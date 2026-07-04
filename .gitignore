@@ -1,6 +1,5 @@
-# build output
+# build output (dist/ is committed on purpose: the node fetches the binary from there)
 /tnl-engine
-/dist/
 *.exe
 
 # local test scratch
