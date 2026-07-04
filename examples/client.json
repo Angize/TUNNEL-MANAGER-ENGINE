@@ -1,0 +1,12 @@
+{
+  "role": "client",
+  "mode": "packet",
+  "profile": "bip",
+  "peer": "PUBLIC_SERVER_IP:9000",
+  "tun_name": "tnl0",
+  "tun_addr": "10.200.0.1/24",
+  "tun_peer": "10.200.0.2",
+  "mtu": 1400,
+  "keepalive": 15,
+  "crypto": { "enabled": true, "psk": "change-me", "cipher": "aes-256-gcm" }
+}
