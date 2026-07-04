@@ -44,12 +44,14 @@ func main() {
 	}
 
 	var sealer packet.Sealer
+	cipherName := "off"
 	if cfg.Crypto.Enabled {
-		s, err := crypto.NewSealer(cfg.Crypto.PSK)
+		s, err := crypto.NewSealer(cfg.Crypto.Cipher, cfg.Crypto.PSK)
 		if err != nil {
 			log.Fatalf("tnl-engine: crypto: %v", err)
 		}
 		sealer = s
+		cipherName = s.Name
 	}
 
 	dev, err := tun.Open(cfg.TunName, cfg.MTU, cfg.TunAddr)
@@ -57,8 +59,8 @@ func main() {
 		log.Fatalf("tnl-engine: tun: %v", err)
 	}
 	defer dev.Close()
-	log.Printf("tnl-engine %s: tun=%s addr=%s mtu=%d crypto=%v role=%s",
-		version, dev.Name, cfg.TunAddr, cfg.MTU, cfg.Crypto.Enabled, cfg.Role)
+	log.Printf("tnl-engine %s: tun=%s addr=%s mtu=%d cipher=%s role=%s",
+		version, dev.Name, cfg.TunAddr, cfg.MTU, cipherName, cfg.Role)
 
 	var b *packet.Bip
 	ka := time.Duration(cfg.Keepalive) * time.Second
