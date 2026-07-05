@@ -1,0 +1,190 @@
+// Raw-IP encapsulation profiles for the "raw" transport. Each profile wraps a
+// sealed bip frame in a different IP-layer carrier so the tunnel mimics ordinary
+// IPIP / GRE / ICMP / TCP / UDP traffic — or "bip", our native minimal framing.
+//
+// The sealed frame (the AEAD ciphertext, identical to the UDP/TCP carriers) is
+// the innermost payload; only the carrier header — and therefore the IP protocol
+// number on the wire — changes between profiles:
+//
+//	bip   proto 253  no L4 header            [IPv4][sealed]
+//	ipip  proto 4    no L4 header            [IPv4][sealed]
+//	gre   proto 47   4-byte GRE header       [IPv4][GRE][sealed]
+//	icmp  proto 1    8-byte ICMP echo        [IPv4][ICMP][sealed]  (req 8 / reply 0)
+//	udp   proto 17   8-byte UDP header        [IPv4][UDP][sealed]
+//	tcp   proto 6    20-byte TCP header       [IPv4][TCP][sealed]  (PSH|ACK)
+//
+// The receiver ignores the carrier header's contents (the inner AEAD tag is the
+// real integrity check); the header only has to be well formed enough to look
+// like the protocol it imitates and to be skipped on the way in. Unlike
+// Backhaul's raw modes, the sealed frame carries a masked nonce (no cleartext
+// nonce on the wire) and rides our ephemeral-key session — so a passive observer
+// sees neither a fixed nonce signature nor a static key.
+package packet
+
+import (
+	"encoding/binary"
+	"net"
+)
+
+// IP protocol numbers, one per profile.
+const (
+	protoICMP = 1
+	protoIPIP = 4
+	protoTCP  = 6
+	protoUDP  = 17
+	protoGRE  = 47
+	protoBIP  = 253 // private/experimental range: our native no-L4-header profile
+)
+
+// rawProfiles maps a profile name to its IP protocol number. It is also the
+// authoritative set of valid profile names.
+var rawProfiles = map[string]int{
+	"bip":  protoBIP,
+	"ipip": protoIPIP,
+	"gre":  protoGRE,
+	"icmp": protoICMP,
+	"udp":  protoUDP,
+	"tcp":  protoTCP,
+}
+
+// Fixed, plausible ports for the tcp/udp profiles (source ephemeral -> :443).
+const (
+	rawSrcPort = 51820
+	rawDstPort = 443
+)
+
+// rawProtoFor returns the IP protocol number for a profile name.
+func rawProtoFor(profile string) (int, bool) {
+	p, ok := rawProfiles[profile]
+	return p, ok
+}
+
+// rawEncap prepends profile's carrier header to a sealed frame and returns the
+// bytes to hand the raw socket (the kernel prepends the outer IPv4 header, so we
+// do NOT include it here). src/dst are the tunnel endpoint IPs, needed for the
+// TCP checksum; isClient selects the direction-dependent fields (ICMP echo
+// request vs reply); id/seq make the ICMP/TCP headers look like a live flow.
+func rawEncap(profile string, payload []byte, src, dst net.IP, isClient bool, id uint16, seq uint32) []byte {
+	switch rawProfiles[profile] {
+	case protoBIP, protoIPIP:
+		return payload // native / IP-in-IP: the sealed frame is the whole payload
+
+	case protoGRE:
+		h := make([]byte, 4+len(payload))
+		// flags+version = 0 (no checksum/key/seq, version 0); protocol type = IPv4
+		binary.BigEndian.PutUint16(h[2:4], 0x0800)
+		copy(h[4:], payload)
+		return h
+
+	case protoICMP:
+		h := make([]byte, 8+len(payload))
+		if isClient {
+			h[0] = 8 // echo request
+		} else {
+			h[0] = 0 // echo reply
+		}
+		binary.BigEndian.PutUint16(h[4:6], id)
+		binary.BigEndian.PutUint16(h[6:8], uint16(seq))
+		copy(h[8:], payload)
+		binary.BigEndian.PutUint16(h[2:4], onesComplementSum(h)) // checksum over header+payload
+		return h
+
+	case protoUDP:
+		h := make([]byte, 8+len(payload))
+		binary.BigEndian.PutUint16(h[0:2], rawSrcPort)
+		binary.BigEndian.PutUint16(h[2:4], rawDstPort)
+		binary.BigEndian.PutUint16(h[4:6], uint16(len(h)))
+		copy(h[8:], payload)
+		cs := l4Checksum(src, dst, protoUDP, h)
+		if cs == 0 {
+			cs = 0xffff // 0 means "no checksum" in UDP; use the equivalent 0xffff
+		}
+		binary.BigEndian.PutUint16(h[6:8], cs)
+		return h
+
+	case protoTCP:
+		h := make([]byte, 20+len(payload))
+		binary.BigEndian.PutUint16(h[0:2], rawSrcPort)
+		binary.BigEndian.PutUint16(h[2:4], rawDstPort)
+		binary.BigEndian.PutUint32(h[4:8], seq) // sequence number
+		h[12] = 5 << 4                          // data offset = 5 words (20 bytes), no options
+		h[13] = 0x18                            // PSH | ACK — looks like a data segment
+		binary.BigEndian.PutUint16(h[14:16], 0xffff)
+		copy(h[20:], payload)
+		binary.BigEndian.PutUint16(h[16:18], l4Checksum(src, dst, protoTCP, h))
+		return h
+	}
+	return payload
+}
+
+// rawDecap strips the profile's carrier header, returning the inner sealed
+// frame. A raw ip4 read MAY or may not include the outer IPv4 header depending
+// on the platform/kernel, so rawDecap detects a genuine leading IPv4 header
+// (version 4, with the total-length and protocol fields matching) and strips it
+// only then — otherwise the bytes already start at the carrier header. It
+// reports false on a packet too short to hold the expected carrier header.
+func rawDecap(profile string, pkt []byte) ([]byte, bool) {
+	proto := rawProfiles[profile]
+	if len(pkt) >= 20 && pkt[0]>>4 == 4 {
+		ihl := int(pkt[0]&0x0f) * 4
+		total := int(binary.BigEndian.Uint16(pkt[2:4]))
+		if ihl >= 20 && ihl <= len(pkt) && total == len(pkt) && int(pkt[9]) == proto {
+			pkt = pkt[ihl:] // a real IPv4 header was included; strip it
+		}
+	}
+	switch proto {
+	case protoBIP, protoIPIP:
+		return pkt, true
+	case protoGRE:
+		return skip(pkt, 4)
+	case protoICMP, protoUDP:
+		return skip(pkt, 8)
+	case protoTCP:
+		if len(pkt) < 20 {
+			return nil, false
+		}
+		off := int(pkt[12]>>4) * 4 // data offset word count -> bytes
+		return skip(pkt, off)
+	}
+	return nil, false
+}
+
+func skip(pkt []byte, n int) ([]byte, bool) {
+	if n < 0 || len(pkt) < n {
+		return nil, false
+	}
+	return pkt[n:], true
+}
+
+// onesComplementSum computes the 16-bit one's-complement checksum (RFC 1071)
+// used by ICMP over the buffer as-is (the checksum field must be zero on entry).
+func onesComplementSum(b []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(b[i])<<8 | uint32(b[i+1])
+	}
+	if len(b)%2 == 1 {
+		sum += uint32(b[len(b)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+// l4Checksum computes the TCP/UDP checksum over the IPv4 pseudo-header plus the
+// L4 segment (whose own checksum field must be zero on entry).
+func l4Checksum(src, dst net.IP, proto int, l4 []byte) uint16 {
+	s, d := src.To4(), dst.To4()
+	pseudo := make([]byte, 12+len(l4))
+	if s != nil {
+		copy(pseudo[0:4], s)
+	}
+	if d != nil {
+		copy(pseudo[4:8], d)
+	}
+	pseudo[9] = byte(proto)
+	binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(l4)))
+	copy(pseudo[12:], l4)
+	return onesComplementSum(pseudo)
+}

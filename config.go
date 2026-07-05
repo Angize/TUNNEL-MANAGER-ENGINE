@@ -25,9 +25,16 @@ type Config struct {
 	Profile string `json:"profile"` // "bip" (only profile implemented in this slice)
 
 	// Transport selects the carrier for bip frames: "udp" (default,
-	// NAT-friendly datagrams) or "tcp" (stream, length-prefixed frames,
-	// survives raw-IP/UDP filtering and rides existing TCP-friendly paths).
+	// NAT-friendly datagrams), "tcp" (stream, length-prefixed frames), or "raw"
+	// (each frame in a raw IPv4 packet of a chosen protocol — see Profile).
 	Transport string `json:"transport"`
+
+	// RawProfile selects the raw-transport encapsulation (Transport=="raw" only):
+	// "bip" (native, proto 253), "ipip" (4), "gre" (47), "icmp" (1), "udp" (17),
+	// or "tcp" (6). The sealed frame is identical across profiles; only the
+	// IP-layer carrier header — and thus how the traffic looks — changes. Raw
+	// sockets need CAP_NET_RAW and Linux; ipip/gre often do not cross NAT.
+	RawProfile string `json:"raw_profile"`
 
 	Listen string `json:"listen"` // server: bind address, e.g. "0.0.0.0:9000"
 	Peer   string `json:"peer"`   // client: server address, e.g. "1.2.3.4:9000"
@@ -56,6 +63,13 @@ type Config struct {
 	// the cover the server borrows. TCP only; bip/PSK runs inside the TLS tunnel.
 	Cover    bool   `json:"cover"`
 	CoverSNI string `json:"cover_sni"`
+
+	// GSO opens the TUN with a virtio-net header and TCP/UDP segmentation
+	// offload, so the kernel hands the engine large super-packets on bulk
+	// transfers instead of many MTU-sized ones — fewer syscalls/copies, higher
+	// throughput. It is a local optimization only (the wire format is unchanged)
+	// and each side can enable it independently. Linux only.
+	GSO bool `json:"gso"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -87,6 +101,16 @@ func (c *Config) applyDefaults() {
 	if c.Transport == "" {
 		c.Transport = "udp"
 	}
+	if c.Transport == "raw" && c.RawProfile == "" {
+		c.RawProfile = "bip"
+	}
+}
+
+// rawProfiles is the set of valid raw-transport encapsulation profiles. It
+// mirrors the map in the packet package (kept here so config validation does not
+// depend on that package).
+var rawProfiles = map[string]bool{
+	"bip": true, "ipip": true, "gre": true, "icmp": true, "udp": true, "tcp": true,
 }
 
 func (c *Config) validate() error {
@@ -111,8 +135,15 @@ func (c *Config) validate() error {
 	switch c.Transport {
 	case "", "udp", "tcp":
 		// ok ("" defaults to udp in applyDefaults)
+	case "raw":
+		if c.RawProfile != "" && !rawProfiles[c.RawProfile] {
+			return errors.New("raw_profile must be one of bip|ipip|gre|icmp|udp|tcp")
+		}
+		if !c.Crypto.Enabled {
+			return errors.New("raw transport requires crypto enabled (the AEAD both encrypts and authenticates each raw packet)")
+		}
 	default:
-		return errors.New("transport must be \"udp\" or \"tcp\"")
+		return errors.New("transport must be \"udp\", \"tcp\", or \"raw\"")
 	}
 	if c.TunAddr == "" {
 		return errors.New("tun_addr is required")
@@ -123,7 +154,7 @@ func (c *Config) validate() error {
 	if c.Obfs && !c.Crypto.Enabled {
 		return errors.New("obfs requires crypto enabled")
 	}
-	if c.Cover && c.Transport == "udp" {
+	if c.Cover && c.Transport != "tcp" {
 		return errors.New("cover (TLS) requires transport \"tcp\"")
 	}
 	if c.Cover && c.CoverSNI == "" {

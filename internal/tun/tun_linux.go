@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -22,31 +23,56 @@ const (
 	ifReqSize = 40
 )
 
-// Device is an open TUN interface.
+// Device is an open TUN interface. When gso is set it was opened with a
+// virtio-net header and segmentation offload; Read then serves one L3 packet per
+// call out of a queue filled by splitting the kernel's super-packets (see
+// offload_linux.go), so callers keep the simple one-packet-per-Read contract.
 type Device struct {
 	f    *os.File
 	Name string
+
+	gso  bool
+	rbuf []byte   // super-packet read buffer (vnet header + up to 64 KiB)
+	q    [][]byte // segments not yet handed out; drained before the next read
+
+	nSuper, nSeg atomic.Uint64 // GSO diagnostic: super-packets split and segments produced
 }
 
 // Open creates the TUN interface, assigns addr (CIDR, e.g. "10.200.0.1/24"),
 // sets mtu and brings it up. name is a hint; the kernel-assigned name is
-// returned in Device.Name.
-func Open(name string, mtu int, addr string) (*Device, error) {
+// returned in Device.Name. When gso is true the device is opened with a
+// virtio-net header and TCP/UDP segmentation offload for higher bulk throughput.
+func Open(name string, mtu int, addr string, gso bool) (*Device, error) {
 	f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/net/tun: %w", err)
 	}
 
+	flags := uint16(iffTun | iffNoPI)
+	if gso {
+		flags |= iffVnetHdr
+	}
 	var ifr [ifReqSize]byte
 	copy(ifr[:15], name) // leave room for NUL terminator
-	binary.LittleEndian.PutUint16(ifr[16:18], iffTun|iffNoPI)
+	binary.LittleEndian.PutUint16(ifr[16:18], flags)
 	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), tunSetIff, uintptr(unsafe.Pointer(&ifr))); errno != 0 {
 		f.Close()
 		return nil, fmt.Errorf("TUNSETIFF: %w", errno)
 	}
 	real := strings.TrimRight(string(ifr[:16]), "\x00")
 
-	d := &Device{f: f, Name: real}
+	if gso {
+		off := uintptr(tunFCSUM | tunFTSO4 | tunFTSO6)
+		if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), tunSetOffload, off); errno != 0 {
+			f.Close()
+			return nil, fmt.Errorf("TUNSETOFFLOAD (gso): %w", errno)
+		}
+	}
+
+	d := &Device{f: f, Name: real, gso: gso}
+	if gso {
+		d.rbuf = make([]byte, vnetHdrLen+65535)
+	}
 	if err := ipCmd("link", "set", "dev", real, "mtu", strconv.Itoa(mtu)); err != nil {
 		d.Close()
 		return nil, err
@@ -62,14 +88,74 @@ func Open(name string, mtu int, addr string) (*Device, error) {
 	return d, nil
 }
 
-// Read returns one L3 packet into buf.
-func (d *Device) Read(buf []byte) (int, error) { return d.f.Read(buf) }
+// Read returns one L3 packet into buf. With GSO enabled it serves segments from
+// the queue, refilling it by reading and splitting one kernel super-packet.
+func (d *Device) Read(buf []byte) (int, error) {
+	if !d.gso {
+		return d.f.Read(buf)
+	}
+	for len(d.q) == 0 {
+		segs, err := d.readGSO()
+		if err != nil {
+			return 0, err
+		}
+		d.q = segs
+	}
+	n := copy(buf, d.q[0])
+	d.q = d.q[1:]
+	return n, nil
+}
 
-// Write injects one L3 packet.
-func (d *Device) Write(pkt []byte) (int, error) { return d.f.Write(pkt) }
+// readGSO reads one virtio super-packet and returns its L3 segments (one element
+// for a non-GSO packet). A runt read returns no segments so Read retries.
+func (d *Device) readGSO() ([][]byte, error) {
+	n, err := d.f.Read(d.rbuf)
+	if err != nil {
+		return nil, err
+	}
+	if n <= vnetHdrLen {
+		return nil, nil
+	}
+	flags := d.rbuf[0]
+	gsoType := int(d.rbuf[1])
+	gsoSize := int(binary.LittleEndian.Uint16(d.rbuf[4:6]))
+	pkt := d.rbuf[vnetHdrLen:n]
+	if gsoType&^gsoECN == gsoNone {
+		if flags&vnetNeedsCsum != 0 {
+			finalizeCsum(pkt)
+		}
+		return [][]byte{pkt}, nil
+	}
+	segs := splitGSO(pkt, gsoSize, gsoType)
+	if len(segs) > 1 {
+		d.nSuper.Add(1)
+		d.nSeg.Add(uint64(len(segs)))
+	}
+	return segs, nil
+}
+
+// Write injects one L3 packet. With GSO the kernel expects a virtio-net header
+// prefix; a zero header means "one complete packet, checksums done".
+func (d *Device) Write(pkt []byte) (int, error) {
+	if !d.gso {
+		return d.f.Write(pkt)
+	}
+	out := make([]byte, vnetHdrLen+len(pkt))
+	copy(out[vnetHdrLen:], pkt)
+	n, err := d.f.Write(out)
+	if n -= vnetHdrLen; n < 0 {
+		n = 0
+	}
+	return n, err
+}
 
 // Close removes the interface (non-persistent).
-func (d *Device) Close() error { return d.f.Close() }
+func (d *Device) Close() error {
+	if n := d.nSuper.Load(); d.gso && n > 0 {
+		fmt.Printf("tun %s: gso split %d super-packets into %d segments\n", d.Name, n, d.nSeg.Load())
+	}
+	return d.f.Close()
+}
 
 func ipCmd(args ...string) error {
 	out, err := exec.Command("ip", args...).CombinedOutput()
