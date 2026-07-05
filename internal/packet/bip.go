@@ -7,13 +7,20 @@
 //	[0] magic = 0xB1
 //	[1] type  = 0 data | 1 ping | 2 pong
 //	[2:] payload
-//	        data: sealed(nonce||ct) if crypto on, else the raw IP packet
-//	        ping/pong: empty
+//	        crypto on:  sealed(nonce||ct) for EVERY type (ping/pong seal an empty
+//	                    payload) so control frames are authenticated too
+//	        crypto off: the raw IP packet for data, empty for ping/pong
 //
-// Roles: the "server" binds a UDP socket and learns the peer's address from
-// the first packet it receives (works through NAT). The "client" dials the
-// server and sends a ping every keepalive interval so the server always knows
-// where to send return traffic even when no L3 packets are flowing.
+// Authentication and the peer address: the server learns the client's address
+// from the frames it receives (works through NAT), but ONLY after a frame both
+// AEAD-opens and passes the anti-replay window. With crypto off there is nothing
+// to authenticate, so the peer is taken on faith — a clear-mode tunnel offers no
+// protection against a spoofed control frame; run crypto (the panel does by
+// default) to get peer-rebinding protection.
+//
+// Roles: the "server" binds a UDP socket and learns the peer's address as above.
+// The "client" dials the server and sends a ping every keepalive interval so the
+// server always knows where to send return traffic even when no L3 packets flow.
 package packet
 
 import (
@@ -37,10 +44,8 @@ const (
 )
 
 // Sealer is the subset of crypto.Sealer bip needs (nil means crypto off).
-// Open returns the authenticated (session, seq) pair carried in the nonce so a
-// replayed data frame can be dropped. This is wire-compatible with an older peer
-// that used random nonces: its (session, seq) just look random, so each of its
-// frames is treated as a fresh session and accepted (no protection, no breakage).
+// Open returns the authenticated (session, seq) pair from the nonce so the
+// carrier can reject replays before acting on a frame.
 type Sealer interface {
 	Seal(pt []byte) ([]byte, error)
 	Open(sealed []byte) (session uint64, seq uint64, pt []byte, err error)
@@ -54,9 +59,9 @@ type Bip struct {
 	keepalive time.Duration
 	obfs      bool // anti-DPI framing: no magic, folded type, padding, jitter
 
-	peer   atomic.Pointer[net.UDPAddr] // current known peer (server learns it)
+	peer     atomic.Pointer[net.UDPAddr] // current known peer (server learns it)
 	isClient bool
-	rp       replayGuard // anti-replay for DATA frames only; driven by netToTun alone
+	rp       replayGuard // driven only by netToTun (single receiver goroutine)
 }
 
 // Dial (client role) binds an ephemeral UDP socket and targets peerAddr.
@@ -101,6 +106,29 @@ func (b *Bip) Run() error {
 // Close tears down the socket, which unblocks both loops.
 func (b *Bip) Close() error { return b.conn.Close() }
 
+// frame builds one datagram for typ/payload. With crypto on every type is
+// sealed (ping/pong seal an empty payload) so control frames are authenticated;
+// with crypto off it is the legacy [magic][type][payload].
+func (b *Bip) frame(typ byte, payload []byte) ([]byte, error) {
+	if b.obfs {
+		return obfsSeal(b.sealer, typ, payload, padMaxFor(typ))
+	}
+	if b.sealer != nil {
+		sealed, err := b.sealer.Seal(payload)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]byte, 2+len(sealed))
+		out[0], out[1] = magic, typ
+		copy(out[2:], sealed)
+		return out, nil
+	}
+	out := make([]byte, 2+len(payload))
+	out[0], out[1] = magic, typ
+	copy(out[2:], payload)
+	return out, nil
+}
+
 // tunToNet reads L3 packets from TUN, seals them, and sends to the peer.
 func (b *Bip) tunToNet() error {
 	buf := make([]byte, maxDatagram)
@@ -113,29 +141,10 @@ func (b *Bip) tunToNet() error {
 		if peer == nil {
 			continue // server has not learned the client yet; drop
 		}
-		var frame []byte
-		if b.obfs {
-			// Obfuscated: seal [type][len][pkt][pad]; no cleartext header.
-			sealed, err := obfsSeal(b.sealer, typeData, buf[:n], obfsDataPadMax)
-			if err != nil {
-				log.Printf("bip: obfs seal error: %v", err)
-				continue
-			}
-			frame = sealed
-		} else {
-			payload := buf[:n]
-			if b.sealer != nil {
-				sealed, err := b.sealer.Seal(payload)
-				if err != nil {
-					log.Printf("bip: seal error: %v", err)
-					continue
-				}
-				payload = sealed
-			}
-			frame = make([]byte, 2+len(payload))
-			frame[0] = magic
-			frame[1] = typeData
-			copy(frame[2:], payload)
+		frame, err := b.frame(typeData, buf[:n])
+		if err != nil {
+			log.Printf("bip: seal error: %v", err)
+			continue
 		}
 		if _, err := b.conn.WriteToUDP(frame, peer); err != nil {
 			log.Printf("bip: write error: %v", err)
@@ -143,8 +152,8 @@ func (b *Bip) tunToNet() error {
 	}
 }
 
-// netToTun receives datagrams, updates the known peer, and writes data frames
-// into the TUN.
+// netToTun receives datagrams, authenticates them, rejects replays, updates the
+// known peer, and writes data frames into the TUN.
 func (b *Bip) netToTun() error {
 	buf := make([]byte, maxDatagram)
 	for {
@@ -157,15 +166,13 @@ func (b *Bip) netToTun() error {
 			payload []byte
 		)
 		if b.obfs {
-			// The only "is this ours?" test is a successful AEAD open. Garbage
-			// (a DPI probe, wrong PSK) fails and is dropped with no response —
-			// the server never emits an identifying byte to a stranger.
+			// The only "is this ours?" test is a successful AEAD open + a fresh
+			// sequence number. Garbage (a DPI probe, wrong PSK) or a replayed
+			// capture fails and is dropped with no response — the server never
+			// emits an identifying byte to a stranger, nor rebinds to a replay.
 			t, session, seq, pt, oerr := obfsOpen(b.sealer, buf[:n])
-			if oerr != nil {
+			if oerr != nil || !b.rp.ok(session, seq) {
 				continue
-			}
-			if t == typeData && !b.rp.ok(session, seq) {
-				continue // replayed data frame -> drop (don't re-inject into the TUN)
 			}
 			typ, payload = t, pt
 		} else {
@@ -173,23 +180,17 @@ func (b *Bip) netToTun() error {
 				continue // not ours
 			}
 			typ = buf[1]
-			if typ == typeData {
-				pt := buf[2:n]
-				if b.sealer != nil {
-					session, seq, opened, oerr := b.sealer.Open(pt)
-					if oerr != nil {
-						log.Printf("bip: open error (auth fail?): %v", oerr)
-						continue
-					}
-					if !b.rp.ok(session, seq) {
-						continue // replayed data frame -> drop
-					}
-					pt = opened
+			if b.sealer != nil {
+				session, seq, pt, oerr := b.sealer.Open(buf[2:n])
+				if oerr != nil || !b.rp.ok(session, seq) {
+					continue // auth failure or replay -> do NOT rebind the peer
 				}
 				payload = pt
+			} else if typ == typeData {
+				payload = buf[2:n] // clear mode: unauthenticated
 			}
 		}
-		// Any authenticated frame tells us where the peer currently is.
+		// An authenticated, non-replayed frame tells us where the peer now is.
 		b.peer.Store(addr)
 		switch typ {
 		case typePing:
@@ -222,18 +223,9 @@ func (b *Bip) send(typ byte, payload []byte, to *net.UDPAddr) {
 	if to == nil {
 		return
 	}
-	var frame []byte
-	if b.obfs {
-		sealed, err := obfsSeal(b.sealer, typ, payload, padMaxFor(typ))
-		if err != nil {
-			return
-		}
-		frame = sealed
-	} else {
-		frame = make([]byte, 2+len(payload))
-		frame[0] = magic
-		frame[1] = typ
-		copy(frame[2:], payload)
+	frame, err := b.frame(typ, payload)
+	if err != nil {
+		return
 	}
 	_, _ = b.conn.WriteToUDP(frame, to)
 }

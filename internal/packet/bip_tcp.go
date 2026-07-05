@@ -6,7 +6,9 @@
 //	[0:2] uint16 big-endian N = length of the frame that follows (magic+type+payload)
 //	[2]   magic = 0xB1
 //	[3]   type  = 0 data | 1 ping | 2 pong
-//	[4:]  payload (sealed(nonce||ct) for data when crypto is on)
+//	[4:]  payload — when crypto is on this is sealed(nonce||ct) for EVERY type
+//	      (ping/pong seal an empty payload) so control frames are authenticated;
+//	      with crypto off it is the raw IP packet for data, empty for ping/pong
 //
 // Obfs framing (obfs on) — no constant bytes on the wire:
 //
@@ -126,9 +128,10 @@ func (cf *connFramer) writeFrame(typ byte, payload []byte) error {
 		return err
 	}
 
-	// Legacy: [len][magic][type][sealed]
+	// Legacy: [len][magic][type][sealed]. With crypto on we seal EVERY type
+	// (ping/pong seal an empty payload) so control frames are authenticated.
 	sealed := payload
-	if typ == typeData && cf.sealer != nil {
+	if cf.sealer != nil {
 		s, err := cf.sealer.Seal(payload)
 		if err != nil {
 			return err
@@ -151,9 +154,9 @@ func (cf *connFramer) writeFrame(typ byte, payload []byte) error {
 }
 
 // readFrame reads one framed message and returns its type, the sender's
-// (session, seq) for anti-replay of DATA frames, and the real payload (padding
-// stripped, data unsealed). ping/pong carry a nil/empty payload; their session/
-// seq are only meaningful in obfs mode and are ignored by the caller anyway.
+// (session, seq) for anti-replay, and the real payload (padding stripped, data
+// unsealed). ping/pong carry a nil/empty payload. session/seq are 0 in clear
+// mode (no crypto), where replay cannot be detected.
 func (cf *connFramer) readFrame() (typ byte, session uint64, seq uint64, payload []byte, err error) {
 	if cf.obfs {
 		if err := cf.ensureReadKS(); err != nil { // peer salt precedes its frames
@@ -190,16 +193,15 @@ func (cf *connFramer) readFrame() (typ byte, session uint64, seq uint64, payload
 		return 0, 0, 0, nil, errDesync
 	}
 	typ = buf[1]
-	if typ == typeData { // only data is sealed on the wire (control stays cleartext, like the old build)
-		sealed := buf[2:n]
-		if cf.sealer != nil {
-			session, seq, opened, err := cf.sealer.Open(sealed)
-			if err != nil {
-				return 0, 0, 0, nil, err
-			}
-			return typ, session, seq, opened, nil
+	if cf.sealer != nil { // crypto on: every type is sealed and authenticated
+		session, seq, payload, err = cf.sealer.Open(buf[2:n])
+		if err != nil {
+			return 0, 0, 0, nil, err
 		}
-		return typ, 0, 0, sealed, nil
+		return typ, session, seq, payload, nil
+	}
+	if typ == typeData { // clear mode: only data carries a payload
+		return typ, 0, 0, buf[2:n], nil
 	}
 	return typ, 0, 0, nil, nil
 }
@@ -220,7 +222,7 @@ type BipTCP struct {
 	cur     atomic.Pointer[connFramer] // currently live connection (nil when none)
 	closed  atomic.Bool
 	closeCh chan struct{}
-	rp      atomicReplayGuard // anti-replay for DATA frames, shared across (re)connections
+	rp      atomicReplayGuard // inbound anti-replay, shared across (re)connections
 }
 
 func idleFor(keepalive time.Duration) time.Duration {
@@ -294,30 +296,36 @@ func (b *BipTCP) acceptLoop() {
 	}
 }
 
-// handleServerConn serves one accepted connection. In obfs mode the connection
-// is published as live (and our salt sent) ONLY after the client's first frame
-// authenticates — a peer that cannot prove the PSK receives zero bytes, so the
-// server is invisible to an active probe. In legacy mode it publishes at once.
+// handleServerConn serves one accepted connection. Whenever crypto is on (obfs
+// or plain TCP) the connection is authenticated BEFORE it is published as live:
+// the first frame must AEAD-open and pass anti-replay, so an unauthenticated
+// peer (a probe, a port scan, `nc`) can no longer evict the real client by
+// simply connecting. In obfs mode the salt is also withheld until then, so the
+// server stays invisible to an active probe. Only clear mode (no crypto) — which
+// offers no authentication by definition — publishes at once.
 func (b *BipTCP) handleServerConn(conn net.Conn) {
 	cf := b.newFramer(conn)
-	if !b.obfs {
-		log.Printf("bip/tcp: peer connected from %s", conn.RemoteAddr())
+	if b.sealer == nil {
+		log.Printf("bip/tcp: peer connected from %s (clear)", conn.RemoteAddr())
 		if old := b.cur.Swap(cf); old != nil {
 			old.conn.Close()
 		}
 		b.serve(cf)
 		return
 	}
-	// obfs: read+authenticate the first frame silently before revealing anything.
+	// crypto on: read+authenticate the first frame silently before revealing or
+	// publishing anything. A wrong PSK or a replayed capture is dropped in silence.
 	conn.SetReadDeadline(time.Now().Add(b.idle))
-	typ, _, _, payload, err := cf.readFrame()
-	if err != nil {
-		conn.Close() // probe / wrong PSK: no reply, no log noise
+	typ, session, seq, payload, err := cf.readFrame()
+	if err != nil || !b.rp.ok(session, seq) {
+		conn.Close() // probe / wrong PSK / replay: no reply, no log noise
 		return
 	}
-	if err := cf.sendSalt(); err != nil { // authenticated — now answer
-		conn.Close()
-		return
+	if b.obfs {
+		if err := cf.sendSalt(); err != nil { // authenticated — now answer
+			conn.Close()
+			return
+		}
 	}
 	log.Printf("bip/tcp: peer connected from %s", conn.RemoteAddr())
 	if old := b.cur.Swap(cf); old != nil {
@@ -380,8 +388,8 @@ func (b *BipTCP) handleFrame(cf *connFramer, typ byte, payload []byte) {
 // serve reads framed messages from one connection until it errors or closes.
 // onConnErr clears the live pointer on exit, so both the client (which redials)
 // and the server converge on "no live connection" without extra bookkeeping.
-// The read deadline is now refreshed every frame in ALL modes (not just obfs) so
-// a peer that dies without a FIN/RST is reaped instead of pinning a goroutine.
+// The read deadline is refreshed every frame in ALL modes so a peer that dies
+// without a FIN/RST is reaped instead of pinning a goroutine forever.
 func (b *BipTCP) serve(cf *connFramer) {
 	for {
 		cf.conn.SetReadDeadline(time.Now().Add(b.idle))
@@ -390,8 +398,8 @@ func (b *BipTCP) serve(cf *connFramer) {
 			b.onConnErr(cf, err)
 			return
 		}
-		if typ == typeData && cf.sealer != nil && !b.rp.ok(session, seq) {
-			continue // replayed data frame -> drop, keep the connection
+		if cf.sealer != nil && !b.rp.ok(session, seq) {
+			continue // authenticated but replayed -> ignore, keep the connection
 		}
 		b.handleFrame(cf, typ, payload)
 	}
