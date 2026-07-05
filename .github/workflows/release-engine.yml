@@ -1,9 +1,18 @@
 name: release-engine
 
-# Build the engine binary on GitHub and attach it to the matching Release.
-# Trigger it either way:
-#   * push a tag  v1, v2, v3 …            -> builds THAT tagged commit, publishes its release
-#   * Actions -> release-engine -> Run    -> rebuild/republish an existing tag by name
+# Build the engine binary on GitHub and attach it to a Release.
+#
+# Two ways to run it — both create the Release + assets automatically:
+#
+#   1) Push a tag  v1, v2 …           -> builds THAT tagged commit, publishes its release.
+#        git tag v2 <sha> && git push origin v2
+#
+#   2) Actions -> release-engine -> Run workflow  (no local git needed):
+#        tag = v2   ref = main       -> creates tag v2 at main and releases it
+#        tag = v1   ref = 5b677d2    -> creates tag v1 at that commit and releases it
+#      If the tag does not exist yet it is CREATED at `ref`; if it already exists,
+#      its assets are refreshed.
+#
 # The nodes download these assets (tnl-engine-linux-<arch> + .sha256) from the
 # panel's engine-update button; nothing is committed to the repo tree.
 
@@ -14,24 +23,36 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to (re)build and release, e.g. v1'
+        description: 'Release tag to create/publish, e.g. v1 or v2'
         required: true
+      ref:
+        description: 'Commit SHA / branch / tag to build from (default: main)'
+        required: false
+        default: main
 
 permissions:
-  contents: write        # needed to create/upload releases
+  contents: write        # needed to create tags, releases and upload assets
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - name: Pick the tag
+      - name: Resolve tag + build ref
         id: t
-        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "ref=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ github.event.inputs.ref }}" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Check out the tagged commit
-        uses: actions/checkout@v4
+      - name: Check out the commit to build
+        uses: actions/checkout@v5
         with:
-          ref: ${{ steps.t.outputs.tag }}
+          ref: ${{ steps.t.outputs.ref }}
+          fetch-depth: 0          # allow building an arbitrary older commit (e.g. v1)
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -49,14 +70,16 @@ jobs:
           done
           ls -l out
 
-      - name: Publish assets to the release
+      - name: Publish the release + assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eux
           TAG="${{ steps.t.outputs.tag }}"
+          SHA="$(git rev-parse HEAD)"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" out/* --clobber
           else
-            gh release create "$TAG" --title "$TAG" --notes "tnl-engine $TAG" out/*
+            # creates the tag at SHA if it doesn't already exist, then the release
+            gh release create "$TAG" --target "$SHA" --title "$TAG" --notes "tnl-engine $TAG" out/*
           fi
