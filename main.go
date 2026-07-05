@@ -103,6 +103,19 @@ func main() {
 				log.Printf("tnl-engine: dialing (bip/tcp%s%s) %s", obfsTag, coverTag(cfg.Cover), cfg.Peer)
 			}
 		}
+	case "raw":
+		switch cfg.Role {
+		case "server":
+			b, err = packet.ListenRaw(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile)
+			if err == nil {
+				log.Printf("tnl-engine: listening (bip/raw:%s%s) on %s", cfg.RawProfile, obfsTag, cfg.Listen)
+			}
+		case "client":
+			b, err = packet.DialRaw(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile)
+			if err == nil {
+				log.Printf("tnl-engine: dialing (bip/raw:%s%s) %s", cfg.RawProfile, obfsTag, cfg.Peer)
+			}
+		}
 	default: // "udp"
 		switch cfg.Role {
 		case "server":
