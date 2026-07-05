@@ -63,6 +63,12 @@ func main() {
 		}
 		sealer = s
 		cipherName = s.Name
+	} else {
+		// Clear mode has NO authentication: a single spoofed datagram can rebind
+		// the peer or inject a packet into the TUN. Make that impossible to miss.
+		log.Printf("tnl-engine: WARNING crypto is DISABLED — the tunnel is unauthenticated " +
+			"and unencrypted; anyone who can send a packet to this listener can hijack or " +
+			"inject into it. Enable crypto unless this is a trusted, isolated link.")
 	}
 	log.Printf("tnl-engine %s: tun=%s addr=%s mtu=%d cipher=%s role=%s",
 		version, dev.Name, cfg.TunAddr, cfg.MTU, cipherName, cfg.Role)

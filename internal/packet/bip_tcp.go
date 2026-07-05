@@ -41,7 +41,28 @@ import (
 	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tun"
 )
 
-const maxFrame = 65535 // uint16 length prefix ceiling (payload fits far under this)
+const (
+	maxFrame = 65535 // uint16 length prefix ceiling (payload fits far under this)
+
+	// readBufSize is the bufio read buffer allocated per connection. It is kept
+	// small (not maxFrame+2) so an unauthenticated peer cannot force a ~64 KB
+	// eager allocation just by connecting; bufio reads larger frames directly
+	// into the destination, so this does not cap frame size.
+	readBufSize = 4096
+
+	// handshakeTimeout bounds how long an UNAUTHENTICATED peer may hold a server
+	// goroutine before its first frame authenticates — far shorter than the
+	// established-connection idle deadline, to blunt slowloris/half-open floods.
+	handshakeTimeout = 10 * time.Second
+
+	// writeTimeout caps a single frame write so a peer advertising a zero receive
+	// window cannot block the sole TUN reader (tunLoop) indefinitely.
+	writeTimeout = 30 * time.Second
+
+	// maxPreAuthConns bounds concurrent not-yet-authenticated server handlers, so
+	// a connection flood cannot exhaust goroutines/fds/memory before auth.
+	maxPreAuthConns = 128
+)
 
 var errDesync = errors.New("bip/tcp: stream desync")
 
@@ -81,6 +102,7 @@ func (cf *connFramer) sendSalt() error {
 		return err
 	}
 	cf.mu.Lock()
+	cf.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	_, werr := cf.conn.Write(salt)
 	if werr == nil {
 		cf.writeKS = ws
@@ -123,6 +145,7 @@ func (cf *connFramer) writeFrame(typ byte, payload []byte) error {
 		copy(out[2:], sealed)
 		cf.mu.Lock()
 		cf.writeKS.XORKeyStream(out[0:2], lb[:]) // mask length; advances keystream
+		cf.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		_, err = cf.conn.Write(out)
 		cf.mu.Unlock()
 		return err
@@ -148,6 +171,7 @@ func (cf *connFramer) writeFrame(typ byte, payload []byte) error {
 	out[3] = typ
 	copy(out[4:], sealed)
 	cf.mu.Lock()
+	cf.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	_, err := cf.conn.Write(out)
 	cf.mu.Unlock()
 	return err
@@ -223,6 +247,7 @@ type BipTCP struct {
 	closed  atomic.Bool
 	closeCh chan struct{}
 	rp      atomicReplayGuard // inbound anti-replay, shared across (re)connections
+	preAuth chan struct{}     // permits: caps concurrent unauthenticated handlers
 }
 
 func idleFor(keepalive time.Duration) time.Duration {
@@ -246,7 +271,8 @@ func ListenTCP(listenAddr string, dev *tun.Device, sealer Sealer, keepalive time
 		return nil, err
 	}
 	return &BipTCP{dev: dev, sealer: sealer, keepalive: keepalive, obfs: obfs, psk: psk,
-		idle: idleFor(keepalive), addr: listenAddr, ln: ln, closeCh: make(chan struct{})}, nil
+		idle: idleFor(keepalive), addr: listenAddr, ln: ln, closeCh: make(chan struct{}),
+		preAuth: make(chan struct{}, maxPreAuthConns)}, nil
 }
 
 // Run blocks until Close is called. The TUN reader runs for the whole lifetime;
@@ -278,20 +304,32 @@ func (b *BipTCP) Close() error {
 }
 
 func (b *BipTCP) newFramer(conn net.Conn) *connFramer {
-	return &connFramer{conn: conn, r: bufio.NewReaderSize(conn, maxFrame+2), sealer: b.sealer, obfs: b.obfs, psk: b.psk}
+	return &connFramer{conn: conn, r: bufio.NewReaderSize(conn, readBufSize), sealer: b.sealer, obfs: b.obfs, psk: b.psk}
 }
 
 // acceptLoop (server) hands each new connection to a per-connection goroutine.
+// On a transient Accept error (e.g. EMFILE from an fd flood) it backs off briefly
+// instead of busy-spinning the CPU and flooding the log.
 func (b *BipTCP) acceptLoop() {
+	var backoff time.Duration
 	for {
 		conn, err := b.ln.Accept()
 		if err != nil {
 			if b.closed.Load() {
 				return
 			}
-			log.Printf("bip/tcp: accept error: %v", err)
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else if backoff < time.Second {
+				backoff *= 2
+			}
+			log.Printf("bip/tcp: accept error: %v (backoff %v)", err, backoff)
+			if b.sleep(backoff) {
+				return
+			}
 			continue
 		}
+		backoff = 0
 		go b.handleServerConn(conn)
 	}
 }
@@ -304,18 +342,39 @@ func (b *BipTCP) acceptLoop() {
 // server stays invisible to an active probe. Only clear mode (no crypto) — which
 // offers no authentication by definition — publishes at once.
 func (b *BipTCP) handleServerConn(conn net.Conn) {
+	// Take a pre-auth permit; shed load if too many handshakes are already in
+	// flight. The permit is released the moment the connection becomes live
+	// (authenticated), so it only bounds the UNAUTHENTICATED window, never the
+	// long-lived established connection.
+	select {
+	case b.preAuth <- struct{}{}:
+	default:
+		conn.Close()
+		return
+	}
+	acquired := true
+	release := func() {
+		if acquired {
+			acquired = false
+			<-b.preAuth
+		}
+	}
+	defer release()
+
 	cf := b.newFramer(conn)
 	if b.sealer == nil {
 		log.Printf("bip/tcp: peer connected from %s (clear)", conn.RemoteAddr())
 		if old := b.cur.Swap(cf); old != nil {
 			old.conn.Close()
 		}
+		release()
 		b.serve(cf)
 		return
 	}
 	// crypto on: read+authenticate the first frame silently before revealing or
 	// publishing anything. A wrong PSK or a replayed capture is dropped in silence.
-	conn.SetReadDeadline(time.Now().Add(b.idle))
+	// A SHORT handshake deadline (not the 60 s idle) bounds the pre-auth hold.
+	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	typ, session, seq, payload, err := cf.readFrame()
 	if err != nil || !b.rp.ok(session, seq) {
 		conn.Close() // probe / wrong PSK / replay: no reply, no log noise
@@ -331,6 +390,7 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 	if old := b.cur.Swap(cf); old != nil {
 		old.conn.Close()
 	}
+	release() // authenticated: no longer occupies a pre-auth slot
 	b.handleFrame(cf, typ, payload)
 	b.serve(cf)
 }
@@ -363,7 +423,7 @@ func (b *BipTCP) dialLoop() {
 		log.Printf("bip/tcp: connected to %s", b.addr)
 		b.cur.Store(cf)
 		_ = cf.writeFrame(typePing, nil) // prime + authenticate us to the server
-		b.serve(cf)                // blocks until this connection dies
+		b.serve(cf)                      // blocks until this connection dies
 		b.cur.CompareAndSwap(cf, nil)
 		if b.sleep(1 * time.Second) {
 			return
@@ -441,14 +501,12 @@ func (b *BipTCP) tunLoop() {
 // jittered so it does not emit on a fixed clock.
 func (b *BipTCP) keepaliveLoop() {
 	for {
-		d := b.keepalive
-		if b.obfs {
-			d = jitter(d)
-		}
+		// Jitter in ALL modes: a fixed keepalive clock is a passive timing
+		// fingerprint even without obfs framing.
 		select {
 		case <-b.closeCh:
 			return
-		case <-time.After(d):
+		case <-time.After(jitter(b.keepalive)):
 			if cf := b.cur.Load(); cf != nil {
 				if err := cf.writeFrame(typePing, nil); err != nil {
 					b.onConnErr(cf, err)

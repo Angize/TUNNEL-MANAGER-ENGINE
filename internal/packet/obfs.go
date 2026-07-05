@@ -57,18 +57,33 @@ func newObfsStream(psk string, salt []byte) (*chacha20.Cipher, error) {
 	return chacha20.NewUnauthenticatedCipher(deriveObfsKey(psk), salt)
 }
 
-// randPad returns n random bytes of padding (n uniform in [0, max]).
-func randPad(max int) ([]byte, error) {
+// randPad returns n random bytes of padding, n UNIFORM in [0, max]. It uses
+// rejection sampling rather than `% (max+1)`: modulo of a single byte biases the
+// low lengths (e.g. for max=64, 256 mod 65 leaves 0..60 slightly more likely and
+// values > 255 unreachable), which narrows the size histogram a DPI classifier
+// sees. Rejection keeps the distribution flat.
+func randUint(max int) (int, error) {
 	if max <= 0 {
-		return nil, nil
+		return 0, nil
 	}
-	var b [1]byte
-	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
+	n := uint32(max) + 1
+	limit := (0xFFFFFFFF/n)*n - 1 // largest multiple of n that fits in uint32, minus 1
+	var b [4]byte
+	for {
+		if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
+			return 0, err
+		}
+		v := binary.BigEndian.Uint32(b[:])
+		if v <= limit {
+			return int(v % n), nil
+		}
+	}
+}
+
+func randPad(max int) ([]byte, error) {
+	n, err := randUint(max)
+	if err != nil || n == 0 {
 		return nil, err
-	}
-	n := int(b[0]) % (max + 1)
-	if n == 0 {
-		return nil, nil
 	}
 	pad := make([]byte, n)
 	if _, err := io.ReadFull(rand.Reader, pad); err != nil {

@@ -124,3 +124,52 @@ func TestObfsLengthKeystreamSymmetry(t *testing.T) {
 		}
 	}
 }
+
+// TestRandUintBoundsAndUniformity checks the rejection-sampling helper stays in
+// range and is roughly uniform (no modulo bias toward the low end).
+func TestRandUintBoundsAndUniformity(t *testing.T) {
+	if v, _ := randUint(0); v != 0 {
+		t.Fatalf("randUint(0) = %d, want 0", v)
+	}
+	const max = 64
+	counts := make([]int, max+1)
+	const N = 200000
+	for i := 0; i < N; i++ {
+		v, err := randUint(max)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v < 0 || v > max {
+			t.Fatalf("randUint(%d) out of range: %d", max, v)
+		}
+		counts[v]++
+	}
+	// Every bucket should be populated and near the expected mean; a modulo-biased
+	// generator would leave the top buckets measurably light. Allow a wide band.
+	exp := float64(N) / float64(max+1)
+	for i, c := range counts {
+		if float64(c) < exp*0.7 || float64(c) > exp*1.3 {
+			t.Fatalf("bucket %d skewed: got %d, expected ~%.0f (bias?)", i, c, exp)
+		}
+	}
+}
+
+// TestAtomicReplayGuardConcurrent exercises the mutex-backed guard from many
+// goroutines: it must never accept a duplicate (session,seq) even under races.
+func TestAtomicReplayGuardConcurrent(t *testing.T) {
+	var g atomicReplayGuard
+	const workers = 16
+	accepted := make(chan bool, workers)
+	for w := 0; w < workers; w++ {
+		go func() { accepted <- g.ok(7, 1) }() // same (session,seq) from all
+	}
+	oks := 0
+	for i := 0; i < workers; i++ {
+		if <-accepted {
+			oks++
+		}
+	}
+	if oks != 1 {
+		t.Fatalf("exactly one goroutine should accept (session,seq)=(7,1); got %d", oks)
+	}
+}
