@@ -27,6 +27,7 @@ package packet
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -39,6 +40,7 @@ import (
 	"golang.org/x/crypto/chacha20"
 
 	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/crypto"
+	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tlscover"
 	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tun"
 )
 
@@ -241,6 +243,10 @@ type BipTCP struct {
 	psk       string
 	idle      time.Duration // read deadline; reaps dead/probe connections
 
+	cover    bool             // wrap the connection in a TLS session (looks like HTTPS)
+	coverSNI string           // SNI the client presents
+	cert     *tls.Certificate // server's self-signed cover certificate
+
 	isClient bool
 	addr     string // server: listen addr; client: peer addr
 
@@ -260,21 +266,39 @@ func idleFor(keepalive time.Duration) time.Duration {
 	return d
 }
 
-// DialTCP (client role) targets peerAddr and reconnects on drop.
-func DialTCP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*BipTCP, error) {
+// DialTCP (client role) targets peerAddr and reconnects on drop. When cover is
+// set the connection is wrapped in a Chrome-fingerprinted TLS session presenting
+// coverSNI, so it looks like HTTPS on the wire.
+func DialTCP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, cover bool, coverSNI string) (*BipTCP, error) {
 	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+		cover: cover, coverSNI: coverSNI,
 		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
 }
 
-// ListenTCP (server role) binds listenAddr and accepts connections.
-func ListenTCP(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*BipTCP, error) {
+// ListenTCP (server role) binds listenAddr and accepts connections. When cover is
+// set it generates a self-signed certificate and completes a TLS handshake before
+// the bip protocol runs inside it.
+func ListenTCP(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, cover bool, coverSNI string) (*BipTCP, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
-	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+	b := &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+		cover: cover, coverSNI: coverSNI,
 		idle: idleFor(keepalive), addr: listenAddr, ln: ln, closeCh: make(chan struct{}),
-		preAuth: make(chan struct{}, maxPreAuthConns)}, nil
+		preAuth: make(chan struct{}, maxPreAuthConns)}
+	if cover {
+		host := coverSNI
+		if host == "" {
+			host = "www.microsoft.com"
+		}
+		b.cert, err = tlscover.SelfSignedCert(host)
+		if err != nil {
+			ln.Close()
+			return nil, err
+		}
+	}
+	return b, nil
 }
 
 // Run blocks until Close is called. The TUN reader runs for the whole lifetime;
@@ -416,6 +440,14 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 	}
 	defer release()
 
+	if b.cover { // complete the TLS cover handshake before anything bip-specific
+		tconn, err := tlscover.ServerConn(conn, b.cert, time.Now().Add(handshakeTimeout))
+		if err != nil {
+			conn.Close()
+			return
+		}
+		conn = tconn
+	}
 	cf := b.newFramer(conn)
 	if !b.cryptoOn {
 		log.Printf("bip/tcp: peer connected from %s (clear)", conn.RemoteAddr())
@@ -468,6 +500,18 @@ func (b *BipTCP) dialLoop() {
 				return
 			}
 			continue
+		}
+		if b.cover { // wrap in a Chrome-fingerprinted TLS session first
+			tconn, cerr := tlscover.ClientConn(conn, b.coverSNI, time.Now().Add(handshakeTimeout))
+			if cerr != nil {
+				conn.Close()
+				log.Printf("bip/tcp: tls cover to %s failed: %v", b.addr, cerr)
+				if b.sleep(1 * time.Second) {
+					return
+				}
+				continue
+			}
+			conn = tconn
 		}
 		cf := b.newFramer(conn)
 		conn.SetReadDeadline(time.Now().Add(handshakeTimeout))

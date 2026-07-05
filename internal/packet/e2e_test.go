@@ -94,11 +94,11 @@ func runTunnel(t *testing.T, transport string, obfs bool) {
 	var err error
 	if transport == "tcp" {
 		addr := freeTCPPort(t)
-		srv, err = ListenTCP(addr, srvDev, ka, obfs, cryptoOn, psk, cipher)
+		srv, err = ListenTCP(addr, srvDev, ka, obfs, cryptoOn, psk, cipher, false, "")
 		if err != nil {
 			t.Fatalf("ListenTCP: %v", err)
 		}
-		cli, err = DialTCP(addr, cliDev, ka, obfs, cryptoOn, psk, cipher)
+		cli, err = DialTCP(addr, cliDev, ka, obfs, cryptoOn, psk, cipher, false, "")
 		if err != nil {
 			t.Fatalf("DialTCP: %v", err)
 		}

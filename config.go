@@ -46,6 +46,13 @@ type Config struct {
 	// prefix is masked with a PSK-derived keystream. It requires crypto because
 	// the obfuscation and probe resistance both rely on the AEAD key.
 	Obfs bool `json:"obfs"`
+
+	// Cover wraps the (TCP) transport in a real TLS session that fingerprints as
+	// Chrome, so the wire looks like ordinary HTTPS instead of "fully-encrypted"
+	// random bytes. CoverSNI is the server name the client presents (a plausible
+	// host). TCP only; the bip/PSK handshake still runs inside the TLS tunnel.
+	Cover    bool   `json:"cover"`
+	CoverSNI string `json:"cover_sni"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -112,6 +119,9 @@ func (c *Config) validate() error {
 	}
 	if c.Obfs && !c.Crypto.Enabled {
 		return errors.New("obfs requires crypto enabled")
+	}
+	if c.Cover && c.Transport == "udp" {
+		return errors.New("cover (TLS) requires transport \"tcp\"")
 	}
 	return nil
 }

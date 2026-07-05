@@ -93,14 +93,14 @@ func main() {
 	case "tcp":
 		switch cfg.Role {
 		case "server":
-			b, err = packet.ListenTCP(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
+			b, err = packet.ListenTCP(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.Cover, cfg.CoverSNI)
 			if err == nil {
-				log.Printf("tnl-engine: listening (bip/tcp%s) on %s", obfsTag, cfg.Listen)
+				log.Printf("tnl-engine: listening (bip/tcp%s%s) on %s", obfsTag, coverTag(cfg.Cover), cfg.Listen)
 			}
 		case "client":
-			b, err = packet.DialTCP(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
+			b, err = packet.DialTCP(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.Cover, cfg.CoverSNI)
 			if err == nil {
-				log.Printf("tnl-engine: dialing (bip/tcp%s) %s", obfsTag, cfg.Peer)
+				log.Printf("tnl-engine: dialing (bip/tcp%s%s) %s", obfsTag, coverTag(cfg.Cover), cfg.Peer)
 			}
 		}
 	default: // "udp"
@@ -136,4 +136,11 @@ func main() {
 	if err := b.Run(); err != nil {
 		log.Printf("tnl-engine: stopped: %v", err)
 	}
+}
+
+func coverTag(cover bool) string {
+	if cover {
+		return " tls"
+	}
+	return ""
 }
