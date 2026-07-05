@@ -8,20 +8,25 @@ import (
 	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/crypto"
 )
 
-func mustSealer(t *testing.T, psk string) Sealer {
+// mustPair returns the two ends of a tunnel (client seals c→s, server opens it).
+func mustPair(t *testing.T, psk string) (client, server Sealer) {
 	t.Helper()
-	s, err := crypto.NewSealer(crypto.CipherChaCha, psk)
+	c, err := crypto.NewSealer(crypto.CipherChaCha, psk, true)
 	if err != nil {
-		t.Fatalf("NewSealer: %v", err)
+		t.Fatalf("client NewSealer: %v", err)
 	}
-	return s
+	s, err := crypto.NewSealer(crypto.CipherChaCha, psk, false)
+	if err != nil {
+		t.Fatalf("server NewSealer: %v", err)
+	}
+	return c, s
 }
 
 func TestObfsSealOpenRoundTrip(t *testing.T) {
-	s := mustSealer(t, "roundtrip-psk-123456")
+	c, s := mustPair(t, "roundtrip-psk-123456")
 	for _, pt := range [][]byte{nil, []byte("x"), bytes.Repeat([]byte{0xAB}, 1400)} {
 		for _, typ := range []byte{typeData, typePing, typePong} {
-			sealed, err := obfsSeal(s, typ, pt, padMaxFor(typ))
+			sealed, err := obfsSeal(c, typ, pt, padMaxFor(typ))
 			if err != nil {
 				t.Fatalf("seal: %v", err)
 			}
@@ -41,12 +46,12 @@ func TestObfsSealOpenRoundTrip(t *testing.T) {
 
 func TestObfsNoConstantPrefix(t *testing.T) {
 	// The whole sealed frame must look random: sealing the SAME plaintext twice
-	// must differ (advancing nonce), and no fixed leading byte like the old magic.
-	s := mustSealer(t, "prefix-psk-abcdefabcdef")
-	a, _ := obfsSeal(s, typeData, []byte("hello"), 0)
-	b, _ := obfsSeal(s, typeData, []byte("hello"), 0)
+	// must differ (advancing nonce + fresh mask salt), and no fixed leading byte.
+	c, _ := mustPair(t, "prefix-psk-abcdefabcdef")
+	a, _ := obfsSeal(c, typeData, []byte("hello"), 0)
+	b, _ := obfsSeal(c, typeData, []byte("hello"), 0)
 	if bytes.Equal(a, b) {
-		t.Fatal("two seals of identical plaintext are identical (nonce reuse?)")
+		t.Fatal("two seals of identical plaintext are identical (nonce/salt reuse?)")
 	}
 	if a[0] == magic && b[0] == magic {
 		t.Fatal("leading byte equals the legacy magic on both — that is a signature")
@@ -54,8 +59,8 @@ func TestObfsNoConstantPrefix(t *testing.T) {
 }
 
 func TestObfsTamperFails(t *testing.T) {
-	s := mustSealer(t, "tamper-psk-0987654321")
-	sealed, _ := obfsSeal(s, typeData, []byte("secret payload"), 0)
+	c, s := mustPair(t, "tamper-psk-0987654321")
+	sealed, _ := obfsSeal(c, typeData, []byte("secret payload"), 0)
 	sealed[len(sealed)-1] ^= 0xFF // flip a tag byte
 	if _, _, _, _, err := obfsOpen(s, sealed); err == nil {
 		t.Fatal("tampered frame opened without error")
@@ -63,18 +68,20 @@ func TestObfsTamperFails(t *testing.T) {
 }
 
 func TestObfsWrongPSKFails(t *testing.T) {
-	sealed, _ := obfsSeal(mustSealer(t, "psk-alpha-1111111111"), typeData, []byte("hi"), 0)
-	if _, _, _, _, err := obfsOpen(mustSealer(t, "psk-beta-22222222222"), sealed); err == nil {
+	cA, _ := mustPair(t, "psk-alpha-1111111111")
+	_, sB := mustPair(t, "psk-beta-22222222222")
+	sealed, _ := obfsSeal(cA, typeData, []byte("hi"), 0)
+	if _, _, _, _, err := obfsOpen(sB, sealed); err == nil {
 		t.Fatal("frame opened under the wrong PSK (no probe resistance)")
 	}
 }
 
 func TestObfsPaddingVaries(t *testing.T) {
 	// Control frames get random padding, so sealed sizes should not be constant.
-	s := mustSealer(t, "pad-psk-777777777777")
+	c, _ := mustPair(t, "pad-psk-777777777777")
 	sizes := map[int]bool{}
 	for i := 0; i < 64; i++ {
-		sealed, _ := obfsSeal(s, typePing, nil, obfsCtrlPadMax)
+		sealed, _ := obfsSeal(c, typePing, nil, obfsCtrlPadMax)
 		sizes[len(sealed)] = true
 	}
 	if len(sizes) < 4 {
@@ -85,10 +92,10 @@ func TestObfsPaddingVaries(t *testing.T) {
 // TestObfsOpenReportsSeq checks obfsOpen surfaces the sender's monotonically
 // increasing sequence number so the carrier can feed it to the replay window.
 func TestObfsOpenReportsSeq(t *testing.T) {
-	s := mustSealer(t, "seq-obfs-psk-000000")
+	c, s := mustPair(t, "seq-obfs-psk-000000")
 	var prev uint64
 	for i := 0; i < 50; i++ {
-		sealed, _ := obfsSeal(s, typeData, []byte("d"), 0)
+		sealed, _ := obfsSeal(c, typeData, []byte("d"), 0)
 		_, _, seq, _, err := obfsOpen(s, sealed)
 		if err != nil {
 			t.Fatal(err)

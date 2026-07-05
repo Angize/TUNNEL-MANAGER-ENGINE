@@ -46,10 +46,13 @@ const (
 
 // Sealer is the subset of crypto.Sealer bip needs (nil means crypto off).
 // Open returns the authenticated (session, seq) pair from the nonce so the
-// carrier can reject replays before acting on a frame.
+// carrier can reject replays before acting on a frame. aad carries the cleartext
+// frame header (the type byte in legacy framing) so it is authenticated and
+// cannot be flipped on the wire; obfs framing folds the type into the plaintext
+// and passes nil.
 type Sealer interface {
-	Seal(pt []byte) ([]byte, error)
-	Open(sealed []byte) (session uint64, seq uint64, pt []byte, err error)
+	Seal(pt, aad []byte) ([]byte, error)
+	Open(sealed, aad []byte) (session uint64, seq uint64, pt []byte, err error)
 }
 
 // Bip carries L3 packets between a TUN device and a UDP peer.
@@ -122,7 +125,7 @@ func (b *Bip) frame(typ byte, payload []byte) ([]byte, error) {
 		return obfsSeal(b.sealer, typ, payload, padMaxFor(typ))
 	}
 	if b.sealer != nil {
-		sealed, err := b.sealer.Seal(payload)
+		sealed, err := b.sealer.Seal(payload, []byte{typ}) // authenticate the type byte
 		if err != nil {
 			return nil, err
 		}
@@ -189,9 +192,9 @@ func (b *Bip) netToTun() error {
 			}
 			typ = buf[1]
 			if b.sealer != nil {
-				session, seq, pt, oerr := b.sealer.Open(buf[2:n])
+				session, seq, pt, oerr := b.sealer.Open(buf[2:n], []byte{typ}) // type is authenticated (flip -> open fails)
 				if oerr != nil || !b.rp.ok(session, seq) {
-					continue // auth failure or replay -> do NOT rebind the peer
+					continue // auth failure, type-flip, or replay -> do NOT rebind the peer
 				}
 				payload = pt
 			} else if typ == typeData {
