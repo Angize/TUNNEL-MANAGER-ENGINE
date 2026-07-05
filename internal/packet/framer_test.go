@@ -16,11 +16,11 @@ func errfmt(format string, a ...any) error { return fmt.Errorf(format, a...) }
 func cfPair(t *testing.T, obfs bool, psk string) (client, server *connFramer, cleanup func()) {
 	t.Helper()
 	c, s := net.Pipe()
-	sc, err := crypto.NewSealer(crypto.CipherChaCha, psk)
+	sc, err := crypto.NewSealer(crypto.CipherChaCha, psk, true) // client end
 	if err != nil {
 		t.Fatal(err)
 	}
-	ss, err := crypto.NewSealer(crypto.CipherChaCha, psk)
+	ss, err := crypto.NewSealer(crypto.CipherChaCha, psk, false) // server end
 	if err != nil {
 		t.Fatal(err)
 	}

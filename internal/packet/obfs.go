@@ -104,14 +104,14 @@ func obfsSeal(s Sealer, typ byte, payload []byte, padMax int) ([]byte, error) {
 	binary.BigEndian.PutUint16(inner[1:3], uint16(len(payload)))
 	copy(inner[obfsInnerHdr:], payload)
 	copy(inner[obfsInnerHdr+len(payload):], pad)
-	return s.Seal(inner)
+	return s.Seal(inner, nil) // type is folded into the sealed plaintext, no aad needed
 }
 
 // obfsOpen reverses obfsSeal, returning the frame type, the sender's
 // (session, seq) for anti-replay, and the real payload (padding stripped). Any
 // authentication failure or malformed frame errors.
 func obfsOpen(s Sealer, sealed []byte) (typ byte, session uint64, seq uint64, payload []byte, err error) {
-	session, seq, inner, err := s.Open(sealed)
+	session, seq, inner, err := s.Open(sealed, nil)
 	if err != nil {
 		return 0, 0, 0, nil, err
 	}

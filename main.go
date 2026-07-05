@@ -57,7 +57,7 @@ func main() {
 	var sealer packet.Sealer
 	cipherName := "off"
 	if cfg.Crypto.Enabled {
-		s, err := crypto.NewSealer(cfg.Crypto.Cipher, cfg.Crypto.PSK)
+		s, err := crypto.NewSealer(cfg.Crypto.Cipher, cfg.Crypto.PSK, cfg.Role == "client")
 		if err != nil {
 			log.Fatalf("tnl-engine: crypto: %v", err)
 		}

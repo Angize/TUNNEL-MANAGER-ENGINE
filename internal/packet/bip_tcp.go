@@ -155,7 +155,7 @@ func (cf *connFramer) writeFrame(typ byte, payload []byte) error {
 	// (ping/pong seal an empty payload) so control frames are authenticated.
 	sealed := payload
 	if cf.sealer != nil {
-		s, err := cf.sealer.Seal(payload)
+		s, err := cf.sealer.Seal(payload, []byte{typ}) // authenticate the type byte
 		if err != nil {
 			return err
 		}
@@ -218,7 +218,7 @@ func (cf *connFramer) readFrame() (typ byte, session uint64, seq uint64, payload
 	}
 	typ = buf[1]
 	if cf.sealer != nil { // crypto on: every type is sealed and authenticated
-		session, seq, payload, err = cf.sealer.Open(buf[2:n])
+		session, seq, payload, err = cf.sealer.Open(buf[2:n], []byte{typ}) // type-flip -> open fails
 		if err != nil {
 			return 0, 0, 0, nil, err
 		}

@@ -85,8 +85,8 @@ type carrier interface {
 // (tcp) handshake, the paths a live node runs.
 func runTunnel(t *testing.T, transport string, obfs bool) {
 	const psk = "e2e-shared-pre-shared-key-1234567890"
-	sSealer, _ := crypto.NewSealer("aes-256-gcm", psk)
-	cSealer, _ := crypto.NewSealer("aes-256-gcm", psk)
+	sSealer, _ := crypto.NewSealer("aes-256-gcm", psk, false) // server
+	cSealer, _ := crypto.NewSealer("aes-256-gcm", psk, true)  // client
 	srvDev, srvCtrl := tunPair(t, "srv")
 	cliDev, cliCtrl := tunPair(t, "cli")
 	ka := 1 * time.Second
