@@ -37,9 +37,13 @@ const (
 )
 
 // Sealer is the subset of crypto.Sealer bip needs (nil means crypto off).
+// Open returns the authenticated (session, seq) pair carried in the nonce so a
+// replayed data frame can be dropped. This is wire-compatible with an older peer
+// that used random nonces: its (session, seq) just look random, so each of its
+// frames is treated as a fresh session and accepted (no protection, no breakage).
 type Sealer interface {
 	Seal(pt []byte) ([]byte, error)
-	Open(ct []byte) ([]byte, error)
+	Open(sealed []byte) (session uint64, seq uint64, pt []byte, err error)
 }
 
 // Bip carries L3 packets between a TUN device and a UDP peer.
@@ -52,6 +56,7 @@ type Bip struct {
 
 	peer   atomic.Pointer[net.UDPAddr] // current known peer (server learns it)
 	isClient bool
+	rp       replayGuard // anti-replay for DATA frames only; driven by netToTun alone
 }
 
 // Dial (client role) binds an ephemeral UDP socket and targets peerAddr.
@@ -155,9 +160,12 @@ func (b *Bip) netToTun() error {
 			// The only "is this ours?" test is a successful AEAD open. Garbage
 			// (a DPI probe, wrong PSK) fails and is dropped with no response —
 			// the server never emits an identifying byte to a stranger.
-			t, pt, oerr := obfsOpen(b.sealer, buf[:n])
+			t, session, seq, pt, oerr := obfsOpen(b.sealer, buf[:n])
 			if oerr != nil {
 				continue
+			}
+			if t == typeData && !b.rp.ok(session, seq) {
+				continue // replayed data frame -> drop (don't re-inject into the TUN)
 			}
 			typ, payload = t, pt
 		} else {
@@ -168,10 +176,13 @@ func (b *Bip) netToTun() error {
 			if typ == typeData {
 				pt := buf[2:n]
 				if b.sealer != nil {
-					opened, oerr := b.sealer.Open(pt)
+					session, seq, opened, oerr := b.sealer.Open(pt)
 					if oerr != nil {
 						log.Printf("bip: open error (auth fail?): %v", oerr)
 						continue
+					}
+					if !b.rp.ok(session, seq) {
+						continue // replayed data frame -> drop
 					}
 					pt = opened
 				}

@@ -150,56 +150,58 @@ func (cf *connFramer) writeFrame(typ byte, payload []byte) error {
 	return err
 }
 
-// readFrame reads one framed message and returns its type and real payload
-// (padding stripped, data unsealed). ping/pong carry a nil payload.
-func (cf *connFramer) readFrame() (byte, []byte, error) {
+// readFrame reads one framed message and returns its type, the sender's
+// (session, seq) for anti-replay of DATA frames, and the real payload (padding
+// stripped, data unsealed). ping/pong carry a nil/empty payload; their session/
+// seq are only meaningful in obfs mode and are ignored by the caller anyway.
+func (cf *connFramer) readFrame() (typ byte, session uint64, seq uint64, payload []byte, err error) {
 	if cf.obfs {
 		if err := cf.ensureReadKS(); err != nil { // peer salt precedes its frames
-			return 0, nil, err
+			return 0, 0, 0, nil, err
 		}
 	}
 	var hdr [2]byte
 	if _, err := io.ReadFull(cf.r, hdr[:]); err != nil {
-		return 0, nil, err
+		return 0, 0, 0, nil, err
 	}
 	if cf.obfs {
 		var lb [2]byte
 		cf.readKS.XORKeyStream(lb[:], hdr[:]) // unmask length; advances keystream
 		n := int(binary.BigEndian.Uint16(lb[:]))
 		if n < 1 || n > maxFrame {
-			return 0, nil, errDesync
+			return 0, 0, 0, nil, errDesync
 		}
 		buf := make([]byte, n)
 		if _, err := io.ReadFull(cf.r, buf); err != nil {
-			return 0, nil, err
+			return 0, 0, 0, nil, err
 		}
 		return obfsOpen(cf.sealer, buf)
 	}
 
 	n := int(binary.BigEndian.Uint16(hdr[:]))
 	if n < 2 {
-		return 0, nil, errDesync
+		return 0, 0, 0, nil, errDesync
 	}
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(cf.r, buf); err != nil {
-		return 0, nil, err
+		return 0, 0, 0, nil, err
 	}
 	if buf[0] != magic {
-		return 0, nil, errDesync
+		return 0, 0, 0, nil, errDesync
 	}
-	typ := buf[1]
-	if typ == typeData {
+	typ = buf[1]
+	if typ == typeData { // only data is sealed on the wire (control stays cleartext, like the old build)
 		sealed := buf[2:n]
 		if cf.sealer != nil {
-			opened, err := cf.sealer.Open(sealed)
+			session, seq, opened, err := cf.sealer.Open(sealed)
 			if err != nil {
-				return 0, nil, err
+				return 0, 0, 0, nil, err
 			}
-			return typ, opened, nil
+			return typ, session, seq, opened, nil
 		}
-		return typ, sealed, nil
+		return typ, 0, 0, sealed, nil
 	}
-	return typ, nil, nil
+	return typ, 0, 0, nil, nil
 }
 
 // BipTCP carries L3 packets between a TUN device and a TCP peer.
@@ -218,6 +220,7 @@ type BipTCP struct {
 	cur     atomic.Pointer[connFramer] // currently live connection (nil when none)
 	closed  atomic.Bool
 	closeCh chan struct{}
+	rp      atomicReplayGuard // anti-replay for DATA frames, shared across (re)connections
 }
 
 func idleFor(keepalive time.Duration) time.Duration {
@@ -307,7 +310,7 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 	}
 	// obfs: read+authenticate the first frame silently before revealing anything.
 	conn.SetReadDeadline(time.Now().Add(b.idle))
-	typ, payload, err := cf.readFrame()
+	typ, _, _, payload, err := cf.readFrame()
 	if err != nil {
 		conn.Close() // probe / wrong PSK: no reply, no log noise
 		return
@@ -377,15 +380,18 @@ func (b *BipTCP) handleFrame(cf *connFramer, typ byte, payload []byte) {
 // serve reads framed messages from one connection until it errors or closes.
 // onConnErr clears the live pointer on exit, so both the client (which redials)
 // and the server converge on "no live connection" without extra bookkeeping.
+// The read deadline is now refreshed every frame in ALL modes (not just obfs) so
+// a peer that dies without a FIN/RST is reaped instead of pinning a goroutine.
 func (b *BipTCP) serve(cf *connFramer) {
 	for {
-		if b.obfs {
-			cf.conn.SetReadDeadline(time.Now().Add(b.idle))
-		}
-		typ, payload, err := cf.readFrame()
+		cf.conn.SetReadDeadline(time.Now().Add(b.idle))
+		typ, session, seq, payload, err := cf.readFrame()
 		if err != nil {
 			b.onConnErr(cf, err)
 			return
+		}
+		if typ == typeData && cf.sealer != nil && !b.rp.ok(session, seq) {
+			continue // replayed data frame -> drop, keep the connection
 		}
 		b.handleFrame(cf, typ, payload)
 	}

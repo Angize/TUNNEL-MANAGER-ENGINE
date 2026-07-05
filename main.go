@@ -43,6 +43,17 @@ func main() {
 		log.Fatalf("tnl-engine: config: %v", err)
 	}
 
+	// Open the TUN device BEFORE building the sealer. The sealer's constructor may
+	// draw from crypto/rand; on hosts without getrandom(2) that opens /dev/urandom
+	// and registers it with the runtime netpoller, which can leave a subsequently
+	// opened TUN fd in a half-pollable state (reads fail with "not pollable" and
+	// the reader loop dies). Setting up the TUN first avoids that ordering hazard.
+	dev, err := tun.Open(cfg.TunName, cfg.MTU, cfg.TunAddr)
+	if err != nil {
+		log.Fatalf("tnl-engine: tun: %v", err)
+	}
+	defer dev.Close()
+
 	var sealer packet.Sealer
 	cipherName := "off"
 	if cfg.Crypto.Enabled {
@@ -53,12 +64,6 @@ func main() {
 		sealer = s
 		cipherName = s.Name
 	}
-
-	dev, err := tun.Open(cfg.TunName, cfg.MTU, cfg.TunAddr)
-	if err != nil {
-		log.Fatalf("tnl-engine: tun: %v", err)
-	}
-	defer dev.Close()
 	log.Printf("tnl-engine %s: tun=%s addr=%s mtu=%d cipher=%s role=%s",
 		version, dev.Name, cfg.TunAddr, cfg.MTU, cipherName, cfg.Role)
 

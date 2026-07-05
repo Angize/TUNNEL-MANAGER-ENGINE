@@ -25,7 +25,7 @@ func TestObfsSealOpenRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatalf("seal: %v", err)
 			}
-			gotTyp, gotPt, err := obfsOpen(s, sealed)
+			gotTyp, _, _, gotPt, err := obfsOpen(s, sealed)
 			if err != nil {
 				t.Fatalf("open: %v", err)
 			}
@@ -41,7 +41,7 @@ func TestObfsSealOpenRoundTrip(t *testing.T) {
 
 func TestObfsNoConstantPrefix(t *testing.T) {
 	// The whole sealed frame must look random: sealing the SAME plaintext twice
-	// must differ (random nonce), and no fixed leading byte like the old magic.
+	// must differ (advancing nonce), and no fixed leading byte like the old magic.
 	s := mustSealer(t, "prefix-psk-abcdefabcdef")
 	a, _ := obfsSeal(s, typeData, []byte("hello"), 0)
 	b, _ := obfsSeal(s, typeData, []byte("hello"), 0)
@@ -57,14 +57,14 @@ func TestObfsTamperFails(t *testing.T) {
 	s := mustSealer(t, "tamper-psk-0987654321")
 	sealed, _ := obfsSeal(s, typeData, []byte("secret payload"), 0)
 	sealed[len(sealed)-1] ^= 0xFF // flip a tag byte
-	if _, _, err := obfsOpen(s, sealed); err == nil {
+	if _, _, _, _, err := obfsOpen(s, sealed); err == nil {
 		t.Fatal("tampered frame opened without error")
 	}
 }
 
 func TestObfsWrongPSKFails(t *testing.T) {
 	sealed, _ := obfsSeal(mustSealer(t, "psk-alpha-1111111111"), typeData, []byte("hi"), 0)
-	if _, _, err := obfsOpen(mustSealer(t, "psk-beta-22222222222"), sealed); err == nil {
+	if _, _, _, _, err := obfsOpen(mustSealer(t, "psk-beta-22222222222"), sealed); err == nil {
 		t.Fatal("frame opened under the wrong PSK (no probe resistance)")
 	}
 }
@@ -79,6 +79,24 @@ func TestObfsPaddingVaries(t *testing.T) {
 	}
 	if len(sizes) < 4 {
 		t.Fatalf("padding not varying: only %d distinct sizes over 64 frames", len(sizes))
+	}
+}
+
+// TestObfsOpenReportsSeq checks obfsOpen surfaces the sender's monotonically
+// increasing sequence number so the carrier can feed it to the replay window.
+func TestObfsOpenReportsSeq(t *testing.T) {
+	s := mustSealer(t, "seq-obfs-psk-000000")
+	var prev uint64
+	for i := 0; i < 50; i++ {
+		sealed, _ := obfsSeal(s, typeData, []byte("d"), 0)
+		_, _, seq, _, err := obfsOpen(s, sealed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i > 0 && seq != prev+1 {
+			t.Fatalf("seq not monotonic: %d -> %d", prev, seq)
+		}
+		prev = seq
 	}
 }
 
