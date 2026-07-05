@@ -123,5 +123,8 @@ func (c *Config) validate() error {
 	if c.Cover && c.Transport == "udp" {
 		return errors.New("cover (TLS) requires transport \"tcp\"")
 	}
+	if c.Cover && c.CoverSNI == "" {
+		return errors.New("cover (TLS) requires cover_sni (the SNI to present)")
+	}
 	return nil
 }

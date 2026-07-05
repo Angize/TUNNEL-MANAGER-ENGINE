@@ -288,11 +288,8 @@ func ListenTCP(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs
 		idle: idleFor(keepalive), addr: listenAddr, ln: ln, closeCh: make(chan struct{}),
 		preAuth: make(chan struct{}, maxPreAuthConns)}
 	if cover {
-		host := coverSNI
-		if host == "" {
-			host = "www.microsoft.com"
-		}
-		b.cert, err = tlscover.SelfSignedCert(host)
+		// coverSNI is required (validated in config); no imposed default.
+		b.cert, err = tlscover.SelfSignedCert(coverSNI)
 		if err != nil {
 			ln.Close()
 			return nil, err
