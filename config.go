@@ -24,6 +24,11 @@ type Config struct {
 	Mode    string `json:"mode"`    // "packet" (only mode implemented in this slice)
 	Profile string `json:"profile"` // "bip" (only profile implemented in this slice)
 
+	// Transport selects the carrier for bip frames: "udp" (default,
+	// NAT-friendly datagrams) or "tcp" (stream, length-prefixed frames,
+	// survives raw-IP/UDP filtering and rides existing TCP-friendly paths).
+	Transport string `json:"transport"`
+
 	Listen string `json:"listen"` // server: bind address, e.g. "0.0.0.0:9000"
 	Peer   string `json:"peer"`   // client: server address, e.g. "1.2.3.4:9000"
 
@@ -34,6 +39,13 @@ type Config struct {
 
 	Keepalive int       `json:"keepalive"` // client ping interval in seconds (default 15)
 	Crypto    CryptoCfg `json:"crypto"`
+
+	// Obfs turns on anti-DPI framing: the constant magic byte is dropped, the
+	// frame type is folded into the AEAD-sealed plaintext, random padding and
+	// keepalive jitter break size/timing fingerprints, and (TCP) the length
+	// prefix is masked with a PSK-derived keystream. It requires crypto because
+	// the obfuscation and probe resistance both rely on the AEAD key.
+	Obfs bool `json:"obfs"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -62,6 +74,9 @@ func (c *Config) applyDefaults() {
 	if c.Crypto.Cipher == "" {
 		c.Crypto.Cipher = "aes-256-gcm"
 	}
+	if c.Transport == "" {
+		c.Transport = "udp"
+	}
 }
 
 func (c *Config) validate() error {
@@ -83,11 +98,20 @@ func (c *Config) validate() error {
 	default:
 		return errors.New("role must be \"server\" or \"client\"")
 	}
+	switch c.Transport {
+	case "", "udp", "tcp":
+		// ok ("" defaults to udp in applyDefaults)
+	default:
+		return errors.New("transport must be \"udp\" or \"tcp\"")
+	}
 	if c.TunAddr == "" {
 		return errors.New("tun_addr is required")
 	}
 	if c.Crypto.Enabled && c.Crypto.PSK == "" {
 		return errors.New("crypto enabled but psk is empty")
+	}
+	if c.Obfs && !c.Crypto.Enabled {
+		return errors.New("obfs requires crypto enabled")
 	}
 	return nil
 }

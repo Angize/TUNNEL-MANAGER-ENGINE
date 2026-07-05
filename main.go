@@ -62,18 +62,44 @@ func main() {
 	log.Printf("tnl-engine %s: tun=%s addr=%s mtu=%d cipher=%s role=%s",
 		version, dev.Name, cfg.TunAddr, cfg.MTU, cipherName, cfg.Role)
 
-	var b *packet.Bip
+	// carrier is satisfied by both the UDP (packet.Bip) and TCP (packet.BipTCP)
+	// bip implementations; cfg.Transport selects which one is built.
+	type carrier interface {
+		Run() error
+		Close() error
+	}
+	var b carrier
 	ka := time.Duration(cfg.Keepalive) * time.Second
-	switch cfg.Role {
-	case "server":
-		b, err = packet.Listen(cfg.Listen, dev, sealer, ka)
-		if err == nil {
-			log.Printf("tnl-engine: listening (bip/udp) on %s", cfg.Listen)
+	obfsTag := ""
+	if cfg.Obfs {
+		obfsTag = " obfs"
+	}
+	switch cfg.Transport {
+	case "tcp":
+		switch cfg.Role {
+		case "server":
+			b, err = packet.ListenTCP(cfg.Listen, dev, sealer, ka, cfg.Obfs, cfg.Crypto.PSK)
+			if err == nil {
+				log.Printf("tnl-engine: listening (bip/tcp%s) on %s", obfsTag, cfg.Listen)
+			}
+		case "client":
+			b, err = packet.DialTCP(cfg.Peer, dev, sealer, ka, cfg.Obfs, cfg.Crypto.PSK)
+			if err == nil {
+				log.Printf("tnl-engine: dialing (bip/tcp%s) %s", obfsTag, cfg.Peer)
+			}
 		}
-	case "client":
-		b, err = packet.Dial(cfg.Peer, dev, sealer, ka)
-		if err == nil {
-			log.Printf("tnl-engine: dialing (bip/udp) %s", cfg.Peer)
+	default: // "udp"
+		switch cfg.Role {
+		case "server":
+			b, err = packet.Listen(cfg.Listen, dev, sealer, ka, cfg.Obfs)
+			if err == nil {
+				log.Printf("tnl-engine: listening (bip/udp%s) on %s", obfsTag, cfg.Listen)
+			}
+		case "client":
+			b, err = packet.Dial(cfg.Peer, dev, sealer, ka, cfg.Obfs)
+			if err == nil {
+				log.Printf("tnl-engine: dialing (bip/udp%s) %s", obfsTag, cfg.Peer)
+			}
 		}
 	}
 	if err != nil {

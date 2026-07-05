@@ -48,13 +48,14 @@ type Bip struct {
 	dev       *tun.Device
 	sealer    Sealer
 	keepalive time.Duration
+	obfs      bool // anti-DPI framing: no magic, folded type, padding, jitter
 
 	peer   atomic.Pointer[net.UDPAddr] // current known peer (server learns it)
 	isClient bool
 }
 
 // Dial (client role) binds an ephemeral UDP socket and targets peerAddr.
-func Dial(peerAddr string, dev *tun.Device, sealer Sealer, keepalive time.Duration) (*Bip, error) {
+func Dial(peerAddr string, dev *tun.Device, sealer Sealer, keepalive time.Duration, obfs bool) (*Bip, error) {
 	ra, err := net.ResolveUDPAddr("udp", peerAddr)
 	if err != nil {
 		return nil, err
@@ -63,13 +64,13 @@ func Dial(peerAddr string, dev *tun.Device, sealer Sealer, keepalive time.Durati
 	if err != nil {
 		return nil, err
 	}
-	b := &Bip{conn: conn, dev: dev, sealer: sealer, keepalive: keepalive, isClient: true}
+	b := &Bip{conn: conn, dev: dev, sealer: sealer, keepalive: keepalive, obfs: obfs, isClient: true}
 	b.peer.Store(ra)
 	return b, nil
 }
 
 // Listen (server role) binds listenAddr and waits to learn the peer.
-func Listen(listenAddr string, dev *tun.Device, sealer Sealer, keepalive time.Duration) (*Bip, error) {
+func Listen(listenAddr string, dev *tun.Device, sealer Sealer, keepalive time.Duration, obfs bool) (*Bip, error) {
 	la, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		return nil, err
@@ -78,7 +79,7 @@ func Listen(listenAddr string, dev *tun.Device, sealer Sealer, keepalive time.Du
 	if err != nil {
 		return nil, err
 	}
-	return &Bip{conn: conn, dev: dev, sealer: sealer, keepalive: keepalive}, nil
+	return &Bip{conn: conn, dev: dev, sealer: sealer, keepalive: keepalive, obfs: obfs}, nil
 }
 
 // Run blocks until one of the loops fails (e.g. the socket or device closes).
@@ -107,19 +108,30 @@ func (b *Bip) tunToNet() error {
 		if peer == nil {
 			continue // server has not learned the client yet; drop
 		}
-		payload := buf[:n]
-		if b.sealer != nil {
-			sealed, err := b.sealer.Seal(payload)
+		var frame []byte
+		if b.obfs {
+			// Obfuscated: seal [type][len][pkt][pad]; no cleartext header.
+			sealed, err := obfsSeal(b.sealer, typeData, buf[:n], obfsDataPadMax)
 			if err != nil {
-				log.Printf("bip: seal error: %v", err)
+				log.Printf("bip: obfs seal error: %v", err)
 				continue
 			}
-			payload = sealed
+			frame = sealed
+		} else {
+			payload := buf[:n]
+			if b.sealer != nil {
+				sealed, err := b.sealer.Seal(payload)
+				if err != nil {
+					log.Printf("bip: seal error: %v", err)
+					continue
+				}
+				payload = sealed
+			}
+			frame = make([]byte, 2+len(payload))
+			frame[0] = magic
+			frame[1] = typeData
+			copy(frame[2:], payload)
 		}
-		frame := make([]byte, 2+len(payload))
-		frame[0] = magic
-		frame[1] = typeData
-		copy(frame[2:], payload)
 		if _, err := b.conn.WriteToUDP(frame, peer); err != nil {
 			log.Printf("bip: write error: %v", err)
 		}
@@ -135,26 +147,45 @@ func (b *Bip) netToTun() error {
 		if err != nil {
 			return err
 		}
-		if n < 2 || buf[0] != magic {
-			continue // not ours
+		var (
+			typ     byte
+			payload []byte
+		)
+		if b.obfs {
+			// The only "is this ours?" test is a successful AEAD open. Garbage
+			// (a DPI probe, wrong PSK) fails and is dropped with no response —
+			// the server never emits an identifying byte to a stranger.
+			t, pt, oerr := obfsOpen(b.sealer, buf[:n])
+			if oerr != nil {
+				continue
+			}
+			typ, payload = t, pt
+		} else {
+			if n < 2 || buf[0] != magic {
+				continue // not ours
+			}
+			typ = buf[1]
+			if typ == typeData {
+				pt := buf[2:n]
+				if b.sealer != nil {
+					opened, oerr := b.sealer.Open(pt)
+					if oerr != nil {
+						log.Printf("bip: open error (auth fail?): %v", oerr)
+						continue
+					}
+					pt = opened
+				}
+				payload = pt
+			}
 		}
-		// Any valid frame tells us where the peer currently is.
+		// Any authenticated frame tells us where the peer currently is.
 		b.peer.Store(addr)
-		switch buf[1] {
+		switch typ {
 		case typePing:
 			b.send(typePong, nil, addr)
 		case typePong:
 			// keepalive ack; nothing else to do
 		case typeData:
-			payload := buf[2:n]
-			if b.sealer != nil {
-				opened, err := b.sealer.Open(payload)
-				if err != nil {
-					log.Printf("bip: open error (auth fail?): %v", err)
-					continue
-				}
-				payload = opened
-			}
 			if _, err := b.dev.Write(payload); err != nil {
 				log.Printf("bip: tun write error: %v", err)
 			}
@@ -163,10 +194,13 @@ func (b *Bip) netToTun() error {
 }
 
 func (b *Bip) keepaliveLoop() {
-	t := time.NewTicker(b.keepalive)
-	defer t.Stop()
 	b.send(typePing, nil, b.peer.Load()) // prime immediately
-	for range t.C {
+	for {
+		d := b.keepalive
+		if b.obfs {
+			d = jitter(d) // break the fixed keepalive period
+		}
+		time.Sleep(d)
 		if peer := b.peer.Load(); peer != nil {
 			b.send(typePing, nil, peer)
 		}
@@ -177,10 +211,19 @@ func (b *Bip) send(typ byte, payload []byte, to *net.UDPAddr) {
 	if to == nil {
 		return
 	}
-	frame := make([]byte, 2+len(payload))
-	frame[0] = magic
-	frame[1] = typ
-	copy(frame[2:], payload)
+	var frame []byte
+	if b.obfs {
+		sealed, err := obfsSeal(b.sealer, typ, payload, padMaxFor(typ))
+		if err != nil {
+			return
+		}
+		frame = sealed
+	} else {
+		frame = make([]byte, 2+len(payload))
+		frame[0] = magic
+		frame[1] = typ
+		copy(frame[2:], payload)
+	}
 	_, _ = b.conn.WriteToUDP(frame, to)
 }
 
