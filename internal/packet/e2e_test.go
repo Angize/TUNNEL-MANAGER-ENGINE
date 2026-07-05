@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/crypto"
 	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tun"
 )
 
@@ -85,8 +84,8 @@ type carrier interface {
 // (tcp) handshake, the paths a live node runs.
 func runTunnel(t *testing.T, transport string, obfs bool) {
 	const psk = "e2e-shared-pre-shared-key-1234567890"
-	sSealer, _ := crypto.NewSealer("aes-256-gcm", psk, false) // server
-	cSealer, _ := crypto.NewSealer("aes-256-gcm", psk, true)  // client
+	const cipher = "aes-256-gcm"
+	const cryptoOn = true // exercises the full ephemeral handshake + session keys
 	srvDev, srvCtrl := tunPair(t, "srv")
 	cliDev, cliCtrl := tunPair(t, "cli")
 	ka := 1 * time.Second
@@ -95,21 +94,21 @@ func runTunnel(t *testing.T, transport string, obfs bool) {
 	var err error
 	if transport == "tcp" {
 		addr := freeTCPPort(t)
-		srv, err = ListenTCP(addr, srvDev, sSealer, ka, obfs, psk)
+		srv, err = ListenTCP(addr, srvDev, ka, obfs, cryptoOn, psk, cipher)
 		if err != nil {
 			t.Fatalf("ListenTCP: %v", err)
 		}
-		cli, err = DialTCP(addr, cliDev, cSealer, ka, obfs, psk)
+		cli, err = DialTCP(addr, cliDev, ka, obfs, cryptoOn, psk, cipher)
 		if err != nil {
 			t.Fatalf("DialTCP: %v", err)
 		}
 	} else {
 		addr := freeUDPPort(t)
-		srv, err = Listen(addr, srvDev, sSealer, ka, obfs)
+		srv, err = Listen(addr, srvDev, ka, obfs, cryptoOn, psk, cipher)
 		if err != nil {
 			t.Fatalf("Listen: %v", err)
 		}
-		cli, err = Dial(addr, cliDev, cSealer, ka, obfs)
+		cli, err = Dial(addr, cliDev, ka, obfs, cryptoOn, psk, cipher)
 		if err != nil {
 			t.Fatalf("Dial: %v", err)
 		}

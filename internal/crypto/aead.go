@@ -129,20 +129,34 @@ func aeadFactory(name string) (mk func(key []byte) (cipher.AEAD, error), keyLen 
 	}
 }
 
-// NewSealer builds a Sealer for the named cipher keyed from psk. isClient selects
-// which direction key it seals with (client seals c→s, opens s→c; server the
-// reverse), so the two ends of a tunnel interoperate.
+// NewSealer builds a Sealer for the named cipher keyed statically from psk.
+// isClient selects which direction key it seals with (client seals c→s, opens
+// s→c; server the reverse), so the two ends of a tunnel interoperate. This is the
+// pre-handshake / no-forward-secrecy path; sealerFromKeys is used once an
+// ephemeral session is negotiated (see handshake.go).
 func NewSealer(cipherName, psk string, isClient bool) (*Sealer, error) {
 	name := ResolveCipher(cipherName)
-	mk, keyLen, err := aeadFactory(name)
+	_, keyLen, err := aeadFactory(name)
 	if err != nil {
 		return nil, err
 	}
-	c2sKey := deriveKey(psk, "aead|c2s|"+name, keyLen)
-	s2cKey := deriveKey(psk, "aead|s2c|"+name, keyLen)
-	c2sMask := deriveKey(psk, "mask|c2s", maskKeyLen)
-	s2cMask := deriveKey(psk, "mask|s2c", maskKeyLen)
+	return sealerFromKeys(name,
+		deriveKey(psk, "aead|c2s|"+name, keyLen),
+		deriveKey(psk, "aead|s2c|"+name, keyLen),
+		deriveKey(psk, "mask|c2s", maskKeyLen),
+		deriveKey(psk, "mask|s2c", maskKeyLen),
+		isClient)
+}
 
+// sealerFromKeys assembles a Sealer from already-derived per-direction key
+// material (AEAD keys + wire-mask keys). The caller supplies the c→s and s→c
+// keys; isClient wires send/recv to the right one. Used by both the static PSK
+// path (NewSealer) and the ephemeral handshake path.
+func sealerFromKeys(name string, c2sKey, s2cKey, c2sMask, s2cMask []byte, isClient bool) (*Sealer, error) {
+	mk, _, err := aeadFactory(name)
+	if err != nil {
+		return nil, err
+	}
 	s := &Sealer{Name: name}
 	var sendKey, recvKey []byte
 	if isClient {

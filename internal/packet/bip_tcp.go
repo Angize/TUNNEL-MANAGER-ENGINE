@@ -38,6 +38,7 @@ import (
 
 	"golang.org/x/crypto/chacha20"
 
+	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/crypto"
 	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tun"
 )
 
@@ -233,7 +234,8 @@ func (cf *connFramer) readFrame() (typ byte, session uint64, seq uint64, payload
 // BipTCP carries L3 packets between a TUN device and a TCP peer.
 type BipTCP struct {
 	dev       *tun.Device
-	sealer    Sealer
+	cryptoOn  bool
+	cipher    string
 	keepalive time.Duration
 	obfs      bool
 	psk       string
@@ -259,18 +261,18 @@ func idleFor(keepalive time.Duration) time.Duration {
 }
 
 // DialTCP (client role) targets peerAddr and reconnects on drop.
-func DialTCP(peerAddr string, dev *tun.Device, sealer Sealer, keepalive time.Duration, obfs bool, psk string) (*BipTCP, error) {
-	return &BipTCP{dev: dev, sealer: sealer, keepalive: keepalive, obfs: obfs, psk: psk,
+func DialTCP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*BipTCP, error) {
+	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
 }
 
 // ListenTCP (server role) binds listenAddr and accepts connections.
-func ListenTCP(listenAddr string, dev *tun.Device, sealer Sealer, keepalive time.Duration, obfs bool, psk string) (*BipTCP, error) {
+func ListenTCP(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*BipTCP, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
-	return &BipTCP{dev: dev, sealer: sealer, keepalive: keepalive, obfs: obfs, psk: psk,
+	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		idle: idleFor(keepalive), addr: listenAddr, ln: ln, closeCh: make(chan struct{}),
 		preAuth: make(chan struct{}, maxPreAuthConns)}, nil
 }
@@ -303,8 +305,61 @@ func (b *BipTCP) Close() error {
 	return nil
 }
 
+// newFramer builds a connFramer with NO sealer yet. In clear mode it stays nil;
+// in crypto mode the ephemeral handshake installs the session sealer before any
+// framed data is read or written.
 func (b *BipTCP) newFramer(conn net.Conn) *connFramer {
-	return &connFramer{conn: conn, r: bufio.NewReaderSize(conn, readBufSize), sealer: b.sealer, obfs: b.obfs, psk: b.psk}
+	return &connFramer{conn: conn, r: bufio.NewReaderSize(conn, readBufSize), obfs: b.obfs, psk: b.psk}
+}
+
+// clientHandshake (client) sends an init and reads the responder's reply, then
+// installs the ephemeral session sealer. Runs under the caller's read deadline.
+func (b *BipTCP) clientHandshake(cf *connFramer) error {
+	ci, err := crypto.GenerateEphemeral()
+	if err != nil {
+		return err
+	}
+	if _, err := cf.conn.Write(crypto.InitMsg(b.psk, ci)); err != nil {
+		return err
+	}
+	resp := make([]byte, crypto.HandshakeSize)
+	if _, err := io.ReadFull(cf.r, resp); err != nil {
+		return err
+	}
+	eResp, err := crypto.ParseResp(b.psk, ci.Pub, resp)
+	if err != nil {
+		return err
+	}
+	s, err := crypto.SessionSealer(b.cipher, b.psk, ci, eResp, ci.Pub, eResp, true)
+	if err != nil {
+		return err
+	}
+	cf.sealer = s
+	return nil
+}
+
+// serverHandshake (server) reads an init, authenticates it, installs the session
+// sealer, and replies. A wrong PSK / probe fails ParseInit and gets no response.
+func (b *BipTCP) serverHandshake(cf *connFramer) error {
+	init := make([]byte, crypto.HandshakeSize)
+	if _, err := io.ReadFull(cf.r, init); err != nil {
+		return err
+	}
+	eInit, err := crypto.ParseInit(b.psk, init)
+	if err != nil {
+		return err
+	}
+	sr, err := crypto.GenerateEphemeral()
+	if err != nil {
+		return err
+	}
+	s, err := crypto.SessionSealer(b.cipher, b.psk, sr, eInit, eInit, sr.Pub, false)
+	if err != nil {
+		return err
+	}
+	cf.sealer = s
+	_, err = cf.conn.Write(crypto.RespMsg(b.psk, eInit, sr))
+	return err
 }
 
 // acceptLoop (server) hands each new connection to a per-connection goroutine.
@@ -362,7 +417,7 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 	defer release()
 
 	cf := b.newFramer(conn)
-	if b.sealer == nil {
+	if !b.cryptoOn {
 		log.Printf("bip/tcp: peer connected from %s (clear)", conn.RemoteAddr())
 		if old := b.cur.Swap(cf); old != nil {
 			old.conn.Close()
@@ -371,10 +426,15 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 		b.serve(cf)
 		return
 	}
-	// crypto on: read+authenticate the first frame silently before revealing or
-	// publishing anything. A wrong PSK or a replayed capture is dropped in silence.
-	// A SHORT handshake deadline (not the 60 s idle) bounds the pre-auth hold.
+	// crypto on: run the ephemeral handshake, then read+authenticate the first
+	// framed message silently before publishing. A wrong PSK / probe fails the
+	// handshake and is dropped in silence. A SHORT handshake deadline (not the
+	// 60 s idle) bounds the pre-auth hold.
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+	if err := b.serverHandshake(cf); err != nil {
+		conn.Close()
+		return
+	}
 	typ, session, seq, payload, err := cf.readFrame()
 	if err != nil || !b.rp.ok(session, seq) {
 		conn.Close() // probe / wrong PSK / replay: no reply, no log noise
@@ -410,9 +470,18 @@ func (b *BipTCP) dialLoop() {
 			continue
 		}
 		cf := b.newFramer(conn)
+		conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+		if b.cryptoOn { // ephemeral handshake first: establishes the session sealer
+			if err := b.clientHandshake(cf); err != nil {
+				conn.Close()
+				if b.sleep(1 * time.Second) {
+					return
+				}
+				continue
+			}
+		}
 		if b.obfs {
-			conn.SetReadDeadline(time.Now().Add(b.idle))
-			if err := cf.sendSalt(); err != nil { // client speaks first
+			if err := cf.sendSalt(); err != nil { // client speaks first (length-mask salt)
 				conn.Close()
 				if b.sleep(1 * time.Second) {
 					return

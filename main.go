@@ -54,16 +54,19 @@ func main() {
 	}
 	defer dev.Close()
 
-	var sealer packet.Sealer
 	cipherName := "off"
 	if cfg.Crypto.Enabled {
+		// Validate the cipher/PSK up front (fail fast); the carriers build the
+		// actual per-session sealers after the ephemeral handshake.
 		s, err := crypto.NewSealer(cfg.Crypto.Cipher, cfg.Crypto.PSK, cfg.Role == "client")
 		if err != nil {
 			log.Fatalf("tnl-engine: crypto: %v", err)
 		}
-		sealer = s
 		cipherName = s.Name
 	} else {
+		if cfg.Obfs {
+			log.Fatalf("tnl-engine: obfs requires crypto (there is no key to obfuscate with) — enable crypto or disable obfs")
+		}
 		// Clear mode has NO authentication: a single spoofed datagram can rebind
 		// the peer or inject a packet into the TUN. Make that impossible to miss.
 		log.Printf("tnl-engine: WARNING crypto is DISABLED — the tunnel is unauthenticated " +
@@ -85,16 +88,17 @@ func main() {
 	if cfg.Obfs {
 		obfsTag = " obfs"
 	}
+	cryptoOn := cfg.Crypto.Enabled
 	switch cfg.Transport {
 	case "tcp":
 		switch cfg.Role {
 		case "server":
-			b, err = packet.ListenTCP(cfg.Listen, dev, sealer, ka, cfg.Obfs, cfg.Crypto.PSK)
+			b, err = packet.ListenTCP(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
 			if err == nil {
 				log.Printf("tnl-engine: listening (bip/tcp%s) on %s", obfsTag, cfg.Listen)
 			}
 		case "client":
-			b, err = packet.DialTCP(cfg.Peer, dev, sealer, ka, cfg.Obfs, cfg.Crypto.PSK)
+			b, err = packet.DialTCP(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
 			if err == nil {
 				log.Printf("tnl-engine: dialing (bip/tcp%s) %s", obfsTag, cfg.Peer)
 			}
@@ -102,12 +106,12 @@ func main() {
 	default: // "udp"
 		switch cfg.Role {
 		case "server":
-			b, err = packet.Listen(cfg.Listen, dev, sealer, ka, cfg.Obfs)
+			b, err = packet.Listen(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
 			if err == nil {
 				log.Printf("tnl-engine: listening (bip/udp%s) on %s", obfsTag, cfg.Listen)
 			}
 		case "client":
-			b, err = packet.Dial(cfg.Peer, dev, sealer, ka, cfg.Obfs)
+			b, err = packet.Dial(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
 			if err == nil {
 				log.Printf("tnl-engine: dialing (bip/udp%s) %s", obfsTag, cfg.Peer)
 			}
