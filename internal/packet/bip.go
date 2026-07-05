@@ -27,6 +27,7 @@ import (
 	"errors"
 	"log"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -62,6 +63,9 @@ type Bip struct {
 	peer     atomic.Pointer[net.UDPAddr] // current known peer (server learns it)
 	isClient bool
 	rp       replayGuard // driven only by netToTun (single receiver goroutine)
+
+	closeCh   chan struct{} // closed by Close() to stop the keepalive loop
+	closeOnce sync.Once
 }
 
 // Dial (client role) binds an ephemeral UDP socket and targets peerAddr.
@@ -74,7 +78,7 @@ func Dial(peerAddr string, dev *tun.Device, sealer Sealer, keepalive time.Durati
 	if err != nil {
 		return nil, err
 	}
-	b := &Bip{conn: conn, dev: dev, sealer: sealer, keepalive: keepalive, obfs: obfs, isClient: true}
+	b := &Bip{conn: conn, dev: dev, sealer: sealer, keepalive: keepalive, obfs: obfs, isClient: true, closeCh: make(chan struct{})}
 	b.peer.Store(ra)
 	return b, nil
 }
@@ -89,7 +93,7 @@ func Listen(listenAddr string, dev *tun.Device, sealer Sealer, keepalive time.Du
 	if err != nil {
 		return nil, err
 	}
-	return &Bip{conn: conn, dev: dev, sealer: sealer, keepalive: keepalive, obfs: obfs}, nil
+	return &Bip{conn: conn, dev: dev, sealer: sealer, keepalive: keepalive, obfs: obfs, closeCh: make(chan struct{})}, nil
 }
 
 // Run blocks until one of the loops fails (e.g. the socket or device closes).
@@ -103,8 +107,12 @@ func (b *Bip) Run() error {
 	return <-errc
 }
 
-// Close tears down the socket, which unblocks both loops.
-func (b *Bip) Close() error { return b.conn.Close() }
+// Close tears down the socket (which unblocks both loops) and stops the
+// keepalive loop. Safe to call more than once.
+func (b *Bip) Close() error {
+	b.closeOnce.Do(func() { close(b.closeCh) })
+	return b.conn.Close()
+}
 
 // frame builds one datagram for typ/payload. With crypto on every type is
 // sealed (ping/pong seal an empty payload) so control frames are authenticated;
@@ -208,11 +216,13 @@ func (b *Bip) netToTun() error {
 func (b *Bip) keepaliveLoop() {
 	b.send(typePing, nil, b.peer.Load()) // prime immediately
 	for {
-		d := b.keepalive
-		if b.obfs {
-			d = jitter(d) // break the fixed keepalive period
+		// Jitter the period in ALL modes: a fixed keepalive clock is a passive
+		// timing fingerprint even without obfs framing.
+		select {
+		case <-b.closeCh:
+			return
+		case <-time.After(jitter(b.keepalive)):
 		}
-		time.Sleep(d)
 		if peer := b.peer.Load(); peer != nil {
 			b.send(typePing, nil, peer)
 		}

@@ -11,7 +11,7 @@
 // legitimately restarted peer (new random prefix, counter back to 1) reconnect.
 package packet
 
-import "sync/atomic"
+import "sync"
 
 const replayWindow = 64
 
@@ -64,17 +64,16 @@ func (g *replayGuard) ok(session, seq uint64) bool {
 // goroutine may validate frames for the same inbound direction (the TCP server
 // authenticates a connection's first frame on the accept goroutine, then the
 // serve loop continues on the same goroutine — but a stray second connection
-// could race). A single mutex-free CAS loop is overkill here, so it simply wraps
-// ok() behind a spin using atomic swap on a busy flag.
+// could race). Contention is rare and the critical section is a few field
+// updates, so a plain mutex is both correct and cheaper than a busy-spin (which
+// could burn a core while the holder is descheduled under a connection flood).
 type atomicReplayGuard struct {
-	busy atomic.Bool
-	g    replayGuard
+	mu sync.Mutex
+	g  replayGuard
 }
 
 func (a *atomicReplayGuard) ok(session, seq uint64) bool {
-	for !a.busy.CompareAndSwap(false, true) {
-	}
-	v := a.g.ok(session, seq)
-	a.busy.Store(false)
-	return v
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.g.ok(session, seq)
 }
