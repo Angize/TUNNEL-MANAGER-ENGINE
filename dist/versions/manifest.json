@@ -1,0 +1,7 @@
+{
+  "latest": "v2",
+  "versions": [
+    {"id": "v2", "label": "v2 — سخت‌گیرانه (ضدِ ربایش + ضدِ replay)", "sha256": "8aef3ae52557177e860b3a0eea447588ef467481160706e812e79c9bd3da5cbf", "default": true},
+    {"id": "v1", "label": "v1 — پایدار (پیش از سخت‌سازی)", "sha256": "25dfba90322c259c78598d2f52e71ae839bc15b886153b808bb71d163b1f3da7"}
+  ]
+}
