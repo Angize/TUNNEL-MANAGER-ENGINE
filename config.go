@@ -63,6 +63,13 @@ type Config struct {
 	// the cover the server borrows. TCP only; bip/PSK runs inside the TLS tunnel.
 	Cover    bool   `json:"cover"`
 	CoverSNI string `json:"cover_sni"`
+
+	// GSO opens the TUN with a virtio-net header and TCP/UDP segmentation
+	// offload, so the kernel hands the engine large super-packets on bulk
+	// transfers instead of many MTU-sized ones — fewer syscalls/copies, higher
+	// throughput. It is a local optimization only (the wire format is unchanged)
+	// and each side can enable it independently. Linux only.
+	GSO bool `json:"gso"`
 }
 
 func loadConfig(path string) (*Config, error) {

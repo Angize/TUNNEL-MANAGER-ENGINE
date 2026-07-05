@@ -48,7 +48,7 @@ func main() {
 	// and registers it with the runtime netpoller, which can leave a subsequently
 	// opened TUN fd in a half-pollable state (reads fail with "not pollable" and
 	// the reader loop dies). Setting up the TUN first avoids that ordering hazard.
-	dev, err := tun.Open(cfg.TunName, cfg.MTU, cfg.TunAddr)
+	dev, err := tun.Open(cfg.TunName, cfg.MTU, cfg.TunAddr, cfg.GSO)
 	if err != nil {
 		log.Fatalf("tnl-engine: tun: %v", err)
 	}
@@ -73,8 +73,12 @@ func main() {
 			"and unencrypted; anyone who can send a packet to this listener can hijack or " +
 			"inject into it. Enable crypto unless this is a trusted, isolated link.")
 	}
-	log.Printf("tnl-engine %s: tun=%s addr=%s mtu=%d cipher=%s role=%s",
-		version, dev.Name, cfg.TunAddr, cfg.MTU, cipherName, cfg.Role)
+	gsoTag := ""
+	if cfg.GSO {
+		gsoTag = " gso"
+	}
+	log.Printf("tnl-engine %s: tun=%s addr=%s mtu=%d cipher=%s role=%s%s",
+		version, dev.Name, cfg.TunAddr, cfg.MTU, cipherName, cfg.Role, gsoTag)
 
 	// carrier is satisfied by both the UDP (packet.Bip) and TCP (packet.BipTCP)
 	// bip implementations; cfg.Transport selects which one is built.
