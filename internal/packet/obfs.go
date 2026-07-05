@@ -92,21 +92,22 @@ func obfsSeal(s Sealer, typ byte, payload []byte, padMax int) ([]byte, error) {
 	return s.Seal(inner)
 }
 
-// obfsOpen reverses obfsSeal, returning the frame type and the real payload
-// (padding stripped). Any authentication failure or malformed frame errors.
-func obfsOpen(s Sealer, sealed []byte) (byte, []byte, error) {
-	inner, err := s.Open(sealed)
+// obfsOpen reverses obfsSeal, returning the frame type, the sender's
+// (session, seq) for anti-replay, and the real payload (padding stripped). Any
+// authentication failure or malformed frame errors.
+func obfsOpen(s Sealer, sealed []byte) (typ byte, session uint64, seq uint64, payload []byte, err error) {
+	session, seq, inner, err := s.Open(sealed)
 	if err != nil {
-		return 0, nil, err
+		return 0, 0, 0, nil, err
 	}
 	if len(inner) < obfsInnerHdr {
-		return 0, nil, errors.New("obfs: short inner frame")
+		return 0, 0, 0, nil, errors.New("obfs: short inner frame")
 	}
 	realLen := int(binary.BigEndian.Uint16(inner[1:3]))
 	if obfsInnerHdr+realLen > len(inner) {
-		return 0, nil, errors.New("obfs: inner length overflow")
+		return 0, 0, 0, nil, errors.New("obfs: inner length overflow")
 	}
-	return inner[0], inner[obfsInnerHdr : obfsInnerHdr+realLen], nil
+	return inner[0], session, seq, inner[obfsInnerHdr : obfsInnerHdr+realLen], nil
 }
 
 // padMaxFor picks the padding budget for a frame type.
