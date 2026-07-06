@@ -127,6 +127,20 @@ func main() {
 				log.Printf("tnl-core: dialing (core/raw:%s%s) %s", cfg.RawProfile, obfsTag, cfg.Peer)
 			}
 		}
+	case "flux":
+		rotate := time.Duration(cfg.FluxRotateSecs) * time.Second
+		switch cfg.Role {
+		case "server":
+			b, err = packet.ListenFlux(cfg.Listen, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
+			if err == nil {
+				log.Printf("tnl-core: listening (core/flux rotate=%ds%s)", cfg.FluxRotateSecs, obfsTag)
+			}
+		case "client":
+			b, err = packet.DialFlux(cfg.Peer, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
+			if err == nil {
+				log.Printf("tnl-core: dialing (core/flux rotate=%ds%s) %s", cfg.FluxRotateSecs, obfsTag, cfg.Peer)
+			}
+		}
 	default: // "udp"
 		switch cfg.Role {
 		case "server":

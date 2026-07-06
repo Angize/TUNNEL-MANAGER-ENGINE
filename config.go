@@ -26,8 +26,10 @@ type Config struct {
 	Profile string `json:"profile"` // "core" (the core profile identifier)
 
 	// Transport selects the carrier for bip frames: "udp" (default,
-	// NAT-friendly datagrams), "tcp" (stream, length-prefixed frames), or "raw"
-	// (each frame in a raw IPv4 packet of a chosen protocol — see Profile).
+	// NAT-friendly datagrams), "tcp" (stream, length-prefixed frames), "raw"
+	// (each frame in a raw IPv4 packet of a chosen protocol — see Profile), or
+	// "flux" (a polymorphic raw carrier whose IP protocol rotates every epoch on a
+	// clock-derived schedule both ends compute with no wire signal — see FluxRotateSecs).
 	Transport string `json:"transport"`
 
 	// RawProfile selects the raw-transport encapsulation (Transport=="raw" only):
@@ -83,6 +85,13 @@ type Config struct {
 	Cover    bool   `json:"cover"`
 	CoverSNI string `json:"cover_sni"`
 
+	// FluxRotateSecs is the epoch length for the "flux" transport: every
+	// floor(unixtime / FluxRotateSecs) the carrier shape (currently the raw IP
+	// protocol number, later size/timing/carrier) rotates. Both ends derive the
+	// shape from HKDF(PSK, epoch) off their own clocks, so rotation needs NO packet
+	// on the wire; a few-epoch grace window absorbs clock skew. 0 defaults to 600.
+	FluxRotateSecs int `json:"flux_rotate_secs"`
+
 	// GSO opens the TUN with a virtio-net header and TCP/UDP segmentation
 	// offload, so the kernel hands the core large super-packets on bulk
 	// transfers instead of many MTU-sized ones — fewer syscalls/copies, higher
@@ -122,6 +131,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Transport == "raw" && c.RawProfile == "" {
 		c.RawProfile = "bip"
+	}
+	if c.Transport == "flux" && c.FluxRotateSecs == 0 {
+		c.FluxRotateSecs = 600
 	}
 }
 
@@ -179,8 +191,18 @@ func (c *Config) validate() error {
 		if c.SpoofDst != "" && c.Role == "server" && c.SpoofPeer == "" {
 			return errors.New("spoof_dst_ip on a server requires spoof_peer (the client's real IP to reply to)")
 		}
+	case "flux":
+		// The polymorphic carrier rides raw sockets and rotates its protocol from
+		// the AEAD-shared key; without crypto there is no key to derive a shape from
+		// and no authentication for the shape-independent decode.
+		if !c.Crypto.Enabled {
+			return errors.New("flux transport requires crypto enabled (the shape is derived from the PSK and the AEAD authenticates every frame)")
+		}
+		if c.FluxRotateSecs < 0 {
+			return errors.New("flux_rotate_secs must be >= 0 (0 defaults to 600)")
+		}
 	default:
-		return errors.New("transport must be \"udp\", \"tcp\", or \"raw\"")
+		return errors.New("transport must be \"udp\", \"tcp\", \"raw\", or \"flux\"")
 	}
 	if c.TunAddr == "" {
 		return errors.New("tun_addr is required")
