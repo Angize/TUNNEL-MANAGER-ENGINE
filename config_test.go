@@ -7,7 +7,7 @@ func validRaw() *Config {
 	return &Config{
 		Role:      "client",
 		Mode:      "packet",
-		Profile:   "core", // engine profile (distinct from the raw encapsulation)
+		Profile:   "core", // core profile (distinct from the raw encapsulation)
 		Transport: "raw",
 		Peer:      "203.0.113.9",
 		TunAddr:   "10.200.0.2/24",

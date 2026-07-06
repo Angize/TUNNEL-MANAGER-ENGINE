@@ -1,12 +1,12 @@
-// Command tnl-engine is the custom data-plane engine for the tunnel fleet
+// Command tnl-core is the custom data-plane core for the tunnel fleet
 // manager. This build implements a single slice: Mode "packet" / Profile "core"
 // — raw L3 packets over a TUN device, carried by UDP with optional AES-256-GCM.
 //
 // Usage:
 //
-//	tnl-engine --config /run/tnl/engine-<id>.json
+//	tnl-core --config /run/tnl/core-<id>.json
 //
-// The node agent owns the config file; the engine just runs what it is told.
+// The node agent owns the config file; the core just runs what it is told.
 package main
 
 import (
@@ -22,11 +22,11 @@ import (
 	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tun"
 )
 
-// version is stamped into logs so the panel can tell which engine a node runs.
+// version is stamped into logs so the panel can tell which core a node runs.
 const version = "0.1.0-core"
 
 func main() {
-	cfgPath := flag.String("config", "", "path to engine JSON config")
+	cfgPath := flag.String("config", "", "path to core JSON config")
 	showVer := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -35,12 +35,12 @@ func main() {
 		return
 	}
 	if *cfgPath == "" {
-		log.Fatal("tnl-engine: --config is required")
+		log.Fatal("tnl-core: --config is required")
 	}
 
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
-		log.Fatalf("tnl-engine: config: %v", err)
+		log.Fatalf("tnl-core: config: %v", err)
 	}
 
 	// Open the TUN device BEFORE building the sealer. The sealer's constructor may
@@ -50,7 +50,7 @@ func main() {
 	// the reader loop dies). Setting up the TUN first avoids that ordering hazard.
 	dev, err := tun.Open(cfg.TunName, cfg.MTU, cfg.TunAddr, cfg.GSO)
 	if err != nil {
-		log.Fatalf("tnl-engine: tun: %v", err)
+		log.Fatalf("tnl-core: tun: %v", err)
 	}
 	defer dev.Close()
 
@@ -60,16 +60,16 @@ func main() {
 		// actual per-session sealers after the ephemeral handshake.
 		s, err := crypto.NewSealer(cfg.Crypto.Cipher, cfg.Crypto.PSK, cfg.Role == "client")
 		if err != nil {
-			log.Fatalf("tnl-engine: crypto: %v", err)
+			log.Fatalf("tnl-core: crypto: %v", err)
 		}
 		cipherName = s.Name
 	} else {
 		if cfg.Obfs {
-			log.Fatalf("tnl-engine: obfs requires crypto (there is no key to obfuscate with) — enable crypto or disable obfs")
+			log.Fatalf("tnl-core: obfs requires crypto (there is no key to obfuscate with) — enable crypto or disable obfs")
 		}
 		// Clear mode has NO authentication: a single spoofed datagram can rebind
 		// the peer or inject a packet into the TUN. Make that impossible to miss.
-		log.Printf("tnl-engine: WARNING crypto is DISABLED — the tunnel is unauthenticated " +
+		log.Printf("tnl-core: WARNING crypto is DISABLED — the tunnel is unauthenticated " +
 			"and unencrypted; anyone who can send a packet to this listener can hijack or " +
 			"inject into it. Enable crypto unless this is a trusted, isolated link.")
 	}
@@ -77,7 +77,7 @@ func main() {
 	if cfg.GSO {
 		gsoTag = " gso"
 	}
-	log.Printf("tnl-engine %s: tun=%s addr=%s mtu=%d cipher=%s role=%s%s",
+	log.Printf("tnl-core %s: tun=%s addr=%s mtu=%d cipher=%s role=%s%s",
 		version, dev.Name, cfg.TunAddr, cfg.MTU, cipherName, cfg.Role, gsoTag)
 
 	// carrier is satisfied by both the UDP (packet.Bip) and TCP (packet.BipTCP)
@@ -99,12 +99,12 @@ func main() {
 		case "server":
 			b, err = packet.ListenTCP(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.Cover, cfg.CoverSNI)
 			if err == nil {
-				log.Printf("tnl-engine: listening (core/tcp%s%s) on %s", obfsTag, coverTag(cfg.Cover), cfg.Listen)
+				log.Printf("tnl-core: listening (core/tcp%s%s) on %s", obfsTag, coverTag(cfg.Cover), cfg.Listen)
 			}
 		case "client":
 			b, err = packet.DialTCP(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.Cover, cfg.CoverSNI)
 			if err == nil {
-				log.Printf("tnl-engine: dialing (core/tcp%s%s) %s", obfsTag, coverTag(cfg.Cover), cfg.Peer)
+				log.Printf("tnl-core: dialing (core/tcp%s%s) %s", obfsTag, coverTag(cfg.Cover), cfg.Peer)
 			}
 		}
 	case "raw":
@@ -112,12 +112,12 @@ func main() {
 		case "server":
 			b, err = packet.ListenRaw(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile)
 			if err == nil {
-				log.Printf("tnl-engine: listening (core/raw:%s%s) on %s", cfg.RawProfile, obfsTag, cfg.Listen)
+				log.Printf("tnl-core: listening (core/raw:%s%s) on %s", cfg.RawProfile, obfsTag, cfg.Listen)
 			}
 		case "client":
 			b, err = packet.DialRaw(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile)
 			if err == nil {
-				log.Printf("tnl-engine: dialing (core/raw:%s%s) %s", cfg.RawProfile, obfsTag, cfg.Peer)
+				log.Printf("tnl-core: dialing (core/raw:%s%s) %s", cfg.RawProfile, obfsTag, cfg.Peer)
 			}
 		}
 	default: // "udp"
@@ -125,17 +125,17 @@ func main() {
 		case "server":
 			b, err = packet.Listen(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
 			if err == nil {
-				log.Printf("tnl-engine: listening (core/udp%s) on %s", obfsTag, cfg.Listen)
+				log.Printf("tnl-core: listening (core/udp%s) on %s", obfsTag, cfg.Listen)
 			}
 		case "client":
 			b, err = packet.Dial(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
 			if err == nil {
-				log.Printf("tnl-engine: dialing (core/udp%s) %s", obfsTag, cfg.Peer)
+				log.Printf("tnl-core: dialing (core/udp%s) %s", obfsTag, cfg.Peer)
 			}
 		}
 	}
 	if err != nil {
-		log.Fatalf("tnl-engine: transport: %v", err)
+		log.Fatalf("tnl-core: transport: %v", err)
 	}
 	defer b.Close()
 
@@ -144,14 +144,14 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sig
-		log.Print("tnl-engine: shutting down")
+		log.Print("tnl-core: shutting down")
 		b.Close()
 		dev.Close()
 		os.Exit(0)
 	}()
 
 	if err := b.Run(); err != nil {
-		log.Printf("tnl-engine: stopped: %v", err)
+		log.Printf("tnl-core: stopped: %v", err)
 	}
 }
 

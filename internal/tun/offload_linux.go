@@ -2,11 +2,11 @@
 
 // GSO/GRO offload for the TUN device. When enabled, the interface is opened with
 // a virtio-net header and TCP/UDP segmentation offload, so the kernel hands the
-// engine ONE large "super-packet" (up to 64 KiB) instead of dozens of MTU-sized
+// core ONE large "super-packet" (up to 64 KiB) instead of dozens of MTU-sized
 // packets on bulk transfers. readGSO splits that super-packet back into ordinary
 // L3 packets in userspace (recomputing every IP/TCP/UDP checksum from scratch,
 // which sidesteps the virtio partial-checksum convention entirely), so the rest
-// of the engine — and the wire format between the two ends — is unchanged. The
+// of the core — and the wire format between the two ends — is unchanged. The
 // win is purely fewer TUN read syscalls and copies per byte moved.
 package tun
 
