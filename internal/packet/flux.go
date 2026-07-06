@@ -49,21 +49,54 @@ var fluxProtoPool = []int{253, 254, 252, 251, 250, 249, 248, 247}
 // drawn from the ephemeral range, which is exactly what a real client would use.
 var fluxDportPool = []uint16{443, 3478, 19302, 5349, 8801}
 
+// fluxStunDports is the destination-port pool for the "stun" carrier — STUN/TURN
+// ports only, since that carrier additionally wraps each frame in a real STUN
+// Binding header so the flow parses as WebRTC signalling, not just generic UDP.
+var fluxStunDports = []uint16{3478, 19302, 5349}
+
 // defaultFluxRotate is the epoch length when the config leaves flux_rotate_secs
 // unset. Ten minutes trades rotation agility against how often the (cheap)
 // statistical shape churns; "rotate now" from the panel bumps the epoch out of band.
 const defaultFluxRotate = 600 * time.Second
 
 // fluxShape is the per-epoch carrier descriptor. It is a pure function of
-// (PSK, epoch): both ends derive the same one from the clock alone. Which fields
-// are used on the wire depends on the configured carrier — "raw" rides proto,
-// "udp" rides sport/dport.
+// (PSK, epoch, shapeProfile): both ends derive the same one from the clock alone.
+// Which fields are used on the wire depends on the configured carrier — "raw" rides
+// proto, "udp"/"stun" ride sport + a carrier-specific destination port.
 type fluxShape struct {
-	epoch  int64
-	proto  int    // raw carrier: rotating IP protocol number this epoch
-	sport  uint16 // udp carrier: rotating source port (ephemeral range)
-	dport  uint16 // udp carrier: rotating destination port (from fluxDportPool)
-	padMax int    // per-frame random padding budget (size shaping)
+	epoch     int64
+	proto     int    // raw carrier: rotating IP protocol number this epoch
+	sport     uint16 // udp/stun carrier: rotating source port (ephemeral range)
+	dport     uint16 // udp carrier: rotating destination port (from fluxDportPool)
+	dportSTUN uint16 // stun carrier: rotating destination port (STUN/TURN ports only)
+	ctrlPad   int    // control-frame (ping/pong) padding budget — the shape profile's size signature
+}
+
+// dportFor returns the destination port to use for the given carrier this epoch.
+func (s fluxShape) dportFor(carrier string) uint16 {
+	if carrier == "stun" {
+		return s.dportSTUN
+	}
+	return s.dport
+}
+
+// shapeCtrlPad maps a statistical shape profile to the padding budget for tiny
+// control frames (keepalives), which are otherwise the most fingerprintable
+// fixed-size packets. Data frames stay near the MTU and are already varied, so the
+// profile shapes the SMALL-packet size histogram to resemble the mimicked traffic:
+// webrtc → small RTP-ish, quic → short-ack-ish, video → larger bursts. This is
+// coarse size-shaping (no added latency, no MTU cost), not full statistical mimicry.
+func shapeCtrlPad(shape string, x byte) int {
+	switch shape {
+	case "quic":
+		return 24 + int(x)%56 // 24..79
+	case "video":
+		return 64 + int(x)%160 // 64..223 — larger, bursty
+	case "webrtc":
+		return 8 + int(x)%48 // 8..55 — small RTP-ish
+	default: // "random"
+		return 16 + int(x)%240 // 16..255 (matches the control padding budget)
+	}
 }
 
 // fluxEpochAt returns the epoch index for time t under the given rotation period.
@@ -76,53 +109,55 @@ func fluxEpochAt(rotate time.Duration, t time.Time) int64 {
 	return t.UnixNano() / int64(rotate)
 }
 
-// deriveFluxShape expands (PSK, epoch) into the epoch's carrier shape via HKDF,
-// domain-separated from the session-key KDF so the two never derive the same bytes.
-func deriveFluxShape(psk string, epoch int64) fluxShape {
+// deriveFluxShape expands (PSK, epoch, shapeProfile) into the epoch's carrier shape
+// via HKDF, domain-separated from the session-key KDF so the two never derive the
+// same bytes. shape is the statistical profile ("quic"/"video"/"webrtc"/"random").
+func deriveFluxShape(psk string, epoch int64, shape string) fluxShape {
 	var eb [8]byte
 	binary.BigEndian.PutUint64(eb[:], uint64(epoch))
 	kdf := hkdf.New(sha256.New, []byte(psk), eb[:], []byte("tnl-flux|v1|shape"))
 	var b [16]byte
 	_, _ = io.ReadFull(kdf, b[:])
 	return fluxShape{
-		epoch:  epoch,
-		proto:  fluxProtoPool[int(b[0])%len(fluxProtoPool)],
-		dport:  fluxDportPool[int(b[1])%len(fluxDportPool)],
-		sport:  uint16(20000 + int(binary.BigEndian.Uint16(b[2:4]))%40000), // 20000..59999
-		padMax: 16 + int(b[5])%80,                                          // 16..95 bytes of jitter
+		epoch:     epoch,
+		proto:     fluxProtoPool[int(b[0])%len(fluxProtoPool)],
+		dport:     fluxDportPool[int(b[1])%len(fluxDportPool)],
+		dportSTUN: fluxStunDports[int(b[1])%len(fluxStunDports)],
+		sport:     uint16(20000 + int(binary.BigEndian.Uint16(b[2:4]))%40000), // 20000..59999
+		ctrlPad:   shapeCtrlPad(shape, b[5]),
 	}
 }
 
-// graceShapes returns the shapes acceptable *right now*: those derived for the
-// previous, current, and next epoch. Accepting the neighbours absorbs modest clock
-// skew between the ends and any packet in flight when the epoch ticked, so traffic
-// never drops at a rotation boundary even though neither side sends a rotation
-// signal. The AEAD still authenticates every frame, so widening the carrier filter
-// never weakens security. The receiver turns these into a protocol set (raw
-// carrier) or a destination-port set (udp carrier).
-func graceShapes(psk string, rotate time.Duration, t time.Time) []fluxShape {
-	e := fluxEpochAt(rotate, t)
+// graceShapes returns the shapes acceptable around the given center epoch: those
+// derived for the previous, current, and next epoch. Accepting the neighbours
+// absorbs modest clock skew between the ends and any packet in flight when the
+// epoch ticked, so traffic never drops at a rotation boundary even though neither
+// side sends a rotation signal. The AEAD still authenticates every frame, so
+// widening the carrier filter never weakens security. The center epoch already
+// includes any manual epoch offset (see Flux.epochNow).
+func graceShapes(psk string, epoch int64, shape string) []fluxShape {
 	return []fluxShape{
-		deriveFluxShape(psk, e-1),
-		deriveFluxShape(psk, e),
-		deriveFluxShape(psk, e+1),
+		deriveFluxShape(psk, epoch-1, shape),
+		deriveFluxShape(psk, epoch, shape),
+		deriveFluxShape(psk, epoch+1, shape),
 	}
 }
 
 // graceProtos is the raw-carrier view of graceShapes: the acceptable IP protocols.
-func graceProtos(psk string, rotate time.Duration, t time.Time) map[int]bool {
+func graceProtos(psk string, epoch int64, shape string) map[int]bool {
 	set := make(map[int]bool, 3)
-	for _, sh := range graceShapes(psk, rotate, t) {
+	for _, sh := range graceShapes(psk, epoch, shape) {
 		set[sh.proto] = true
 	}
 	return set
 }
 
-// graceDports is the udp-carrier view of graceShapes: the acceptable UDP dest ports.
-func graceDports(psk string, rotate time.Duration, t time.Time) map[uint16]bool {
+// graceDports is the udp/stun-carrier view of graceShapes: the acceptable UDP
+// destination ports for the given carrier.
+func graceDports(psk string, epoch int64, shape, carrier string) map[uint16]bool {
 	set := make(map[uint16]bool, 3)
-	for _, sh := range graceShapes(psk, rotate, t) {
-		set[sh.dport] = true
+	for _, sh := range graceShapes(psk, epoch, shape) {
+		set[sh.dportFor(carrier)] = true
 	}
 	return set
 }

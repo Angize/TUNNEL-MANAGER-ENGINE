@@ -87,12 +87,26 @@ type Config struct {
 
 	// FluxCarrier selects how "flux" frames ride the wire: "udp" (default) sends
 	// real UDP datagrams on protocol 17 whose ports rotate each epoch among common
-	// QUIC/STUN/WebRTC ports — internet-safe, since transit forwards UDP; "raw"
-	// rotates the IP protocol number itself among an experimental pool, which is
-	// stealthier but only survives where those protocols reach the peer
-	// (same-segment / L2-adjacent / a cooperative datacenter), not across the
-	// open internet. Empty defaults to "udp".
+	// QUIC/STUN/WebRTC ports — internet-safe, since transit forwards UDP; "stun"
+	// additionally wraps every frame in a real STUN Binding header on STUN/TURN
+	// ports, so the flow parses as WebRTC signalling; "raw" rotates the IP protocol
+	// number itself among an experimental pool, which is stealthier but only survives
+	// where those protocols reach the peer (same-segment / L2-adjacent / a cooperative
+	// datacenter), not across the open internet. Empty defaults to "udp".
 	FluxCarrier string `json:"flux_carrier"`
+
+	// FluxShape is the statistical size profile the carrier mimics: "random"
+	// (default), "quic", "video", or "webrtc". It shapes the padding budget of small
+	// control frames (keepalives) — the most fingerprintable fixed-size packets — so
+	// their size histogram resembles the mimicked traffic. Coarse shaping only: it
+	// adds no latency and no MTU cost.
+	FluxShape string `json:"flux_shape"`
+
+	// FluxEpochOffset manually advances the shape epoch ("rotate now"): the effective
+	// epoch is floor(unixtime / FluxRotateSecs) + FluxEpochOffset. Both ends must
+	// carry the same offset (the panel sets it on both on a "rotate now"), which moves
+	// the target fleet-wide with no wire signal. 0 = follow the clock only.
+	FluxEpochOffset int64 `json:"flux_epoch_offset"`
 
 	// FluxRotateSecs is the epoch length for the "flux" transport: every
 	// floor(unixtime / FluxRotateSecs) the carrier shape (protocol/ports and the
@@ -215,8 +229,15 @@ func (c *Config) validate() error {
 		if c.FluxRotateSecs < 0 {
 			return errors.New("flux_rotate_secs must be >= 0 (0 defaults to 600)")
 		}
-		if c.FluxCarrier != "" && c.FluxCarrier != "udp" && c.FluxCarrier != "raw" {
-			return errors.New("flux_carrier must be \"udp\" or \"raw\"")
+		switch c.FluxCarrier {
+		case "", "udp", "raw", "stun":
+		default:
+			return errors.New("flux_carrier must be \"udp\", \"stun\", or \"raw\"")
+		}
+		switch c.FluxShape {
+		case "", "random", "quic", "video", "webrtc":
+		default:
+			return errors.New("flux_shape must be \"random\", \"quic\", \"video\", or \"webrtc\"")
 		}
 	default:
 		return errors.New("transport must be \"udp\", \"tcp\", \"raw\", or \"flux\"")

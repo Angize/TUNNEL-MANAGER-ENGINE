@@ -131,14 +131,14 @@ func main() {
 		rotate := time.Duration(cfg.FluxRotateSecs) * time.Second
 		switch cfg.Role {
 		case "server":
-			b, err = packet.ListenFlux(cfg.Listen, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.FluxCarrier)
+			b, err = packet.ListenFlux(cfg.Listen, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.FluxCarrier, cfg.FluxShape, cfg.FluxEpochOffset)
 			if err == nil {
-				log.Printf("tnl-core: listening (core/flux:%s rotate=%ds%s)", cfg.FluxCarrier, cfg.FluxRotateSecs, obfsTag)
+				log.Printf("tnl-core: listening (core/flux:%s/%s rotate=%ds%s)", cfg.FluxCarrier, cfg.FluxShape, cfg.FluxRotateSecs, obfsTag)
 			}
 		case "client":
-			b, err = packet.DialFlux(cfg.Peer, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.FluxCarrier)
+			b, err = packet.DialFlux(cfg.Peer, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.FluxCarrier, cfg.FluxShape, cfg.FluxEpochOffset)
 			if err == nil {
-				log.Printf("tnl-core: dialing (core/flux:%s rotate=%ds%s) %s", cfg.FluxCarrier, cfg.FluxRotateSecs, obfsTag, cfg.Peer)
+				log.Printf("tnl-core: dialing (core/flux:%s/%s rotate=%ds%s) %s", cfg.FluxCarrier, cfg.FluxShape, cfg.FluxRotateSecs, obfsTag, cfg.Peer)
 			}
 		}
 	default: // "udp"
