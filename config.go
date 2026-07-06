@@ -45,6 +45,16 @@ type Config struct {
 	SpoofSrc  string `json:"spoof_src_ip"`
 	SpoofPeer string `json:"spoof_peer"`
 
+	// SpoofDst forges the outer IPv4 DESTINATION to a decoy IP (e.g. a reachable,
+	// unfiltered host) so an on-path censor sees traffic to the decoy, not to the real
+	// server. Both ends carry the same decoy: the client puts it in the header dst while
+	// still routing to the real server; the server therefore cannot receive on an ordinary
+	// AF_INET raw socket (the kernel drops packets whose dst isn't local) and instead reads
+	// with AF_PACKET, and replies with the decoy as the source. A server using SpoofDst
+	// must also set SpoofPeer (the forged source hides the client's real IP). Raw + bip +
+	// crypto only; needs CAP_NET_RAW. Empty = no destination spoofing.
+	SpoofDst string `json:"spoof_dst_ip"`
+
 	Listen string `json:"listen"` // server: bind address, e.g. "0.0.0.0:9000"
 	Peer   string `json:"peer"`   // client: server address, e.g. "1.2.3.4:9000"
 
@@ -151,14 +161,23 @@ func (c *Config) validate() error {
 		if !c.Crypto.Enabled {
 			return errors.New("raw transport requires crypto enabled (the AEAD both encrypts and authenticates each raw packet)")
 		}
-		if (c.SpoofSrc != "" || c.SpoofPeer != "") && c.RawProfile != "" && c.RawProfile != "bip" {
-			return errors.New("source spoofing is only supported on the raw \"bip\" profile for now")
+		if (c.SpoofSrc != "" || c.SpoofPeer != "" || c.SpoofDst != "") && c.RawProfile != "" && c.RawProfile != "bip" {
+			return errors.New("IP spoofing is only supported on the raw \"bip\" profile for now")
 		}
 		if c.SpoofSrc != "" && net.ParseIP(c.SpoofSrc).To4() == nil {
 			return errors.New("spoof_src_ip must be an IPv4 address")
 		}
 		if c.SpoofPeer != "" && net.ParseIP(c.SpoofPeer).To4() == nil {
 			return errors.New("spoof_peer must be an IPv4 address")
+		}
+		if c.SpoofDst != "" && net.ParseIP(c.SpoofDst).To4() == nil {
+			return errors.New("spoof_dst_ip must be an IPv4 address")
+		}
+		// A server that expects decoy-destination packets receives them via AF_PACKET and
+		// replies with the decoy as source, so it can never learn the client's real address
+		// from the wire — SpoofPeer must supply it.
+		if c.SpoofDst != "" && c.Role == "server" && c.SpoofPeer == "" {
+			return errors.New("spoof_dst_ip on a server requires spoof_peer (the client's real IP to reply to)")
 		}
 	default:
 		return errors.New("transport must be \"udp\", \"tcp\", or \"raw\"")

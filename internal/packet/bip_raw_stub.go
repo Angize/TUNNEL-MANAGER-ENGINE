@@ -21,10 +21,15 @@ var errRawUnsupported = errors.New("raw transport requires Linux (raw IPv4 socke
 func (r *Raw) Run() error   { return errRawUnsupported }
 func (r *Raw) Close() error { return nil }
 
-func DialRaw(string, *tun.Device, time.Duration, bool, bool, string, string, string, string) (*Raw, error) {
+func DialRaw(string, *tun.Device, time.Duration, bool, bool, string, string, string, string, string) (*Raw, error) {
 	return nil, errRawUnsupported
 }
 
-func ListenRaw(string, *tun.Device, time.Duration, bool, bool, string, string, string, string) (*Raw, error) {
+func ListenRaw(string, *tun.Device, time.Duration, bool, bool, string, string, string, string, string) (*Raw, error) {
 	return nil, errRawUnsupported
+}
+
+// ProbeSpoof reports no capability off Linux (the raw transport is Linux-only).
+func ProbeSpoof() SpoofProbe {
+	return SpoofProbe{Reason: "raw transport requires Linux (raw IPv4 sockets)"}
 }

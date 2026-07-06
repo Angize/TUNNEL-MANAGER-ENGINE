@@ -10,6 +10,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"log"
 	"os"
@@ -28,10 +29,16 @@ const version = "0.1.0-core"
 func main() {
 	cfgPath := flag.String("config", "", "path to core JSON config")
 	showVer := flag.Bool("version", false, "print version and exit")
+	probeSpoof := flag.Bool("probe-spoof", false, "print IP-spoofing capability (JSON) and exit")
 	flag.Parse()
 
 	if *showVer {
 		os.Stdout.WriteString(version + "\n")
+		return
+	}
+	if *probeSpoof {
+		b, _ := json.Marshal(packet.ProbeSpoof())
+		os.Stdout.Write(append(b, '\n'))
 		return
 	}
 	if *cfgPath == "" {
@@ -110,12 +117,12 @@ func main() {
 	case "raw":
 		switch cfg.Role {
 		case "server":
-			b, err = packet.ListenRaw(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile, cfg.SpoofPeer)
+			b, err = packet.ListenRaw(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile, cfg.SpoofPeer, cfg.SpoofDst)
 			if err == nil {
 				log.Printf("tnl-core: listening (core/raw:%s%s) on %s", cfg.RawProfile, obfsTag, cfg.Listen)
 			}
 		case "client":
-			b, err = packet.DialRaw(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile, cfg.SpoofSrc)
+			b, err = packet.DialRaw(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile, cfg.SpoofSrc, cfg.SpoofDst)
 			if err == nil {
 				log.Printf("tnl-core: dialing (core/raw:%s%s) %s", cfg.RawProfile, obfsTag, cfg.Peer)
 			}
