@@ -70,9 +70,28 @@ type Bip struct {
 	session atomic.Pointer[sealerBox]        // negotiated session sealer (nil until handshake / clear mode)
 	rp      replayGuard                      // driven only by netToTun (single receiver goroutine)
 	ci      atomic.Pointer[crypto.Ephemeral] // client's current handshake ephemeral
+	lastRx  atomic.Int64                     // unix-nano of the last authenticated frame (client staleness)
 
 	closeCh   chan struct{}
 	closeOnce sync.Once
+}
+
+// sessionStale reports that the client has heard nothing it could authenticate from the server
+// for long enough that the peer has most likely restarted with a fresh session. The client then
+// drops its now-useless session and re-handshakes. Without this a SERVER restart wedges the tunnel:
+// the client keeps pinging under a key the fresh server cannot open and — because it still holds a
+// session — never re-initiates on its own. A false positive (a few lost pings on a healthy link)
+// only costs one harmless re-handshake. Only meaningful with crypto on.
+func (b *Bip) sessionStale() bool {
+	last := b.lastRx.Load()
+	if last == 0 {
+		return false // no baseline yet
+	}
+	w := 3 * b.keepalive
+	if w < 10*time.Second {
+		w = 10 * time.Second
+	}
+	return time.Since(time.Unix(0, last)) > w
 }
 
 // Dial (client role) binds an ephemeral UDP socket and targets peerAddr.
@@ -222,6 +241,7 @@ func (b *Bip) handleCrypto(pkt []byte, addr *net.UDPAddr) {
 		}
 		if oerr == nil && b.rp.ok(session, seq) {
 			// authenticated, fresh frame -> now safe to (re)learn the peer address
+			b.lastRx.Store(time.Now().UnixNano()) // liveness: the session is answering
 			b.peer.Store(addr)
 			b.dispatch(typ, payload, addr)
 			return
@@ -249,6 +269,7 @@ func (b *Bip) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 		}
 		b.rp = replayGuard{}
 		b.session.Store(&sealerBox{s: s})
+		b.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale"
 		return
 	}
 	// server: authenticate an init, reply, and install the fresh session.
@@ -292,6 +313,11 @@ func (b *Bip) dispatch(typ byte, payload []byte, addr *net.UDPAddr) {
 // lost it starts a new handshake.
 func (b *Bip) clientLoop() {
 	for {
+		if b.cryptoOn && b.sealer() != nil && b.sessionStale() {
+			b.session.Store(nil) // server likely restarted — drop the dead session so we re-handshake
+			b.ci.Store(nil)
+			log.Print("bip: no reply from the peer's session — re-handshaking (peer likely restarted)")
+		}
 		if b.sealer() == nil && b.cryptoOn {
 			b.sendInit()
 		} else {
