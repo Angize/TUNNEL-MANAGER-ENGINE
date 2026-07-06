@@ -127,6 +127,37 @@ func main() {
 				log.Printf("tnl-core: dialing (core/raw:%s%s) %s", cfg.RawProfile, obfsTag, cfg.Peer)
 			}
 		}
+	case "flux":
+		rotate := time.Duration(cfg.FluxRotateSecs) * time.Second
+		switch cfg.Role {
+		case "server":
+			b, err = packet.ListenFlux(cfg.Listen, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.FluxCarrier, cfg.FluxShape, cfg.FluxEpochOffset)
+			if err == nil {
+				log.Printf("tnl-core: listening (core/flux:%s/%s rotate=%ds%s)", cfg.FluxCarrier, cfg.FluxShape, cfg.FluxRotateSecs, obfsTag)
+			}
+		case "client":
+			b, err = packet.DialFlux(cfg.Peer, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.FluxCarrier, cfg.FluxShape, cfg.FluxEpochOffset)
+			if err == nil {
+				log.Printf("tnl-core: dialing (core/flux:%s/%s rotate=%ds%s) %s", cfg.FluxCarrier, cfg.FluxShape, cfg.FluxRotateSecs, obfsTag, cfg.Peer)
+			}
+		}
+	case "ws":
+		switch cfg.Role {
+		case "server":
+			b, err = packet.ListenWS(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
+			if err == nil {
+				log.Printf("tnl-core: listening (core/ws%s) on %s", obfsTag, cfg.Listen)
+			}
+		case "client":
+			b, err = packet.DialWS(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.WSHost, cfg.WSPath, cfg.WSTLS)
+			if err == nil {
+				tlsTag := ""
+				if cfg.WSTLS {
+					tlsTag = " wss"
+				}
+				log.Printf("tnl-core: dialing (core/ws%s%s) %s", obfsTag, tlsTag, cfg.Peer)
+			}
+		}
 	default: // "udp"
 		switch cfg.Role {
 		case "server":

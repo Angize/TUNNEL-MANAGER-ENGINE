@@ -26,8 +26,10 @@ type Config struct {
 	Profile string `json:"profile"` // "core" (the core profile identifier)
 
 	// Transport selects the carrier for bip frames: "udp" (default,
-	// NAT-friendly datagrams), "tcp" (stream, length-prefixed frames), or "raw"
-	// (each frame in a raw IPv4 packet of a chosen protocol — see Profile).
+	// NAT-friendly datagrams), "tcp" (stream, length-prefixed frames), "raw"
+	// (each frame in a raw IPv4 packet of a chosen protocol — see Profile), or
+	// "flux" (a polymorphic raw carrier whose IP protocol rotates every epoch on a
+	// clock-derived schedule both ends compute with no wire signal — see FluxRotateSecs).
 	Transport string `json:"transport"`
 
 	// RawProfile selects the raw-transport encapsulation (Transport=="raw" only):
@@ -83,6 +85,46 @@ type Config struct {
 	Cover    bool   `json:"cover"`
 	CoverSNI string `json:"cover_sni"`
 
+	// WebSocket carrier (Transport=="ws"): the bip stream rides RFC 6455 binary
+	// frames after an HTTP Upgrade, so it can be fronted through a CDN. WSHost is the
+	// Host header (and TLS SNI) — the fronting/origin domain; WSPath the request path
+	// ("/" default); WSTLS makes the client speak wss:// (standard TLS to the CDN edge)
+	// before the upgrade. The server stays plain (the CDN terminates TLS and forwards
+	// the WebSocket to the origin). TCP-family; obfs/crypto apply as with tcp.
+	WSHost string `json:"ws_host"`
+	WSPath string `json:"ws_path"`
+	WSTLS  bool   `json:"ws_tls"`
+
+	// FluxCarrier selects how "flux" frames ride the wire: "udp" (default) sends
+	// real UDP datagrams on protocol 17 whose ports rotate each epoch among common
+	// QUIC/STUN/WebRTC ports — internet-safe, since transit forwards UDP; "stun"
+	// additionally wraps every frame in a real STUN Binding header on STUN/TURN
+	// ports, so the flow parses as WebRTC signalling; "raw" rotates the IP protocol
+	// number itself among an experimental pool, which is stealthier but only survives
+	// where those protocols reach the peer (same-segment / L2-adjacent / a cooperative
+	// datacenter), not across the open internet. Empty defaults to "udp".
+	FluxCarrier string `json:"flux_carrier"`
+
+	// FluxShape is the statistical size profile the carrier mimics: "random"
+	// (default), "quic", "video", or "webrtc". It shapes the padding budget of small
+	// control frames (keepalives) — the most fingerprintable fixed-size packets — so
+	// their size histogram resembles the mimicked traffic. Coarse shaping only: it
+	// adds no latency and no MTU cost.
+	FluxShape string `json:"flux_shape"`
+
+	// FluxEpochOffset manually advances the shape epoch ("rotate now"): the effective
+	// epoch is floor(unixtime / FluxRotateSecs) + FluxEpochOffset. Both ends must
+	// carry the same offset (the panel sets it on both on a "rotate now"), which moves
+	// the target fleet-wide with no wire signal. 0 = follow the clock only.
+	FluxEpochOffset int64 `json:"flux_epoch_offset"`
+
+	// FluxRotateSecs is the epoch length for the "flux" transport: every
+	// floor(unixtime / FluxRotateSecs) the carrier shape (protocol/ports and the
+	// padding budget, later size/timing) rotates. Both ends derive the shape from
+	// HKDF(PSK, epoch) off their own clocks, so rotation needs NO packet on the
+	// wire; a few-epoch grace window absorbs clock skew. 0 defaults to 600.
+	FluxRotateSecs int `json:"flux_rotate_secs"`
+
 	// GSO opens the TUN with a virtio-net header and TCP/UDP segmentation
 	// offload, so the kernel hands the core large super-packets on bulk
 	// transfers instead of many MTU-sized ones — fewer syscalls/copies, higher
@@ -122,6 +164,17 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Transport == "raw" && c.RawProfile == "" {
 		c.RawProfile = "bip"
+	}
+	if c.Transport == "flux" {
+		if c.FluxRotateSecs == 0 {
+			c.FluxRotateSecs = 600
+		}
+		if c.FluxCarrier == "" {
+			c.FluxCarrier = "udp"
+		}
+	}
+	if c.Transport == "ws" && c.WSPath == "" {
+		c.WSPath = "/"
 	}
 }
 
@@ -179,8 +232,34 @@ func (c *Config) validate() error {
 		if c.SpoofDst != "" && c.Role == "server" && c.SpoofPeer == "" {
 			return errors.New("spoof_dst_ip on a server requires spoof_peer (the client's real IP to reply to)")
 		}
+	case "flux":
+		// The polymorphic carrier rides raw sockets and rotates its protocol from
+		// the AEAD-shared key; without crypto there is no key to derive a shape from
+		// and no authentication for the shape-independent decode.
+		if !c.Crypto.Enabled {
+			return errors.New("flux transport requires crypto enabled (the shape is derived from the PSK and the AEAD authenticates every frame)")
+		}
+		if c.FluxRotateSecs < 0 {
+			return errors.New("flux_rotate_secs must be >= 0 (0 defaults to 600)")
+		}
+		switch c.FluxCarrier {
+		case "", "udp", "raw", "stun":
+		default:
+			return errors.New("flux_carrier must be \"udp\", \"stun\", or \"raw\"")
+		}
+		switch c.FluxShape {
+		case "", "random", "quic", "video", "webrtc":
+		default:
+			return errors.New("flux_shape must be \"random\", \"quic\", \"video\", or \"webrtc\"")
+		}
+	case "ws":
+		// WebSocket carrier. Client-side TLS to a CDN edge needs an SNI/Host, so
+		// ws_tls requires ws_host; the server side (plain, behind the CDN) needs neither.
+		if c.WSTLS && c.Role == "client" && c.WSHost == "" {
+			return errors.New("ws_tls requires ws_host (the TLS SNI / fronting domain)")
+		}
 	default:
-		return errors.New("transport must be \"udp\", \"tcp\", or \"raw\"")
+		return errors.New("transport must be \"udp\", \"tcp\", \"raw\", \"flux\", or \"ws\"")
 	}
 	if c.TunAddr == "" {
 		return errors.New("tun_addr is required")

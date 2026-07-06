@@ -27,6 +27,7 @@ package packet
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -246,6 +247,16 @@ type BipTCP struct {
 	coverSNI string           // client: SNI to present; server: real dest to borrow
 	coverSrv *tlscover.Server // server-side REALITY responder (nil on the client)
 
+	// WebSocket carrier (transport "ws"): the stream is wrapped in RFC 6455 binary
+	// frames after an HTTP Upgrade, so it can be fronted through a CDN. ws is
+	// mutually exclusive with cover. On the client, wsTLS wraps the connection in a
+	// standard TLS session (ServerName=wsHost) BEFORE the upgrade, so the client
+	// speaks wss:// to a CDN edge; the server stays plain (the CDN terminates TLS).
+	ws     bool
+	wsHost string // client: Host header + TLS SNI (the fronting/origin domain)
+	wsPath string // client: request path (default "/")
+	wsTLS  bool   // client: TLS to the edge before the WebSocket upgrade
+
 	isClient bool
 	addr     string // server: listen addr; client: peer addr
 
@@ -272,6 +283,28 @@ func DialTCP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cr
 	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		cover: cover, coverSNI: coverSNI,
 		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
+}
+
+// DialWS (client role) is DialTCP over a WebSocket carrier: it dials peerAddr (a
+// CDN edge or the origin), optionally wraps it in TLS (wsTLS, ServerName=wsHost),
+// then performs the WebSocket upgrade with Host=wsHost before the bip framing runs.
+func DialWS(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher, wsHost, wsPath string, wsTLS bool) (*BipTCP, error) {
+	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+		ws: true, wsHost: wsHost, wsPath: wsPath, wsTLS: wsTLS,
+		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
+}
+
+// ListenWS (server role) accepts WebSocket connections (plain HTTP upgrade; a CDN
+// in front terminates TLS and forwards the WebSocket to us). A non-WS request gets
+// a plausible 404 and is dropped, so the port looks like an ordinary web endpoint.
+func ListenWS(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*BipTCP, error) {
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+		ws: true, idle: idleFor(keepalive), addr: listenAddr, ln: ln, closeCh: make(chan struct{}),
+		preAuth: make(chan struct{}, maxPreAuthConns)}, nil
 }
 
 // ListenTCP (server role) binds listenAddr and accepts connections. When cover is
@@ -439,7 +472,14 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 	}
 	defer release()
 
-	if b.cover { // REALITY cover: authenticate by ClientHello token, else proxy to dest
+	if b.ws { // WebSocket upgrade; a non-WS probe gets a 404 and is dropped
+		r, werr := wsServerHandshake(conn, time.Now().Add(handshakeTimeout))
+		if werr != nil {
+			conn.Close()
+			return
+		}
+		conn = &wsConn{Conn: conn, r: r, client: false}
+	} else if b.cover { // REALITY cover: authenticate by ClientHello token, else proxy to dest
 		tconn, err := b.coverSrv.Handle(conn, time.Now().Add(handshakeTimeout))
 		if err != nil {
 			// ErrProbe: the relay goroutine now owns conn (proxying it to the
@@ -504,7 +544,37 @@ func (b *BipTCP) dialLoop() {
 			}
 			continue
 		}
-		if b.cover { // wrap in a Chrome-fingerprinted TLS session carrying the auth token
+		if b.ws { // optional TLS to the edge, then the WebSocket upgrade
+			if b.wsTLS {
+				tc := tls.Client(conn, &tls.Config{ServerName: b.wsHost})
+				tc.SetDeadline(time.Now().Add(handshakeTimeout))
+				if herr := tc.Handshake(); herr != nil {
+					conn.Close()
+					log.Printf("bip/ws: tls to %s failed: %v", b.addr, herr)
+					if b.sleep(1 * time.Second) {
+						return
+					}
+					continue
+				}
+				var zero time.Time
+				tc.SetDeadline(zero)
+				conn = tc
+			}
+			host := b.wsHost
+			if host == "" {
+				host = b.addr
+			}
+			r, werr := wsClientHandshake(conn, host, b.wsPath, time.Now().Add(handshakeTimeout))
+			if werr != nil {
+				conn.Close()
+				log.Printf("bip/ws: upgrade to %s failed: %v", b.addr, werr)
+				if b.sleep(1 * time.Second) {
+					return
+				}
+				continue
+			}
+			conn = &wsConn{Conn: conn, r: r, client: true}
+		} else if b.cover { // wrap in a Chrome-fingerprinted TLS session carrying the auth token
 			tconn, cerr := tlscover.ClientConn(conn, b.coverSNI, b.psk, time.Now().Add(handshakeTimeout))
 			if cerr != nil {
 				conn.Close()
