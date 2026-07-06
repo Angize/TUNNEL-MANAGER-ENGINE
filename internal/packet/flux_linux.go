@@ -17,8 +17,11 @@
 package packet
 
 import (
+	"encoding/binary"
 	"log"
 	"net"
+	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -40,27 +43,38 @@ type Flux struct {
 	cipher    string
 	isClient  bool
 
+	carrier string // "raw" (rotate IP protocol) or "udp" (proto 17, rotate ports) — internet-safe
+
 	sendFd int // AF_INET SOCK_RAW + IP_HDRINCL: builds each packet's IPv4 header (any protocol)
 	pktFd  int // AF_PACKET SOCK_DGRAM: receives every IPv4 frame regardless of protocol
 
-	localIP atomic.Pointer[net.IPAddr] // our source IP toward the peer
-	peer    atomic.Pointer[net.IPAddr] // current known peer (server learns it)
-	session atomic.Pointer[sealerBox]
-	rp      replayGuard
-	ci      atomic.Pointer[crypto.Ephemeral]
-	lastRx  atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
-	logEp   atomic.Int64 // last epoch whose rotation was logged (rotation visibility)
+	localIP  atomic.Pointer[net.IPAddr] // our source IP toward the peer
+	peer     atomic.Pointer[net.IPAddr] // current known peer (server learns it)
+	session  atomic.Pointer[sealerBox]
+	curShape atomic.Pointer[fluxShape] // this epoch's shape (refreshed each second by rotateWatcher)
+	rp       replayGuard
+	ci       atomic.Pointer[crypto.Ephemeral]
+	lastRx   atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
+	logEp    atomic.Int64 // last epoch whose rotation was logged (rotation visibility)
 
+	antiLeak  func()    // removes the kernel anti-ICMP (iptables) rule for the peer on Close
+	leakOnce  sync.Once // installs antiLeak exactly once (the server learns the peer late)
 	closeCh   chan struct{}
 	closeOnce sync.Once
 }
 
-func newFlux(dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher string, isClient bool) *Flux {
-	return &Flux{
+func newFlux(dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier string, isClient bool) *Flux {
+	if carrier == "" {
+		carrier = "udp"
+	}
+	f := &Flux{
 		dev: dev, keepalive: ka, rotate: rotate, obfs: obfs, cryptoOn: cryptoOn,
-		psk: psk, cipher: cipher, isClient: isClient, sendFd: -1, pktFd: -1,
+		psk: psk, cipher: cipher, carrier: carrier, isClient: isClient, sendFd: -1, pktFd: -1,
 		closeCh: make(chan struct{}),
 	}
+	sh := deriveFluxShape(psk, fluxEpochAt(rotate, time.Now()))
+	f.curShape.Store(&sh)
+	return f
 }
 
 // openFluxSockets opens the shared IP_HDRINCL sender and AF_PACKET receiver. The
@@ -82,7 +96,7 @@ func openFluxSockets() (send, pkt int, err error) {
 
 // DialFlux (client role) targets peerIP. peerIP may be a plain IPv4 or "ip:port"
 // (the port is ignored — the raw carrier has no ports of its own).
-func DialFlux(peerIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher string) (*Flux, error) {
+func DialFlux(peerIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier string) (*Flux, error) {
 	ip := parseIP4(hostOnly(peerIP))
 	if ip == nil {
 		return nil, errBadFrame
@@ -91,24 +105,25 @@ func DialFlux(peerIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cr
 	if err != nil {
 		return nil, err
 	}
-	f := newFlux(dev, ka, rotate, obfs, cryptoOn, psk, cipher, true)
+	f := newFlux(dev, ka, rotate, obfs, cryptoOn, psk, cipher, carrier, true)
 	f.sendFd, f.pktFd = send, pkt
 	f.peer.Store(&net.IPAddr{IP: ip})
 	if lip := routeLocalIP(ip); lip != nil {
 		f.localIP.Store(&net.IPAddr{IP: lip})
 	}
+	f.installAntiLeak(ip) // the peer is known up front — suppress kernel ICMP for its frames now
 	return f, nil
 }
 
 // ListenFlux (server role) waits to learn the peer from the first authenticated
 // frame. listenIP is accepted for signature parity with the other carriers but is
 // not used: AF_PACKET receives on every interface and the source filter is the peer.
-func ListenFlux(listenIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher string) (*Flux, error) {
+func ListenFlux(listenIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier string) (*Flux, error) {
 	send, pkt, err := openFluxSockets()
 	if err != nil {
 		return nil, err
 	}
-	f := newFlux(dev, ka, rotate, obfs, cryptoOn, psk, cipher, false)
+	f := newFlux(dev, ka, rotate, obfs, cryptoOn, psk, cipher, carrier, false)
 	f.sendFd, f.pktFd = send, pkt
 	return f, nil
 }
@@ -125,9 +140,13 @@ func (f *Flux) Run() error {
 	return <-errc
 }
 
-// Close tears down the sockets (unblocking the loops) and the client loop.
+// Close tears down the sockets (unblocking the loops), the client loop, and any
+// kernel anti-ICMP rule installed for the peer.
 func (f *Flux) Close() error {
 	f.closeOnce.Do(func() { close(f.closeCh) })
+	if f.antiLeak != nil {
+		f.antiLeak()
+	}
 	if f.sendFd >= 0 {
 		syscall.Close(f.sendFd)
 	}
@@ -135,6 +154,14 @@ func (f *Flux) Close() error {
 		syscall.Close(f.pktFd)
 	}
 	return nil
+}
+
+// installAntiLeak drops the peer's frames in the raw PREROUTING chain so the kernel
+// does not answer our exotic protocol / unbound UDP port with an ICMP unreachable.
+// AF_PACKET taps every frame before that chain runs, so flux still receives everything.
+// Best-effort and installed exactly once (the server learns the peer late).
+func (f *Flux) installAntiLeak(peer net.IP) {
+	f.leakOnce.Do(func() { f.antiLeak = addPeerDrop(peer) })
 }
 
 func (f *Flux) sealer() Sealer {
@@ -149,12 +176,6 @@ func (f *Flux) srcIP() net.IP {
 		return l.IP
 	}
 	return net.IPv4zero
-}
-
-// curProto returns the carrier IP protocol number for the current epoch — a pure
-// function of (PSK, clock), so the peer derives the same one without any signal.
-func (f *Flux) curProto() int {
-	return deriveFluxShape(f.psk, fluxEpochAt(f.rotate, time.Now())).proto
 }
 
 // body builds the framed (magic/type/sealed or obfs) bytes — identical to the UDP
@@ -180,28 +201,72 @@ func (f *Flux) body(typ byte, payload []byte) ([]byte, error) {
 	return out, nil
 }
 
-// writeOut builds the full IPv4 packet (this epoch's protocol) around body and
-// sends it to the peer via the IP_HDRINCL socket. The header source is our real IP
-// and the destination is the real peer — flux rotates the protocol, it does not
-// forge addresses.
+// writeOut builds the full IPv4 packet in this epoch's shape around body and sends
+// it to the peer via the IP_HDRINCL socket. The header source is our real IP and
+// the destination is the real peer — flux rotates the carrier, it does not forge
+// addresses. The "raw" carrier stamps the epoch's rotating IP protocol; the "udp"
+// carrier stamps protocol 17 and wraps the frame in a UDP header whose ports rotate.
 func (f *Flux) writeOut(body []byte, to *net.IPAddr) {
 	if to == nil || f.sendFd < 0 {
 		return
 	}
-	out := buildIP4(f.srcIP(), to.IP, f.curProto(), body)
+	sh := f.curShape.Load()
+	src := f.srcIP()
+	var out []byte
+	if f.carrier == "raw" {
+		out = buildIP4(src, to.IP, sh.proto, body)
+	} else {
+		out = buildIP4(src, to.IP, protoUDP, buildUDPSeg(src, to.IP, sh.sport, sh.dport, body))
+	}
 	var sa syscall.SockaddrInet4
 	copy(sa.Addr[:], to.IP.To4())
 	_ = syscall.Sendto(f.sendFd, out, 0, &sa)
 }
 
-// netToTun receives every IPv4 frame via AF_PACKET, accepts those whose protocol
-// is in the current grace window (previous/current/next epoch) and — once the peer
-// is known — whose source is the peer, then authenticates and dispatches. SOCK_DGRAM
-// strips the link header, so each frame starts at the IPv4 header.
+// buildUDPSeg wraps payload in a UDP header with the given ports and a correct
+// checksum (over the IPv4 pseudo-header), so the udp carrier's packets are valid
+// UDP datagrams any transit will forward.
+func buildUDPSeg(src, dst net.IP, sport, dport uint16, payload []byte) []byte {
+	h := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint16(h[0:2], sport)
+	binary.BigEndian.PutUint16(h[2:4], dport)
+	binary.BigEndian.PutUint16(h[4:6], uint16(len(h)))
+	copy(h[8:], payload)
+	cs := l4Checksum(src, dst, protoUDP, h)
+	if cs == 0 {
+		cs = 0xffff // 0 means "no checksum" in UDP; use the equivalent 0xffff
+	}
+	binary.BigEndian.PutUint16(h[6:8], cs)
+	return h
+}
+
+// addPeerDrop installs a best-effort iptables rule dropping all frames from peer in
+// the raw table's PREROUTING chain, so the kernel never answers our carrier with an
+// ICMP unreachable. AF_PACKET taps before this chain, so flux's receive is unaffected.
+// Returns a cleanup func (nil if the rule could not be installed).
+func addPeerDrop(peer net.IP) func() {
+	args := []string{"-t", "raw", "-A", "PREROUTING", "-s", peer.String(), "-j", "DROP"}
+	if out, err := exec.Command("iptables", args...).CombinedOutput(); err != nil {
+		log.Printf("flux: anti-leak rule not installed (kernel may ICMP-reject our carrier): %v: %s", err, strings.TrimSpace(string(out)))
+		return nil
+	}
+	return func() {
+		del := append([]string(nil), args...)
+		del[2] = "-D"
+		_ = exec.Command("iptables", del...).Run()
+	}
+}
+
+// netToTun receives every IPv4 frame via AF_PACKET, keeps those that match the
+// current carrier's grace window (raw: IP protocol ∈ prev/current/next epoch; udp:
+// protocol 17 with a destination port ∈ the epochs' ports) and — once the peer is
+// known — whose source is the peer, strips the carrier header, then authenticates
+// and dispatches. SOCK_DGRAM strips the link header, so each frame starts at the IPv4 header.
 func (f *Flux) netToTun() error {
 	buf := make([]byte, maxDatagram+64)
 	var graceEpoch int64 = -1
-	var grace map[int]bool
+	var graceP map[int]bool
+	var graceD map[uint16]bool
 	for {
 		n, from, err := syscall.Recvfrom(f.pktFd, buf, 0)
 		if err != nil {
@@ -227,17 +292,30 @@ func (f *Flux) netToTun() error {
 			continue
 		}
 		if e := fluxEpochAt(f.rotate, time.Now()); e != graceEpoch {
-			grace = graceProtos(f.psk, f.rotate, time.Now())
+			graceP = graceProtos(f.psk, f.rotate, time.Now())
+			graceD = graceDports(f.psk, f.rotate, time.Now())
 			graceEpoch = e
 		}
-		if !grace[int(pkt[9])] {
-			continue // not a flux carrier protocol for any live epoch
+		var body []byte
+		if f.carrier == "raw" {
+			if !graceP[int(pkt[9])] {
+				continue // not a flux carrier protocol for any live epoch
+			}
+			body = pkt[ihl:]
+		} else { // udp carrier
+			if int(pkt[9]) != protoUDP || len(pkt) < ihl+8 {
+				continue
+			}
+			if !graceD[binary.BigEndian.Uint16(pkt[ihl+2:ihl+4])] {
+				continue // not a flux carrier destination port for any live epoch
+			}
+			body = pkt[ihl+8:] // strip the UDP header
 		}
 		src := &net.IPAddr{IP: append(net.IP(nil), pkt[12:16]...)}
 		if peer := f.peer.Load(); peer != nil && !src.IP.Equal(peer.IP) {
 			continue // only the peer's frames are ours (AF_PACKET sees all hosts)
 		}
-		f.handleCrypto(pkt[ihl:], src)
+		f.handleCrypto(body, src)
 	}
 }
 
@@ -300,7 +378,8 @@ func (f *Flux) handleCrypto(body []byte, addr *net.IPAddr) {
 }
 
 // learnPeer records the peer address (and, on the server, the local source IP
-// toward it) once a frame authenticates.
+// toward it) once a frame authenticates, and installs the peer's anti-ICMP rule the
+// first time (the server has no peer to scope it to until now).
 func (f *Flux) learnPeer(addr *net.IPAddr) {
 	f.peer.Store(addr)
 	if f.localIP.Load() == nil {
@@ -308,6 +387,7 @@ func (f *Flux) learnPeer(addr *net.IPAddr) {
 			f.localIP.Store(&net.IPAddr{IP: lip})
 		}
 	}
+	f.installAntiLeak(addr.IP)
 }
 
 func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
@@ -436,9 +516,10 @@ func (f *Flux) send(typ byte, payload []byte, to *net.IPAddr) {
 	f.writeOut(body, to)
 }
 
-// rotateWatcher logs each carrier rotation so an operator (and the netns PoC) can
-// see the moving target change without any wire signal. It only observes the
-// clock; the derivation both ends run is what actually keeps them in lock-step.
+// rotateWatcher refreshes the cached send-side shape every second (so writeOut
+// never pays for an HKDF per packet) and logs each rotation, so an operator — and
+// the netns PoC — can see the moving target change with no wire signal. It only
+// observes the clock; the derivation both ends run is what keeps them in lock-step.
 func (f *Flux) rotateWatcher() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -448,8 +529,13 @@ func (f *Flux) rotateWatcher() {
 			return
 		case <-t.C:
 			sh := deriveFluxShape(f.psk, fluxEpochAt(f.rotate, time.Now()))
+			f.curShape.Store(&sh)
 			if prev := f.logEp.Swap(sh.epoch); prev != sh.epoch && prev != 0 {
-				log.Printf("flux: rotated to epoch %d (carrier proto %d)", sh.epoch, sh.proto)
+				if f.carrier == "raw" {
+					log.Printf("flux: rotated to epoch %d (raw carrier proto %d)", sh.epoch, sh.proto)
+				} else {
+					log.Printf("flux: rotated to epoch %d (udp carrier :%d)", sh.epoch, sh.dport)
+				}
 			}
 		}
 	}

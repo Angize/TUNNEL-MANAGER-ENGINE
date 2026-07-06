@@ -85,11 +85,20 @@ type Config struct {
 	Cover    bool   `json:"cover"`
 	CoverSNI string `json:"cover_sni"`
 
+	// FluxCarrier selects how "flux" frames ride the wire: "udp" (default) sends
+	// real UDP datagrams on protocol 17 whose ports rotate each epoch among common
+	// QUIC/STUN/WebRTC ports — internet-safe, since transit forwards UDP; "raw"
+	// rotates the IP protocol number itself among an experimental pool, which is
+	// stealthier but only survives where those protocols reach the peer
+	// (same-segment / L2-adjacent / a cooperative datacenter), not across the
+	// open internet. Empty defaults to "udp".
+	FluxCarrier string `json:"flux_carrier"`
+
 	// FluxRotateSecs is the epoch length for the "flux" transport: every
-	// floor(unixtime / FluxRotateSecs) the carrier shape (currently the raw IP
-	// protocol number, later size/timing/carrier) rotates. Both ends derive the
-	// shape from HKDF(PSK, epoch) off their own clocks, so rotation needs NO packet
-	// on the wire; a few-epoch grace window absorbs clock skew. 0 defaults to 600.
+	// floor(unixtime / FluxRotateSecs) the carrier shape (protocol/ports and the
+	// padding budget, later size/timing) rotates. Both ends derive the shape from
+	// HKDF(PSK, epoch) off their own clocks, so rotation needs NO packet on the
+	// wire; a few-epoch grace window absorbs clock skew. 0 defaults to 600.
 	FluxRotateSecs int `json:"flux_rotate_secs"`
 
 	// GSO opens the TUN with a virtio-net header and TCP/UDP segmentation
@@ -132,8 +141,13 @@ func (c *Config) applyDefaults() {
 	if c.Transport == "raw" && c.RawProfile == "" {
 		c.RawProfile = "bip"
 	}
-	if c.Transport == "flux" && c.FluxRotateSecs == 0 {
-		c.FluxRotateSecs = 600
+	if c.Transport == "flux" {
+		if c.FluxRotateSecs == 0 {
+			c.FluxRotateSecs = 600
+		}
+		if c.FluxCarrier == "" {
+			c.FluxCarrier = "udp"
+		}
 	}
 }
 
@@ -200,6 +214,9 @@ func (c *Config) validate() error {
 		}
 		if c.FluxRotateSecs < 0 {
 			return errors.New("flux_rotate_secs must be >= 0 (0 defaults to 600)")
+		}
+		if c.FluxCarrier != "" && c.FluxCarrier != "udp" && c.FluxCarrier != "raw" {
+			return errors.New("flux_carrier must be \"udp\" or \"raw\"")
 		}
 	default:
 		return errors.New("transport must be \"udp\", \"tcp\", \"raw\", or \"flux\"")

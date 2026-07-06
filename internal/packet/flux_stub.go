@@ -18,10 +18,10 @@ type Flux struct{}
 func (f *Flux) Run() error   { return errRawUnsupported }
 func (f *Flux) Close() error { return nil }
 
-func DialFlux(string, *tun.Device, time.Duration, time.Duration, bool, bool, string, string) (*Flux, error) {
+func DialFlux(string, *tun.Device, time.Duration, time.Duration, bool, bool, string, string, string) (*Flux, error) {
 	return nil, errRawUnsupported
 }
 
-func ListenFlux(string, *tun.Device, time.Duration, time.Duration, bool, bool, string, string) (*Flux, error) {
+func ListenFlux(string, *tun.Device, time.Duration, time.Duration, bool, bool, string, string, string) (*Flux, error) {
 	return nil, errRawUnsupported
 }
