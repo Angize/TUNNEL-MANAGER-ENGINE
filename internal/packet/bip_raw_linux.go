@@ -69,6 +69,7 @@ type Raw struct {
 	rp      replayGuard
 	ci      atomic.Pointer[crypto.Ephemeral]
 	seq     atomic.Uint32
+	lastRx  atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
 
 	closeCh   chan struct{}
 	closeOnce sync.Once
@@ -519,6 +520,7 @@ func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
 			oerr = errBadFrame
 		}
 		if oerr == nil && r.rp.ok(session, seq) {
+			r.lastRx.Store(time.Now().UnixNano()) // liveness: the session is answering
 			r.learnPeer(addr)
 			r.dispatch(typ, payload, addr)
 			return
@@ -556,6 +558,7 @@ func (r *Raw) tryHandshake(body []byte, addr *net.IPAddr) {
 		}
 		r.rp = replayGuard{}
 		r.session.Store(&sealerBox{s: s})
+		r.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale"
 		return
 	}
 	eInit, err := crypto.ParseInit(r.psk, body)
@@ -599,8 +602,29 @@ func (r *Raw) dispatch(typ byte, payload []byte, addr *net.IPAddr) {
 	}
 }
 
+// sessionStale reports that the client has heard nothing authenticated from the server for long
+// enough that the peer most likely restarted with a fresh session, so the client should drop its
+// dead session and re-handshake. Without it a SERVER restart wedges the tunnel: the client keeps
+// pinging under a key the fresh server can't open and never re-initiates. See Bip.sessionStale.
+func (r *Raw) sessionStale() bool {
+	last := r.lastRx.Load()
+	if last == 0 {
+		return false
+	}
+	w := 3 * r.keepalive
+	if w < 10*time.Second {
+		w = 10 * time.Second
+	}
+	return time.Since(time.Unix(0, last)) > w
+}
+
 func (r *Raw) clientLoop() {
 	for {
+		if r.cryptoOn && r.sealer() != nil && r.sessionStale() {
+			r.session.Store(nil) // server likely restarted — drop the dead session so we re-handshake
+			r.ci.Store(nil)
+			log.Print("raw: no reply from the peer's session — re-handshaking (peer likely restarted)")
+		}
 		if r.cryptoOn && r.sealer() == nil {
 			r.sendInit()
 		} else {
