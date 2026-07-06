@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,16 +43,25 @@ type Raw struct {
 	isClient  bool
 	icmpID    uint16 // per-process ICMP echo identifier (receiver ignores it)
 
-	// Source-IP spoofing (client): forge the outer IPv4 source so per-source/stateful
-	// egress filters can't pin the real IP. spoofFd is a SOCK_RAW+IP_HDRINCL socket used
-	// to build the whole IP header ourselves; the ordinary conn still RECEIVES replies
-	// (which come back to our real IP). On the SERVER, fixedPeer is the client's REAL IP
-	// (the reply target) — needed because the packet source is forged, so the server
-	// can't learn it; it also disables the source filter (the AEAD still authenticates).
+	// IP spoofing. spoofFd is a SOCK_RAW+IP_HDRINCL socket used to build the whole IPv4
+	// header ourselves, so any of the outer addresses can be forged:
+	//   - spoofSrc: forged source (client hides its real IP; server replies AS the decoy).
+	//   - spoofDst: forged destination = the decoy (client only) — routing still targets the
+	//     real peer via the sendto() address, so the packet reaches the server while the wire
+	//     shows the decoy as destination.
+	// A decoy destination isn't a local address on the server, so the kernel would drop it
+	// before an AF_INET raw socket; the server therefore RECEIVES via pktFd (AF_PACKET),
+	// filtering incoming frames to decoy. fixedPeer is the client's REAL IP (the reply
+	// target) — needed because the source is forged, so the server can't learn it; it also
+	// pins the peer and disables the source filter (the AEAD still authenticates).
 	proto     int
 	spoofSrc  net.IP
-	spoofFd   int
+	spoofDst  net.IP // client: forged header destination (decoy); server: nil
+	decoy     net.IP // server: AF_PACKET receive filter (the decoy destination)
+	spoofFd   int    // AF_INET SOCK_RAW + IP_HDRINCL sender (-1 if unused)
+	pktFd     int    // AF_PACKET receiver for decoy-dst frames (-1 if unused)
 	fixedPeer net.IP
+	antiLeak  func() // removes the kernel anti-leak (iptables) rule on Close
 
 	localIP atomic.Pointer[net.IPAddr] // our source IP toward the peer (for TCP/UDP checksums)
 	peer    atomic.Pointer[net.IPAddr] // current known peer (server learns it)
@@ -69,7 +79,7 @@ func newRaw(conn *net.IPConn, dev *tun.Device, ka time.Duration, obfs, cryptoOn 
 	_, _ = rand.Read(idb[:])
 	return &Raw{
 		conn: conn, dev: dev, keepalive: ka, obfs: obfs, cryptoOn: cryptoOn,
-		psk: psk, cipher: cipher, profile: profile, isClient: isClient, spoofFd: -1,
+		psk: psk, cipher: cipher, profile: profile, isClient: isClient, spoofFd: -1, pktFd: -1,
 		icmpID: binary.BigEndian.Uint16(idb[:]), closeCh: make(chan struct{}),
 	}
 }
@@ -77,7 +87,7 @@ func newRaw(conn *net.IPConn, dev *tun.Device, ka time.Duration, obfs, cryptoOn 
 // DialRaw (client role) opens a raw socket of the profile's protocol and targets
 // peerIP. peerIP may be a plain IPv4 or an "ip:port" (the port is ignored — raw
 // IP has no ports of its own; the tcp/udp profiles carry synthetic ones).
-func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofSrc string) (*Raw, error) {
+func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofSrc, spoofDst string) (*Raw, error) {
 	proto, ok := rawProtoFor(profile)
 	if !ok {
 		return nil, fmt.Errorf("raw: unknown profile %q", profile)
@@ -102,17 +112,25 @@ func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bo
 			conn.Close()
 			return nil, fmt.Errorf("raw: spoof_src_ip %q is not an IPv4 address", spoofSrc)
 		}
-		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, proto)
+		r.spoofSrc = sip
+	}
+	if spoofDst != "" { // forge the outer destination to the decoy; routing still targets the real peer
+		dip := parseIP4(hostOnly(spoofDst))
+		if dip == nil {
+			conn.Close()
+			return nil, fmt.Errorf("raw: spoof_dst_ip %q is not an IPv4 address", spoofDst)
+		}
+		r.spoofDst = dip
+		// The server answers AS the decoy, so replies don't come from the real peer —
+		// pin the peer and skip the source filter (the AEAD authenticates).
+	}
+	if r.spoofSrc != nil || r.spoofDst != nil { // any forged field needs the IP_HDRINCL socket
+		fd, err := openHdrincl(proto)
 		if err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("raw: spoof socket: %w", err)
 		}
-		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
-			syscall.Close(fd)
-			conn.Close()
-			return nil, fmt.Errorf("raw: set IP_HDRINCL: %w", err)
-		}
-		r.spoofSrc, r.spoofFd = sip, fd
+		r.spoofFd = fd
 	}
 	return r, nil
 }
@@ -120,7 +138,7 @@ func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bo
 // ListenRaw (server role) binds a raw socket of the profile's protocol and waits
 // to learn the peer from the first authenticated frame. listenIP may be empty,
 // "0.0.0.0", a plain IPv4, or an "ip:port" (the port is ignored).
-func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofPeer string) (*Raw, error) {
+func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofPeer, spoofDst string) (*Raw, error) {
 	proto, ok := rawProtoFor(profile)
 	if !ok {
 		return nil, fmt.Errorf("raw: unknown profile %q", profile)
@@ -149,6 +167,29 @@ func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoO
 			r.localIP.Store(&net.IPAddr{IP: lip})
 		}
 	}
+	if spoofDst != "" { // clients aim at this decoy; receive it via AF_PACKET and answer AS it
+		dip := parseIP4(hostOnly(spoofDst))
+		if dip == nil {
+			conn.Close()
+			return nil, fmt.Errorf("raw: spoof_dst_ip %q is not an IPv4 address", spoofDst)
+		}
+		r.decoy = dip
+		r.spoofSrc = dip // replies leave with the decoy as their source
+		fd, err := openHdrincl(proto)
+		if err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("raw: spoof socket: %w", err)
+		}
+		r.spoofFd = fd
+		pfd, err := openAfpacket()
+		if err != nil {
+			syscall.Close(fd)
+			conn.Close()
+			return nil, fmt.Errorf("raw: AF_PACKET socket: %w", err)
+		}
+		r.pktFd = pfd
+		r.antiLeak = addAntiLeak(proto, dip) // best-effort; stops the kernel forwarding the decoy dst
+	}
 	return r, nil
 }
 
@@ -156,20 +197,38 @@ func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoO
 func (r *Raw) Run() error {
 	errc := make(chan error, 2)
 	go func() { errc <- r.tunToNet() }()
-	go func() { errc <- r.netToTun() }()
+	if r.pktFd >= 0 { // decoy server: the real dst isn't local, so read raw frames off the wire
+		go func() { errc <- r.afpacketToTun() }()
+	} else {
+		go func() { errc <- r.netToTun() }()
+	}
 	if r.isClient {
 		go r.clientLoop()
 	}
 	return <-errc
 }
 
-// Close tears down the socket (unblocking both loops) and the client loop.
+// Close tears down the sockets (unblocking both loops), the client loop, and any
+// kernel anti-leak rule installed for a decoy destination.
 func (r *Raw) Close() error {
 	r.closeOnce.Do(func() { close(r.closeCh) })
+	if r.antiLeak != nil {
+		r.antiLeak()
+	}
 	if r.spoofFd >= 0 {
 		syscall.Close(r.spoofFd)
 	}
+	if r.pktFd >= 0 {
+		syscall.Close(r.pktFd)
+	}
 	return r.conn.Close()
+}
+
+// pinnedPeer reports whether the peer address is fixed and the source filter must be
+// skipped: on the server when the client forges its source (fixedPeer), and on the
+// client when the server answers as the decoy (spoofDst) instead of its real IP.
+func (r *Raw) pinnedPeer() bool {
+	return r.fixedPeer != nil || (r.isClient && r.spoofDst != nil)
 }
 
 func (r *Raw) sealer() Sealer {
@@ -214,15 +273,25 @@ func (r *Raw) wire(body []byte, dst net.IP) []byte {
 	return rawEncap(r.profile, body, r.srcIP(), dst, r.isClient, r.icmpID, r.seq.Add(1))
 }
 
-// writeOut sends one wrapped packet to `to`. When source spoofing is on (client)
-// it builds the whole IPv4 header via the IP_HDRINCL socket so the outer source
-// is the forged address; otherwise the kernel builds the header on the IPConn.
+// writeOut sends one wrapped packet toward the real peer `to`. When any outer
+// address is forged it builds the whole IPv4 header via the IP_HDRINCL socket: the
+// source is spoofSrc when set (else our real IP), and the destination is the decoy
+// (spoofDst) when set (else `to`). Crucially the sendto() address is ALWAYS the real
+// peer, so routing reaches the server even though the header shows the decoy dst.
 func (r *Raw) writeOut(pkt []byte, to *net.IPAddr) {
 	if to == nil {
 		return
 	}
-	if r.spoofSrc != nil && r.spoofFd >= 0 {
-		out := buildIP4(r.spoofSrc, to.IP, r.proto, pkt)
+	if r.spoofFd >= 0 {
+		src := r.srcIP()
+		if r.spoofSrc != nil {
+			src = r.spoofSrc
+		}
+		dst := to.IP
+		if r.spoofDst != nil {
+			dst = r.spoofDst
+		}
+		out := buildIP4(src, dst, r.proto, pkt)
 		var sa syscall.SockaddrInet4
 		copy(sa.Addr[:], to.IP.To4())
 		_ = syscall.Sendto(r.spoofFd, out, 0, &sa)
@@ -254,6 +323,81 @@ func buildIP4(src, dst net.IP, proto int, payload []byte) []byte {
 	return h
 }
 
+// packetOutgoing is PACKET_OUTGOING: AF_PACKET delivers our own transmitted frames
+// too, and those are skipped so the server never processes its own decoy replies.
+const packetOutgoing = 4
+
+// ethPIP is ETH_P_IP (the IPv4 EtherType); the AF_PACKET socket is opened for it so
+// only IPv4 frames are delivered.
+const ethPIP = 0x0800
+
+// htons converts a uint16 to network byte order for the AF_PACKET protocol argument.
+// Deployment targets (x86-64, arm64) are little-endian, so this is a byte swap.
+func htons(v uint16) uint16 { return v<<8 | v>>8 }
+
+// ProbeSpoof checks whether the raw sockets IP spoofing needs can be opened here.
+// It opens (and immediately closes) an IP_HDRINCL raw socket and an AF_PACKET socket;
+// EPERM on either means the process lacks CAP_NET_RAW. bip's protocol number (253) is
+// used for the raw-socket probe. This is a local check only — see SpoofProbe.
+func ProbeSpoof() SpoofProbe {
+	p := SpoofProbe{}
+	if fd, err := openHdrincl(253); err == nil {
+		p.CapNetRaw = true
+		syscall.Close(fd)
+	} else {
+		p.Reason = "raw sockets not permitted (needs CAP_NET_RAW / root): " + err.Error()
+	}
+	if fd, err := openAfpacket(); err == nil {
+		p.AFPacket = true
+		syscall.Close(fd)
+	} else if p.Reason == "" {
+		p.Reason = "AF_PACKET not permitted (needs CAP_NET_RAW / root): " + err.Error()
+	}
+	p.OK = p.CapNetRaw && p.AFPacket
+	if p.OK {
+		p.Reason = ""
+	}
+	return p
+}
+
+// openHdrincl opens an AF_INET raw socket of proto with IP_HDRINCL set, so the caller
+// supplies the whole IPv4 header (used to forge the outer source and/or destination).
+func openHdrincl(proto int) (int, error) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, proto)
+	if err != nil {
+		return -1, err
+	}
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+		syscall.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
+// openAfpacket opens an AF_PACKET SOCK_DGRAM socket for IPv4 frames, used to receive
+// packets addressed to the decoy destination (which the IP stack would otherwise drop).
+func openAfpacket() (int, error) {
+	return syscall.Socket(syscall.AF_PACKET, syscall.SOCK_DGRAM, int(htons(ethPIP)))
+}
+
+// addAntiLeak installs a best-effort iptables rule that drops the decoy-destined
+// packets in the raw table's PREROUTING chain, so the kernel does not try to forward
+// or answer them. AF_PACKET taps the frame before this chain runs, so our receive path
+// is unaffected. Returns a cleanup func (nil if the rule could not be installed).
+func addAntiLeak(proto int, decoy net.IP) func() {
+	args := []string{"-t", "raw", "-A", "PREROUTING", "-p", strconv.Itoa(proto), "-d", decoy.String(), "-j", "DROP"}
+	if out, err := exec.Command("iptables", args...).CombinedOutput(); err != nil {
+		log.Printf("raw: anti-leak rule not installed (kernel may forward the decoy dst): %v: %s", err, strings.TrimSpace(string(out)))
+		return nil
+	}
+	log.Printf("raw: anti-leak rule installed (iptables raw PREROUTING -p %d -d %s DROP)", proto, decoy)
+	return func() {
+		del := append([]string(nil), args...)
+		del[2] = "-D"
+		_ = exec.Command("iptables", del...).Run()
+	}
+}
+
 // tunToNet reads L3 packets from TUN, seals+wraps them, and sends to the peer.
 func (r *Raw) tunToNet() error {
 	buf := make([]byte, maxDatagram)
@@ -278,9 +422,9 @@ func (r *Raw) tunToNet() error {
 	}
 }
 
-// netToTun receives raw packets, strips the profile header, authenticates, and
-// writes data frames into the TUN. Packets that do not open as data are tried as
-// handshake messages.
+// netToTun receives raw packets on the AF_INET socket, strips the profile header,
+// authenticates, and writes data frames into the TUN. Used for every configuration
+// except a decoy server (which reads off the wire via afpacketToTun instead).
 func (r *Raw) netToTun() error {
 	buf := make([]byte, maxDatagram)
 	for {
@@ -288,25 +432,74 @@ func (r *Raw) netToTun() error {
 		if err != nil {
 			return err
 		}
-		if r.fixedPeer == nil { // spoofing client forges its source, so we can't filter by it — the AEAD authenticates
+		if !r.pinnedPeer() { // a forged source can't be filtered by — the AEAD authenticates
 			if peer := r.peer.Load(); peer != nil && !addr.IP.Equal(peer.IP) {
 				continue // only the peer's packets are ours (raw sockets see all)
 			}
 		}
-		body, ok := rawDecap(r.profile, buf[:n])
-		if !ok {
-			continue
-		}
-		if r.cryptoOn {
-			r.handleCrypto(body, addr)
-			continue
-		}
-		if len(body) < 2 || body[0] != magic {
-			continue
-		}
-		r.learnPeer(addr)
-		r.dispatch(body[1], iff(body[1] == typeData, body[2:], nil), addr)
+		r.handleRaw(buf[:n], addr)
 	}
+}
+
+// afpacketToTun receives frames aimed at the decoy destination off the wire via
+// AF_PACKET. A decoy dst is not a local address, so the kernel would drop it before
+// an AF_INET raw socket; AF_PACKET taps the packet before the IP stack's dst check.
+// Incoming IPv4 frames are filtered to our protocol and decoy dst, then handled just
+// like netToTun. SOCK_DGRAM strips the link header, so each frame starts at the IP header.
+func (r *Raw) afpacketToTun() error {
+	buf := make([]byte, maxDatagram+64) // room for the IPv4 header ahead of the frame
+	for {
+		n, from, err := syscall.Recvfrom(r.pktFd, buf, 0)
+		if err != nil {
+			select {
+			case <-r.closeCh:
+				return nil
+			default:
+			}
+			if err == syscall.EINTR {
+				continue
+			}
+			return err
+		}
+		if ll, ok := from.(*syscall.SockaddrLinklayer); ok && ll.Pkttype == packetOutgoing {
+			continue // ignore frames we transmitted ourselves
+		}
+		pkt := buf[:n]
+		if len(pkt) < 20 || pkt[0]>>4 != 4 {
+			continue // not IPv4
+		}
+		ihl := int(pkt[0]&0x0f) * 4
+		if ihl < 20 || len(pkt) < ihl {
+			continue
+		}
+		if int(pkt[9]) != r.proto {
+			continue // not our carrier protocol
+		}
+		if r.decoy != nil && !net.IP(pkt[16:20]).Equal(r.decoy) {
+			continue // only frames aimed at our decoy destination
+		}
+		src := &net.IPAddr{IP: append(net.IP(nil), pkt[12:16]...)}
+		r.handleRaw(pkt[ihl:], src)
+	}
+}
+
+// handleRaw strips the profile header, authenticates the frame, and dispatches it —
+// the common tail of both receive paths (AF_INET and AF_PACKET). Frames that do not
+// open as data are tried as handshake messages.
+func (r *Raw) handleRaw(raw []byte, addr *net.IPAddr) {
+	body, ok := rawDecap(r.profile, raw)
+	if !ok {
+		return
+	}
+	if r.cryptoOn {
+		r.handleCrypto(body, addr)
+		return
+	}
+	if len(body) < 2 || body[0] != magic {
+		return
+	}
+	r.learnPeer(addr)
+	r.dispatch(body[1], iff(body[1] == typeData, body[2:], nil), addr)
 }
 
 func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
@@ -337,7 +530,7 @@ func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
 // learnPeer records the peer address (and, on the server, the local source IP
 // toward it, needed for the tcp profile's checksum) once a frame authenticates.
 func (r *Raw) learnPeer(addr *net.IPAddr) {
-	if r.fixedPeer == nil { // with a spoofing client the source is forged — keep the configured peer
+	if !r.pinnedPeer() { // with a forged source/decoy the address is not the real peer — keep the configured one
 		r.peer.Store(addr)
 	}
 	if r.localIP.Load() == nil {
