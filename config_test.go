@@ -57,3 +57,27 @@ func TestRawTransportRejectsCover(t *testing.T) {
 		t.Error("cover was accepted on the raw transport (it is TCP-only)")
 	}
 }
+
+func TestSpoofValidation(t *testing.T) {
+	c := validRaw()
+	c.SpoofSrc = "192.0.2.7"
+	if err := c.validate(); err != nil {
+		t.Errorf("valid spoof_src_ip rejected: %v", err)
+	}
+	c = validRaw()
+	c.SpoofSrc = "not-an-ip"
+	if err := c.validate(); err == nil {
+		t.Error("bogus spoof_src_ip accepted")
+	}
+	c = validRaw()
+	c.RawProfile = "gre"
+	c.SpoofSrc = "192.0.2.7"
+	if err := c.validate(); err == nil {
+		t.Error("spoofing accepted on a non-bip profile")
+	}
+	c = validRaw()
+	c.SpoofPeer = "198.51.100.9"
+	if err := c.validate(); err != nil {
+		t.Errorf("valid spoof_peer rejected: %v", err)
+	}
+}
