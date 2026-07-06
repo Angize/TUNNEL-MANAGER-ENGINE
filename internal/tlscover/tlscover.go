@@ -156,7 +156,11 @@ func (sv *Server) Handle(raw net.Conn, deadline time.Time) (net.Conn, error) {
 			_ = raw.SetDeadline(time.Time{})
 		}
 		pc := &prefixConn{Conn: raw, pre: hello}
-		s := tls.Server(pc, &tls.Config{Certificates: []tls.Certificate{*sv.cert}, MinVersion: tls.VersionTLS12})
+		// Pin TLS 1.3: our Chrome-fingerprinted client always offers it, and in
+		// 1.3 the server Certificate message is encrypted — so the throwaway
+		// self-signed cert is never visible to a passive observer (only the real
+		// dest's genuine cert, for proxied probes, is ever seen on the wire).
+		s := tls.Server(pc, &tls.Config{Certificates: []tls.Certificate{*sv.cert}, MinVersion: tls.VersionTLS13})
 		if !deadline.IsZero() {
 			_ = s.SetDeadline(deadline)
 		}
