@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/crypto"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/crypto"
 )
 
 // mustPair returns the two ends of a tunnel (client seals c→s, server opens it).

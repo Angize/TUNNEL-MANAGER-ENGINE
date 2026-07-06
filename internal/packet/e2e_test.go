@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tun"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/tun"
 )
 
 // tunPair returns a Device backed by one end of a unix datagram socketpair and

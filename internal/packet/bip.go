@@ -28,8 +28,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/crypto"
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tun"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/crypto"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/tun"
 )
 
 const (

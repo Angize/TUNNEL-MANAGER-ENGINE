@@ -1,4 +1,4 @@
-module github.com/Angize/TUNNEL-MANAGER-ENGINE
+module github.com/Angize/TUNNEL-MANAGER-CORE
 
 go 1.25.0
 

@@ -38,9 +38,9 @@ import (
 
 	"golang.org/x/crypto/chacha20"
 
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/crypto"
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tlscover"
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tun"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/crypto"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/tlscover"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/tun"
 )
 
 const (

@@ -9,7 +9,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tun"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/tun"
 )
 
 // Raw is unavailable off Linux; the type exists only so the constructors share a

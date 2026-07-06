@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/crypto"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/crypto"
 )
 
 func errfmt(format string, a ...any) error { return fmt.Errorf(format, a...) }

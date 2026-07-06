@@ -17,9 +17,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/crypto"
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/packet"
-	"github.com/Angize/TUNNEL-MANAGER-ENGINE/internal/tun"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/crypto"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/packet"
+	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/tun"
 )
 
 // version is stamped into logs so the panel can tell which core a node runs.
