@@ -49,7 +49,7 @@ const (
 	maskKeyLen  = 32 // ChaCha20 key length for the wire mask
 )
 
-// Supported is the ordered list of concrete cipher names the engine accepts.
+// Supported is the ordered list of concrete cipher names the core accepts.
 var Supported = []string{CipherAES256, CipherAES128, CipherChaCha, CipherXChaCha}
 
 // Sealer seals and opens packet payloads with the configured AEAD, using

@@ -1,12 +1,12 @@
 # TUNNEL-MANAGER-ENGINE
 
-موتورِ دیتاپلینِ اختصاصی برای پنلِ مدیریتِ ناوگانِ تونل — یک باینریِ Go (static، بدونِ
-وابستگی). پنلِ مرکزی و نودِ agent (Python) همچنان ارکستریتور می‌مانند؛ این موتور فقط
+هستهٔ دیتاپلینِ اختصاصی برای پنلِ مدیریتِ ناوگانِ تونل — یک باینریِ Go (static، بدونِ
+وابستگی). پنلِ مرکزی و نودِ agent (Python) همچنان ارکستریتور می‌مانند؛ این هسته فقط
 دادهٔ خام را جابه‌جا می‌کند.
 
-Custom data-plane engine for the tunnel fleet manager. A single static Go
+Custom data-plane core for the tunnel fleet manager. A single static Go
 binary with no external dependencies. The Python panel and node agent stay the
-orchestrators; this engine only moves packets.
+orchestrators; this core only moves packets.
 
 ## وضعیت (این نسخه)
 
@@ -23,7 +23,7 @@ orchestrators; this engine only moves packets.
 ## ساخت
 
 ```sh
-CGO_ENABLED=0 go build -o tnl-engine .
+CGO_ENABLED=0 go build -o tnl-core .
 ```
 
 ## اجرا
@@ -31,20 +31,20 @@ CGO_ENABLED=0 go build -o tnl-engine .
 روی نودِ عمومی (server):
 
 ```sh
-sudo ./tnl-engine --config examples/server.json
+sudo ./tnl-core --config examples/server.json
 ```
 
 روی نودِ پشتِ NAT (client) — فیلدِ `peer` را به آی‌پیِ عمومیِ server بگذار:
 
 ```sh
-sudo ./tnl-engine --config examples/client.json
+sudo ./tnl-core --config examples/client.json
 ```
 
 سپس ترافیکِ `10.200.0.0/24` از تونل عبور می‌کند (مثلاً `ping 10.200.0.2`).
 
 ## قراردادِ کنترل
 
-موتور stdin/stdout تعاملی ندارد؛ نود یک فایلِ `engine-<id>.json` می‌نویسد و باینری را با
+هسته stdin/stdout تعاملی ندارد؛ نود یک فایلِ `core-<id>.json` می‌نویسد و باینری را با
 `--config <path>` اجرا می‌کند — دقیقاً مثلِ اینکه نود الان `ip`/`iptables` را صدا می‌زند.
 
 ## فرمتِ سیم (bip)

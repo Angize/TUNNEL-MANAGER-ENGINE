@@ -1,7 +1,7 @@
 //go:build !linux
 
 // The raw transport uses Linux raw IPv4 sockets (CAP_NET_RAW). On other
-// platforms the constructors fail cleanly so the rest of the engine still builds
+// platforms the constructors fail cleanly so the rest of the core still builds
 // and runs (the raw profile codec in rawprofile.go stays portable and tested).
 package packet
 

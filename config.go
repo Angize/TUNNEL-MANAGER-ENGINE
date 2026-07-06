@@ -16,13 +16,13 @@ type CryptoCfg struct {
 	Cipher  string `json:"cipher"` // "aes-256-gcm" (default / only for now)
 }
 
-// Config is the full contract between the Python node agent and this engine.
-// The node writes it to engine-<id>.json and launches the binary with
+// Config is the full contract between the Python node agent and this core.
+// The node writes it to core-<id>.json and launches the binary with
 // --config <path>. Nothing here is invented at runtime; the node owns it.
 type Config struct {
 	Role    string `json:"role"`    // "server" (public, listens) | "client" (behind NAT, dials)
 	Mode    string `json:"mode"`    // "packet" (only mode implemented in this slice)
-	Profile string `json:"profile"` // "bip" (only profile implemented in this slice)
+	Profile string `json:"profile"` // "core" (the core profile identifier)
 
 	// Transport selects the carrier for bip frames: "udp" (default,
 	// NAT-friendly datagrams), "tcp" (stream, length-prefixed frames), or "raw"
@@ -65,7 +65,7 @@ type Config struct {
 	CoverSNI string `json:"cover_sni"`
 
 	// GSO opens the TUN with a virtio-net header and TCP/UDP segmentation
-	// offload, so the kernel hands the engine large super-packets on bulk
+	// offload, so the kernel hands the core large super-packets on bulk
 	// transfers instead of many MTU-sized ones — fewer syscalls/copies, higher
 	// throughput. It is a local optimization only (the wire format is unchanged)
 	// and each side can enable it independently. Linux only.
@@ -117,8 +117,8 @@ func (c *Config) validate() error {
 	if c.Mode != "packet" {
 		return errors.New("mode must be \"packet\" in this build")
 	}
-	if c.Profile != "bip" {
-		return errors.New("profile must be \"bip\" in this build")
+	if c.Profile != "core" {
+		return errors.New("profile must be \"core\" in this build")
 	}
 	switch c.Role {
 	case "server":
