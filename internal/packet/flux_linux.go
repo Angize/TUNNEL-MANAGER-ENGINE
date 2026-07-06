@@ -49,6 +49,10 @@ type Flux struct {
 	shapeProf   string // statistical shape profile: "quic" | "video" | "webrtc" | "random"
 	epochOffset int64  // manual epoch bump ("rotate now"): epoch = clock-epoch + offset (both ends set identically)
 
+	fecEnc *fecEncoder // non-nil when FEC is on: buffers data frames into RS blocks on send
+	fecDec *fecDecoder // non-nil when FEC is on: reassembles + reconstructs blocks on receive
+	rxSrc  atomic.Pointer[net.IPAddr] // src of the packet currently feeding fecDec (deliver reads it)
+
 	sendFd int // AF_INET SOCK_RAW + IP_HDRINCL: builds each packet's IPv4 header (any protocol)
 	pktFd  int // AF_PACKET SOCK_DGRAM: receives every IPv4 frame regardless of protocol
 
@@ -67,7 +71,7 @@ type Flux struct {
 	closeOnce sync.Once
 }
 
-func newFlux(dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier, shape string, epochOffset int64, isClient bool) *Flux {
+func newFlux(dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier, shape string, epochOffset int64, fec bool, fecData, fecParity int, isClient bool) *Flux {
 	if carrier == "" {
 		carrier = "udp"
 	}
@@ -81,6 +85,26 @@ func newFlux(dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk
 	}
 	sh := deriveFluxShape(psk, f.epochNow(), shape)
 	f.curShape.Store(&sh)
+	if fec {
+		// emit sends each ready FEC packet (data/parity shard) to the current peer
+		// wrapped in the carrier; deliver feeds each recovered frame back into the
+		// normal crypto path with the source of the packet that completed the block.
+		enc, err := newFecEncoder(fecData, fecParity, func(pkt []byte) {
+			if p := f.peer.Load(); p != nil {
+				f.carrierOut(pkt, p)
+			}
+		})
+		if err == nil {
+			f.fecEnc = enc
+			f.fecDec = newFecDecoder(func(frame []byte) {
+				if s := f.rxSrc.Load(); s != nil {
+					f.handleCrypto(frame, s)
+				}
+			})
+		} else {
+			log.Printf("flux: FEC disabled (bad geometry %d+%d): %v", fecData, fecParity, err)
+		}
+	}
 	return f
 }
 
@@ -108,7 +132,7 @@ func openFluxSockets() (send, pkt int, err error) {
 
 // DialFlux (client role) targets peerIP. peerIP may be a plain IPv4 or "ip:port"
 // (the port is ignored — the raw carrier has no ports of its own).
-func DialFlux(peerIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier, shape string, epochOffset int64) (*Flux, error) {
+func DialFlux(peerIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier, shape string, epochOffset int64, fec bool, fecData, fecParity int) (*Flux, error) {
 	ip := parseIP4(hostOnly(peerIP))
 	if ip == nil {
 		return nil, errBadFrame
@@ -117,7 +141,7 @@ func DialFlux(peerIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cr
 	if err != nil {
 		return nil, err
 	}
-	f := newFlux(dev, ka, rotate, obfs, cryptoOn, psk, cipher, carrier, shape, epochOffset, true)
+	f := newFlux(dev, ka, rotate, obfs, cryptoOn, psk, cipher, carrier, shape, epochOffset, fec, fecData, fecParity, true)
 	f.sendFd, f.pktFd = send, pkt
 	f.peer.Store(&net.IPAddr{IP: ip})
 	if lip := routeLocalIP(ip); lip != nil {
@@ -130,12 +154,12 @@ func DialFlux(peerIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cr
 // ListenFlux (server role) waits to learn the peer from the first authenticated
 // frame. listenIP is accepted for signature parity with the other carriers but is
 // not used: AF_PACKET receives on every interface and the source filter is the peer.
-func ListenFlux(listenIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier, shape string, epochOffset int64) (*Flux, error) {
+func ListenFlux(listenIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier, shape string, epochOffset int64, fec bool, fecData, fecParity int) (*Flux, error) {
 	send, pkt, err := openFluxSockets()
 	if err != nil {
 		return nil, err
 	}
-	f := newFlux(dev, ka, rotate, obfs, cryptoOn, psk, cipher, carrier, shape, epochOffset, false)
+	f := newFlux(dev, ka, rotate, obfs, cryptoOn, psk, cipher, carrier, shape, epochOffset, fec, fecData, fecParity, false)
 	f.sendFd, f.pktFd = send, pkt
 	return f, nil
 }
@@ -230,12 +254,13 @@ func (f *Flux) body(typ byte, payload []byte) ([]byte, error) {
 	return out, nil
 }
 
-// writeOut builds the full IPv4 packet in this epoch's shape around body and sends
+// carrierOut builds the full IPv4 packet in this epoch's shape around body and sends
 // it to the peer via the IP_HDRINCL socket. The header source is our real IP and
 // the destination is the real peer — flux rotates the carrier, it does not forge
 // addresses. The "raw" carrier stamps the epoch's rotating IP protocol; the "udp"
 // carrier stamps protocol 17 and wraps the frame in a UDP header whose ports rotate.
-func (f *Flux) writeOut(body []byte, to *net.IPAddr) {
+// When FEC is on, body already carries the 1-byte FEC type tag (data/parity/pass).
+func (f *Flux) carrierOut(body []byte, to *net.IPAddr) {
 	if to == nil || f.sendFd < 0 {
 		return
 	}
@@ -417,7 +442,14 @@ func (f *Flux) netToTun() error {
 		if peer := f.peer.Load(); peer != nil && !src.IP.Equal(peer.IP) {
 			continue // only the peer's frames are ours (AF_PACKET sees all hosts)
 		}
-		f.handleCrypto(body, src)
+		if f.fecDec != nil {
+			// netToTun is the sole reader, so rxSrc is stable for the whole input()
+			// call (the decoder delivers recovered frames synchronously within it).
+			f.rxSrc.Store(src)
+			f.fecDec.input(body)
+		} else {
+			f.handleCrypto(body, src)
+		}
 	}
 }
 
@@ -441,7 +473,11 @@ func (f *Flux) tunToNet() error {
 			log.Printf("flux: seal error: %v", err)
 			continue
 		}
-		f.writeOut(body, peer)
+		if f.fecEnc != nil {
+			f.fecEnc.addData(body) // buffered into an RS block; shards go out via the emit callback
+		} else {
+			f.carrierOut(body, peer)
+		}
 	}
 }
 
@@ -534,7 +570,7 @@ func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
 	// frame that opens under the new session (learnPeer), so a replayed init
 	// cannot redirect traffic.
 	if msg2 := crypto.RespMsg(f.psk, eInit, sr); msg2 != nil {
-		f.writeOut(msg2, addr)
+		f.sendCtrl(msg2, addr)
 	}
 }
 
@@ -601,7 +637,19 @@ func (f *Flux) sendInit() {
 		return
 	}
 	f.ci.Store(ci)
-	f.writeOut(crypto.InitMsg(f.psk, ci), peer)
+	f.sendCtrl(crypto.InitMsg(f.psk, ci), peer)
+}
+
+// sendCtrl sends a control/handshake frame. Under FEC it is tagged passthrough so
+// the peer's decoder forwards it straight through instead of parsing it as a shard
+// (or holding it in a block). `to` may differ from the learned peer — e.g. a
+// server's handshake reply to the init's source before the peer is committed.
+func (f *Flux) sendCtrl(body []byte, to *net.IPAddr) {
+	if f.fecEnc != nil {
+		f.carrierOut(append([]byte{fecTypePass}, body...), to)
+		return
+	}
+	f.carrierOut(body, to)
 }
 
 func (f *Flux) send(typ byte, payload []byte, to *net.IPAddr) {
@@ -615,7 +663,7 @@ func (f *Flux) send(typ byte, payload []byte, to *net.IPAddr) {
 	if err != nil {
 		return
 	}
-	f.writeOut(body, to)
+	f.sendCtrl(body, to)
 }
 
 // rotateWatcher refreshes the cached send-side shape every second (so writeOut
