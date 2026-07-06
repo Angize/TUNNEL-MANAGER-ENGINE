@@ -22,6 +22,7 @@ import (
 	"log"
 	"net"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -167,12 +168,15 @@ func (f *Flux) Close() error {
 	return nil
 }
 
-// installAntiLeak drops the peer's frames in the raw PREROUTING chain so the kernel
-// does not answer our exotic protocol / unbound UDP port with an ICMP unreachable.
-// AF_PACKET taps every frame before that chain runs, so flux still receives everything.
-// Best-effort and installed exactly once (the server learns the peer late).
+// installAntiLeak drops just THIS carrier's inbound frames from the peer in the raw
+// PREROUTING chain, so the kernel does not answer our exotic protocol / unbound UDP
+// port with an ICMP unreachable. AF_PACKET taps every frame before that chain runs,
+// so flux still receives everything. The rules are scoped to the carrier's own
+// protocol/ports (NOT all traffic from the peer) so a co-located tunnel to the same
+// peer — e.g. a raw/bip link on proto 253 — is not collaterally dropped. Best-effort,
+// installed exactly once (the server learns the peer late).
 func (f *Flux) installAntiLeak(peer net.IP) {
-	f.leakOnce.Do(func() { f.antiLeak = addPeerDrop(peer) })
+	f.leakOnce.Do(func() { f.antiLeak = addFluxDrop(peer, f.carrier) })
 }
 
 func (f *Flux) sealer() Sealer {
@@ -296,20 +300,55 @@ func buildUDPSeg(src, dst net.IP, sport, dport uint16, payload []byte) []byte {
 	return h
 }
 
-// addPeerDrop installs a best-effort iptables rule dropping all frames from peer in
-// the raw table's PREROUTING chain, so the kernel never answers our carrier with an
-// ICMP unreachable. AF_PACKET taps before this chain, so flux's receive is unaffected.
-// Returns a cleanup func (nil if the rule could not be installed).
-func addPeerDrop(peer net.IP) func() {
-	args := []string{"-t", "raw", "-A", "PREROUTING", "-s", peer.String(), "-j", "DROP"}
-	if out, err := exec.Command("iptables", args...).CombinedOutput(); err != nil {
-		log.Printf("flux: anti-leak rule not installed (kernel may ICMP-reject our carrier): %v: %s", err, strings.TrimSpace(string(out)))
+// fluxDropMatches returns the iptables match fragments (one per rule) that select
+// exactly this carrier's inbound traffic from peer — scoped to the carrier's own
+// protocol/ports so it never drops another tunnel's packets to the same peer:
+//   - raw:  one rule per experimental protocol in the pool (-p <proto>)
+//   - stun: one rule per STUN destination port (-p udp --dport <p>)
+//   - udp:  one rule per QUIC/STUN/WebRTC destination port (-p udp --dport <p>)
+func fluxDropMatches(peer net.IP, carrier string) [][]string {
+	s := peer.String()
+	var out [][]string
+	switch carrier {
+	case "raw":
+		for _, p := range fluxProtoPool {
+			out = append(out, []string{"-s", s, "-p", strconv.Itoa(p)})
+		}
+	case "stun":
+		for _, dp := range fluxStunDports {
+			out = append(out, []string{"-s", s, "-p", "udp", "--dport", strconv.Itoa(int(dp))})
+		}
+	default: // udp
+		for _, dp := range fluxDportPool {
+			out = append(out, []string{"-s", s, "-p", "udp", "--dport", strconv.Itoa(int(dp))})
+		}
+	}
+	return out
+}
+
+// addFluxDrop installs best-effort raw-PREROUTING DROP rules for exactly this
+// carrier's traffic from peer, so the kernel never ICMP-rejects our frames while a
+// co-located tunnel (e.g. raw/bip on proto 253) to the same peer keeps working.
+// AF_PACKET taps before this chain, so flux's receive is unaffected. Returns a
+// cleanup func that removes every rule it managed to install (nil if none).
+func addFluxDrop(peer net.IP, carrier string) func() {
+	var added [][]string
+	for _, m := range fluxDropMatches(peer, carrier) {
+		args := append([]string{"-t", "raw", "-A", "PREROUTING"}, append(append([]string{}, m...), "-j", "DROP")...)
+		if out, err := exec.Command("iptables", args...).CombinedOutput(); err != nil {
+			log.Printf("flux: anti-leak rule not installed (kernel may ICMP-reject our carrier): %v: %s", err, strings.TrimSpace(string(out)))
+			continue
+		}
+		added = append(added, m)
+	}
+	if len(added) == 0 {
 		return nil
 	}
 	return func() {
-		del := append([]string(nil), args...)
-		del[2] = "-D"
-		_ = exec.Command("iptables", del...).Run()
+		for _, m := range added {
+			del := append([]string{"-t", "raw", "-D", "PREROUTING"}, append(append([]string{}, m...), "-j", "DROP")...)
+			_ = exec.Command("iptables", del...).Run()
+		}
 	}
 }
 
