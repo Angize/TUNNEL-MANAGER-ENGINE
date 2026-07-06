@@ -1,5 +1,5 @@
 // Command tnl-engine is the custom data-plane engine for the tunnel fleet
-// manager. This build implements a single slice: Mode "packet" / Profile "bip"
+// manager. This build implements a single slice: Mode "packet" / Profile "core"
 // — raw L3 packets over a TUN device, carried by UDP with optional AES-256-GCM.
 //
 // Usage:
@@ -23,7 +23,7 @@ import (
 )
 
 // version is stamped into logs so the panel can tell which engine a node runs.
-const version = "0.1.0-bip"
+const version = "0.1.0-core"
 
 func main() {
 	cfgPath := flag.String("config", "", "path to engine JSON config")
@@ -99,12 +99,12 @@ func main() {
 		case "server":
 			b, err = packet.ListenTCP(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.Cover, cfg.CoverSNI)
 			if err == nil {
-				log.Printf("tnl-engine: listening (bip/tcp%s%s) on %s", obfsTag, coverTag(cfg.Cover), cfg.Listen)
+				log.Printf("tnl-engine: listening (core/tcp%s%s) on %s", obfsTag, coverTag(cfg.Cover), cfg.Listen)
 			}
 		case "client":
 			b, err = packet.DialTCP(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.Cover, cfg.CoverSNI)
 			if err == nil {
-				log.Printf("tnl-engine: dialing (bip/tcp%s%s) %s", obfsTag, coverTag(cfg.Cover), cfg.Peer)
+				log.Printf("tnl-engine: dialing (core/tcp%s%s) %s", obfsTag, coverTag(cfg.Cover), cfg.Peer)
 			}
 		}
 	case "raw":
@@ -112,12 +112,12 @@ func main() {
 		case "server":
 			b, err = packet.ListenRaw(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile)
 			if err == nil {
-				log.Printf("tnl-engine: listening (bip/raw:%s%s) on %s", cfg.RawProfile, obfsTag, cfg.Listen)
+				log.Printf("tnl-engine: listening (core/raw:%s%s) on %s", cfg.RawProfile, obfsTag, cfg.Listen)
 			}
 		case "client":
 			b, err = packet.DialRaw(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile)
 			if err == nil {
-				log.Printf("tnl-engine: dialing (bip/raw:%s%s) %s", cfg.RawProfile, obfsTag, cfg.Peer)
+				log.Printf("tnl-engine: dialing (core/raw:%s%s) %s", cfg.RawProfile, obfsTag, cfg.Peer)
 			}
 		}
 	default: // "udp"
@@ -125,12 +125,12 @@ func main() {
 		case "server":
 			b, err = packet.Listen(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
 			if err == nil {
-				log.Printf("tnl-engine: listening (bip/udp%s) on %s", obfsTag, cfg.Listen)
+				log.Printf("tnl-engine: listening (core/udp%s) on %s", obfsTag, cfg.Listen)
 			}
 		case "client":
 			b, err = packet.Dial(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
 			if err == nil {
-				log.Printf("tnl-engine: dialing (bip/udp%s) %s", obfsTag, cfg.Peer)
+				log.Printf("tnl-engine: dialing (core/udp%s) %s", obfsTag, cfg.Peer)
 			}
 		}
 	}
