@@ -12,6 +12,7 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -99,6 +100,10 @@ func main() {
 	if cfg.Obfs {
 		obfsTag = " obfs"
 	}
+	fecTag := ""
+	if cfg.Fec {
+		fecTag = fmt.Sprintf(" fec=%d+%d", cfg.FecData, cfg.FecParity)
+	}
 	cryptoOn := cfg.Crypto.Enabled
 	switch cfg.Transport {
 	case "tcp":
@@ -131,14 +136,14 @@ func main() {
 		rotate := time.Duration(cfg.FluxRotateSecs) * time.Second
 		switch cfg.Role {
 		case "server":
-			b, err = packet.ListenFlux(cfg.Listen, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.FluxCarrier, cfg.FluxShape, cfg.FluxEpochOffset)
+			b, err = packet.ListenFlux(cfg.Listen, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.FluxCarrier, cfg.FluxShape, cfg.FluxEpochOffset, cfg.Fec, cfg.FecData, cfg.FecParity)
 			if err == nil {
-				log.Printf("tnl-core: listening (core/flux:%s/%s rotate=%ds%s)", cfg.FluxCarrier, cfg.FluxShape, cfg.FluxRotateSecs, obfsTag)
+				log.Printf("tnl-core: listening (core/flux:%s/%s rotate=%ds%s%s)", cfg.FluxCarrier, cfg.FluxShape, cfg.FluxRotateSecs, obfsTag, fecTag)
 			}
 		case "client":
-			b, err = packet.DialFlux(cfg.Peer, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.FluxCarrier, cfg.FluxShape, cfg.FluxEpochOffset)
+			b, err = packet.DialFlux(cfg.Peer, dev, ka, rotate, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.FluxCarrier, cfg.FluxShape, cfg.FluxEpochOffset, cfg.Fec, cfg.FecData, cfg.FecParity)
 			if err == nil {
-				log.Printf("tnl-core: dialing (core/flux:%s/%s rotate=%ds%s) %s", cfg.FluxCarrier, cfg.FluxShape, cfg.FluxRotateSecs, obfsTag, cfg.Peer)
+				log.Printf("tnl-core: dialing (core/flux:%s/%s rotate=%ds%s%s) %s", cfg.FluxCarrier, cfg.FluxShape, cfg.FluxRotateSecs, obfsTag, fecTag, cfg.Peer)
 			}
 		}
 	case "ws":

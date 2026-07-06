@@ -125,6 +125,22 @@ type Config struct {
 	// wire; a few-epoch grace window absorbs clock skew. 0 defaults to 600.
 	FluxRotateSecs int `json:"flux_rotate_secs"`
 
+	// Fec turns on forward error correction on the datagram carriers (flux
+	// udp/stun/raw). Data frames are grouped into blocks of FecData shards and
+	// FecParity parity shards are sent alongside; the receiver reconstructs up to
+	// FecParity lost shards per block WITHOUT a retransmit, so a throttled/high-loss
+	// link stays usable instead of collapsing the inner TCP with retransmits. It
+	// costs FecParity/FecData extra bandwidth. Both ends must match (the panel sets
+	// both). It has no effect on the tcp/ws carriers (TCP is already reliable).
+	Fec bool `json:"fec"`
+
+	// FecData / FecParity are the block geometry: FecData data shards per block,
+	// FecParity parity shards. E.g. 10/3 = "10 + 3" (30% overhead, recovers up to 3
+	// of every 13). Defaults 10/3 when Fec is on. Constraint: FecData>=1, FecParity>=1,
+	// FecData+FecParity<=255.
+	FecData   int `json:"fec_data"`
+	FecParity int `json:"fec_parity"`
+
 	// GSO opens the TUN with a virtio-net header and TCP/UDP segmentation
 	// offload, so the kernel hands the core large super-packets on bulk
 	// transfers instead of many MTU-sized ones — fewer syscalls/copies, higher
@@ -171,6 +187,14 @@ func (c *Config) applyDefaults() {
 		}
 		if c.FluxCarrier == "" {
 			c.FluxCarrier = "udp"
+		}
+		if c.Fec {
+			if c.FecData == 0 {
+				c.FecData = 10
+			}
+			if c.FecParity == 0 {
+				c.FecParity = 3
+			}
 		}
 	}
 	if c.Transport == "ws" && c.WSPath == "" {
@@ -252,6 +276,13 @@ func (c *Config) validate() error {
 		default:
 			return errors.New("flux_shape must be \"random\", \"quic\", \"video\", or \"webrtc\"")
 		}
+		// FEC geometry (0 means "use the default" — applied after validation).
+		if c.FecData < 0 || c.FecParity < 0 {
+			return errors.New("fec_data / fec_parity must be >= 0 (0 defaults to 10 / 3)")
+		}
+		if c.FecData+c.FecParity > 255 {
+			return errors.New("fec_data + fec_parity must be <= 255")
+		}
 	case "ws":
 		// WebSocket carrier. Client-side TLS to a CDN edge needs an SNI/Host, so
 		// ws_tls requires ws_host; the server side (plain, behind the CDN) needs neither.
@@ -269,6 +300,9 @@ func (c *Config) validate() error {
 	}
 	if c.Obfs && !c.Crypto.Enabled {
 		return errors.New("obfs requires crypto enabled")
+	}
+	if c.Fec && c.Transport != "flux" {
+		return errors.New("fec is only supported on the \"flux\" transport (its datagram carriers)")
 	}
 	if c.Cover && c.Transport != "tcp" {
 		return errors.New("cover (TLS) requires transport \"tcp\"")
