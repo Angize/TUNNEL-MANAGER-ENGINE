@@ -18,9 +18,38 @@ package packet
 
 import (
 	"encoding/binary"
+	"log"
 	"sync"
 	"time"
 )
+
+// newFecPair builds the encoder/decoder a datagram carrier needs to run FEC, or
+// (nil, nil) when fec is off or the geometry is bad (logged, so the carrier just
+// runs without FEC rather than failing). emit sends one ready wire packet (the
+// carrier wraps + transmits it to the peer); deliver receives each recovered frame
+// (the carrier feeds it back into its normal crypto/clear path). This keeps the
+// three datagram carriers (udp, raw, flux) sharing one FEC wiring.
+func newFecPair(fec bool, data, parity int, name string, emit, deliver func([]byte)) (*fecEncoder, *fecDecoder) {
+	if !fec {
+		return nil, nil
+	}
+	enc, err := newFecEncoder(data, parity, emit)
+	if err != nil {
+		log.Printf("%s: FEC disabled (bad geometry %d+%d): %v", name, data, parity, err)
+		return nil, nil
+	}
+	return enc, newFecDecoder(deliver)
+}
+
+// fecTag prepends the passthrough type tag to a control/handshake frame when enc is
+// non-nil (FEC on), so the peer's decoder forwards it straight through instead of
+// parsing it as a shard. With FEC off it returns the frame unchanged.
+func fecTag(enc *fecEncoder, frame []byte) []byte {
+	if enc == nil {
+		return frame
+	}
+	return append([]byte{fecTypePass}, frame...)
+}
 
 const (
 	fecTypePass   = 0

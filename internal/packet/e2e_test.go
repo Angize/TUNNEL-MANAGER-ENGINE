@@ -104,11 +104,11 @@ func runTunnel(t *testing.T, transport string, obfs bool) {
 		}
 	} else {
 		addr := freeUDPPort(t)
-		srv, err = Listen(addr, srvDev, ka, obfs, cryptoOn, psk, cipher)
+		srv, err = Listen(addr, srvDev, ka, obfs, cryptoOn, psk, cipher, false, 0, 0)
 		if err != nil {
 			t.Fatalf("Listen: %v", err)
 		}
-		cli, err = Dial(addr, cliDev, ka, obfs, cryptoOn, psk, cipher)
+		cli, err = Dial(addr, cliDev, ka, obfs, cryptoOn, psk, cipher, false, 0, 0)
 		if err != nil {
 			t.Fatalf("Dial: %v", err)
 		}

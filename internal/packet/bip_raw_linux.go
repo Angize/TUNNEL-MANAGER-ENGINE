@@ -71,6 +71,10 @@ type Raw struct {
 	seq     atomic.Uint32
 	lastRx  atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
 
+	fecEnc *fecEncoder                // non-nil when FEC is on: buffers data frames into RS blocks on send
+	fecDec *fecDecoder                // non-nil when FEC is on: reassembles + reconstructs blocks on receive
+	rxAddr atomic.Pointer[net.IPAddr] // src of the packet currently feeding fecDec (deliver reads it)
+
 	closeCh   chan struct{}
 	closeOnce sync.Once
 }
@@ -88,7 +92,7 @@ func newRaw(conn *net.IPConn, dev *tun.Device, ka time.Duration, obfs, cryptoOn 
 // DialRaw (client role) opens a raw socket of the profile's protocol and targets
 // peerIP. peerIP may be a plain IPv4 or an "ip:port" (the port is ignored — raw
 // IP has no ports of its own; the tcp/udp profiles carry synthetic ones).
-func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofSrc, spoofDst string) (*Raw, error) {
+func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofSrc, spoofDst string, fec bool, fecData, fecParity int) (*Raw, error) {
 	proto, ok := rawProtoFor(profile)
 	if !ok {
 		return nil, fmt.Errorf("raw: unknown profile %q", profile)
@@ -133,13 +137,14 @@ func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bo
 		}
 		r.spoofFd = fd
 	}
+	r.initFec(fec, fecData, fecParity)
 	return r, nil
 }
 
 // ListenRaw (server role) binds a raw socket of the profile's protocol and waits
 // to learn the peer from the first authenticated frame. listenIP may be empty,
 // "0.0.0.0", a plain IPv4, or an "ip:port" (the port is ignored).
-func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofPeer, spoofDst string) (*Raw, error) {
+func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofPeer, spoofDst string, fec bool, fecData, fecParity int) (*Raw, error) {
 	proto, ok := rawProtoFor(profile)
 	if !ok {
 		return nil, fmt.Errorf("raw: unknown profile %q", profile)
@@ -191,7 +196,21 @@ func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoO
 		r.pktFd = pfd
 		r.antiLeak = addAntiLeak(proto, dip) // best-effort; stops the kernel forwarding the decoy dst
 	}
+	r.initFec(fec, fecData, fecParity)
 	return r, nil
+}
+
+// initFec wires the FEC encoder/decoder (no-op when fec is off). Data shards are
+// profile-wrapped and emitted to the current peer; recovered frames re-enter the
+// normal receive path with the source of the packet that completed their block.
+func (r *Raw) initFec(fec bool, fecData, fecParity int) {
+	r.fecEnc, r.fecDec = newFecPair(fec, fecData, fecParity, "raw",
+		func(pkt []byte) {
+			if p := r.peer.Load(); p != nil {
+				r.writeOut(r.wire(pkt, p.IP), p)
+			}
+		},
+		func(frame []byte) { r.deliver(frame, r.rxAddr.Load()) })
 }
 
 // Run blocks until one of the loops fails (e.g. the socket or device closes).
@@ -419,6 +438,10 @@ func (r *Raw) tunToNet() error {
 			log.Printf("raw: seal error: %v", err)
 			continue
 		}
+		if r.fecEnc != nil {
+			r.fecEnc.addData(body) // buffered into an RS block; shards go out via the emit callback
+			continue
+		}
 		r.writeOut(r.wire(body, peer.IP), peer)
 	}
 }
@@ -490,6 +513,22 @@ func (r *Raw) afpacketToTun() error {
 func (r *Raw) handleRaw(raw []byte, addr *net.IPAddr) {
 	body, ok := rawDecap(r.profile, raw)
 	if !ok {
+		return
+	}
+	if r.fecDec != nil {
+		// The two receive loops are the only readers, so rxAddr is stable for the
+		// whole input() call (the decoder delivers recovered frames synchronously).
+		r.rxAddr.Store(addr)
+		r.fecDec.input(body)
+		return
+	}
+	r.deliver(body, addr)
+}
+
+// deliver dispatches one received frame (already de-FEC'd and de-encap'd):
+// authenticated data in crypto mode, or unauthenticated legacy framing in clear mode.
+func (r *Raw) deliver(body []byte, addr *net.IPAddr) {
+	if addr == nil {
 		return
 	}
 	if r.cryptoOn {
@@ -584,9 +623,19 @@ func (r *Raw) tryHandshake(body []byte, addr *net.IPAddr) {
 		}
 	}
 	if msg2 := crypto.RespMsg(r.psk, eInit, sr); msg2 != nil {
-		to := r.replyAddr(addr)
-		r.writeOut(r.wire(msg2, to.IP), to)
+		r.writeCtrl(msg2, r.replyAddr(addr))
 	}
+}
+
+// writeCtrl profile-wraps and sends a control/handshake frame, tagging it passthrough
+// under FEC so the peer's decoder forwards it straight through instead of parsing it as
+// a shard. to may differ from the learned peer (a server's handshake reply, or a
+// forged-source client's fixed reply address).
+func (r *Raw) writeCtrl(body []byte, to *net.IPAddr) {
+	if to == nil {
+		return
+	}
+	r.writeOut(r.wire(fecTag(r.fecEnc, body), to.IP), to)
 }
 
 func (r *Raw) dispatch(typ byte, payload []byte, addr *net.IPAddr) {
@@ -652,7 +701,7 @@ func (r *Raw) sendInit() {
 		return
 	}
 	r.ci.Store(ci)
-	r.writeOut(r.wire(crypto.InitMsg(r.psk, ci), peer.IP), peer)
+	r.writeCtrl(crypto.InitMsg(r.psk, ci), peer)
 }
 
 func (r *Raw) send(typ byte, payload []byte, to *net.IPAddr) {
@@ -666,7 +715,7 @@ func (r *Raw) send(typ byte, payload []byte, to *net.IPAddr) {
 	if err != nil {
 		return
 	}
-	r.writeOut(r.wire(body, to.IP), to)
+	r.writeCtrl(body, to)
 }
 
 // hostOnly returns the host part of an "ip:port", or s unchanged if it has none.

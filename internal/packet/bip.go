@@ -72,6 +72,10 @@ type Bip struct {
 	ci      atomic.Pointer[crypto.Ephemeral] // client's current handshake ephemeral
 	lastRx  atomic.Int64                     // unix-nano of the last authenticated frame (client staleness)
 
+	fecEnc *fecEncoder                 // non-nil when FEC is on: buffers data frames into RS blocks on send
+	fecDec *fecDecoder                 // non-nil when FEC is on: reassembles + reconstructs blocks on receive
+	rxAddr atomic.Pointer[net.UDPAddr] // src of the packet currently feeding fecDec (deliver reads it)
+
 	closeCh   chan struct{}
 	closeOnce sync.Once
 }
@@ -95,7 +99,7 @@ func (b *Bip) sessionStale() bool {
 }
 
 // Dial (client role) binds an ephemeral UDP socket and targets peerAddr.
-func Dial(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*Bip, error) {
+func Dial(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, fec bool, fecData, fecParity int) (*Bip, error) {
 	ra, err := net.ResolveUDPAddr("udp", peerAddr)
 	if err != nil {
 		return nil, err
@@ -106,11 +110,12 @@ func Dial(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, crypt
 	}
 	b := &Bip{conn: conn, dev: dev, keepalive: keepalive, obfs: obfs, cryptoOn: cryptoOn, psk: psk, cipher: cipher, isClient: true, closeCh: make(chan struct{})}
 	b.peer.Store(ra)
+	b.initFec(fec, fecData, fecParity)
 	return b, nil
 }
 
 // Listen (server role) binds listenAddr and waits to learn the peer.
-func Listen(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*Bip, error) {
+func Listen(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, fec bool, fecData, fecParity int) (*Bip, error) {
 	la, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		return nil, err
@@ -119,7 +124,22 @@ func Listen(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, c
 	if err != nil {
 		return nil, err
 	}
-	return &Bip{conn: conn, dev: dev, keepalive: keepalive, obfs: obfs, cryptoOn: cryptoOn, psk: psk, cipher: cipher, closeCh: make(chan struct{})}, nil
+	b := &Bip{conn: conn, dev: dev, keepalive: keepalive, obfs: obfs, cryptoOn: cryptoOn, psk: psk, cipher: cipher, closeCh: make(chan struct{})}
+	b.initFec(fec, fecData, fecParity)
+	return b, nil
+}
+
+// initFec wires the FEC encoder/decoder (no-op when fec is off). Data shards emit to
+// the current peer; recovered frames re-enter the normal receive path with the source
+// of the packet that completed their block.
+func (b *Bip) initFec(fec bool, fecData, fecParity int) {
+	b.fecEnc, b.fecDec = newFecPair(fec, fecData, fecParity, "bip",
+		func(pkt []byte) {
+			if p := b.peer.Load(); p != nil {
+				_, _ = b.conn.WriteToUDP(pkt, p)
+			}
+		},
+		func(frame []byte) { b.deliver(frame, b.rxAddr.Load()) })
 }
 
 // Run blocks until one of the loops fails (e.g. the socket or device closes).
@@ -192,6 +212,10 @@ func (b *Bip) tunToNet() error {
 			log.Printf("bip: seal error: %v", err)
 			continue
 		}
+		if b.fecEnc != nil {
+			b.fecEnc.addData(frame) // buffered into an RS block; shards go out via the emit callback
+			continue
+		}
 		if _, err := b.conn.WriteToUDP(frame, peer); err != nil {
 			log.Printf("bip: write error: %v", err)
 		}
@@ -208,17 +232,32 @@ func (b *Bip) netToTun() error {
 		if err != nil {
 			return err
 		}
-		if b.cryptoOn {
-			b.handleCrypto(buf[:n], addr)
+		if b.fecDec != nil {
+			// netToTun is the sole reader, so rxAddr is stable for the whole input()
+			// call (the decoder delivers recovered frames synchronously within it).
+			b.rxAddr.Store(addr)
+			b.fecDec.input(buf[:n])
 			continue
 		}
-		// clear mode: unauthenticated legacy framing
-		if n < 2 || buf[0] != magic {
-			continue
-		}
-		b.peer.Store(addr)
-		b.dispatch(buf[1], iff(buf[1] == typeData, buf[2:n], nil), addr)
+		b.deliver(buf[:n], addr)
 	}
+}
+
+// deliver dispatches one received frame (already de-FEC'd): authenticated data in
+// crypto mode, or unauthenticated legacy framing in clear mode.
+func (b *Bip) deliver(pkt []byte, addr *net.UDPAddr) {
+	if addr == nil {
+		return
+	}
+	if b.cryptoOn {
+		b.handleCrypto(pkt, addr)
+		return
+	}
+	if len(pkt) < 2 || pkt[0] != magic {
+		return
+	}
+	b.peer.Store(addr)
+	b.dispatch(pkt[1], iff(pkt[1] == typeData, pkt[2:], nil), addr)
 }
 
 // handleCrypto is the crypto-on receive path: try the frame as data under the
@@ -291,8 +330,18 @@ func (b *Bip) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 	// waits for a data/ping frame that opens under the new session, so a replayed
 	// init cannot redirect traffic.
 	if msg2 := crypto.RespMsg(b.psk, eInit, sr); msg2 != nil {
-		_, _ = b.conn.WriteToUDP(msg2, addr)
+		b.writeCtrl(msg2, addr)
 	}
+}
+
+// writeCtrl sends a control/handshake datagram, tagging it passthrough under FEC so
+// the peer's decoder forwards it straight through (never held in a block or parsed as
+// a shard). to may differ from the learned peer (a server's handshake reply).
+func (b *Bip) writeCtrl(pkt []byte, to *net.UDPAddr) {
+	if to == nil {
+		return
+	}
+	_, _ = b.conn.WriteToUDP(fecTag(b.fecEnc, pkt), to)
 }
 
 func (b *Bip) dispatch(typ byte, payload []byte, addr *net.UDPAddr) {
@@ -347,7 +396,7 @@ func (b *Bip) sendInit() {
 		return
 	}
 	b.ci.Store(ci)
-	_, _ = b.conn.WriteToUDP(crypto.InitMsg(b.psk, ci), peer)
+	b.writeCtrl(crypto.InitMsg(b.psk, ci), peer)
 }
 
 func (b *Bip) send(typ byte, payload []byte, to *net.UDPAddr) {
@@ -361,7 +410,7 @@ func (b *Bip) send(typ byte, payload []byte, to *net.UDPAddr) {
 	if err != nil {
 		return
 	}
-	_, _ = b.conn.WriteToUDP(frame, to)
+	b.writeCtrl(frame, to)
 }
 
 func iff(cond bool, a, b []byte) []byte {

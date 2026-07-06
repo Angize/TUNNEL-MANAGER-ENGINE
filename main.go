@@ -122,14 +122,14 @@ func main() {
 	case "raw":
 		switch cfg.Role {
 		case "server":
-			b, err = packet.ListenRaw(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile, cfg.SpoofPeer, cfg.SpoofDst)
+			b, err = packet.ListenRaw(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile, cfg.SpoofPeer, cfg.SpoofDst, cfg.Fec, cfg.FecData, cfg.FecParity)
 			if err == nil {
-				log.Printf("tnl-core: listening (core/raw:%s%s) on %s", cfg.RawProfile, obfsTag, cfg.Listen)
+				log.Printf("tnl-core: listening (core/raw:%s%s%s) on %s", cfg.RawProfile, obfsTag, fecTag, cfg.Listen)
 			}
 		case "client":
-			b, err = packet.DialRaw(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile, cfg.SpoofSrc, cfg.SpoofDst)
+			b, err = packet.DialRaw(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile, cfg.SpoofSrc, cfg.SpoofDst, cfg.Fec, cfg.FecData, cfg.FecParity)
 			if err == nil {
-				log.Printf("tnl-core: dialing (core/raw:%s%s) %s", cfg.RawProfile, obfsTag, cfg.Peer)
+				log.Printf("tnl-core: dialing (core/raw:%s%s%s) %s", cfg.RawProfile, obfsTag, fecTag, cfg.Peer)
 			}
 		}
 	case "flux":
@@ -166,14 +166,14 @@ func main() {
 	default: // "udp"
 		switch cfg.Role {
 		case "server":
-			b, err = packet.Listen(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
+			b, err = packet.Listen(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.Fec, cfg.FecData, cfg.FecParity)
 			if err == nil {
-				log.Printf("tnl-core: listening (core/udp%s) on %s", obfsTag, cfg.Listen)
+				log.Printf("tnl-core: listening (core/udp%s%s) on %s", obfsTag, fecTag, cfg.Listen)
 			}
 		case "client":
-			b, err = packet.Dial(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
+			b, err = packet.Dial(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.Fec, cfg.FecData, cfg.FecParity)
 			if err == nil {
-				log.Printf("tnl-core: dialing (core/udp%s) %s", obfsTag, cfg.Peer)
+				log.Printf("tnl-core: dialing (core/udp%s%s) %s", obfsTag, fecTag, cfg.Peer)
 			}
 		}
 	}

@@ -85,26 +85,20 @@ func newFlux(dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk
 	}
 	sh := deriveFluxShape(psk, f.epochNow(), shape)
 	f.curShape.Store(&sh)
-	if fec {
-		// emit sends each ready FEC packet (data/parity shard) to the current peer
-		// wrapped in the carrier; deliver feeds each recovered frame back into the
-		// normal crypto path with the source of the packet that completed the block.
-		enc, err := newFecEncoder(fecData, fecParity, func(pkt []byte) {
+	// emit sends each ready FEC packet (data/parity shard) to the current peer wrapped
+	// in the carrier; deliver feeds each recovered frame back into the normal crypto
+	// path with the source of the packet that completed the block.
+	f.fecEnc, f.fecDec = newFecPair(fec, fecData, fecParity, "flux",
+		func(pkt []byte) {
 			if p := f.peer.Load(); p != nil {
 				f.carrierOut(pkt, p)
 			}
+		},
+		func(frame []byte) {
+			if s := f.rxSrc.Load(); s != nil {
+				f.handleCrypto(frame, s)
+			}
 		})
-		if err == nil {
-			f.fecEnc = enc
-			f.fecDec = newFecDecoder(func(frame []byte) {
-				if s := f.rxSrc.Load(); s != nil {
-					f.handleCrypto(frame, s)
-				}
-			})
-		} else {
-			log.Printf("flux: FEC disabled (bad geometry %d+%d): %v", fecData, fecParity, err)
-		}
-	}
 	return f
 }
 
@@ -645,11 +639,7 @@ func (f *Flux) sendInit() {
 // (or holding it in a block). `to` may differ from the learned peer — e.g. a
 // server's handshake reply to the init's source before the peer is committed.
 func (f *Flux) sendCtrl(body []byte, to *net.IPAddr) {
-	if f.fecEnc != nil {
-		f.carrierOut(append([]byte{fecTypePass}, body...), to)
-		return
-	}
-	f.carrierOut(body, to)
+	f.carrierOut(fecTag(f.fecEnc, body), to)
 }
 
 func (f *Flux) send(typ byte, payload []byte, to *net.IPAddr) {

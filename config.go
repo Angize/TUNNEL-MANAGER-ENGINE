@@ -188,13 +188,13 @@ func (c *Config) applyDefaults() {
 		if c.FluxCarrier == "" {
 			c.FluxCarrier = "udp"
 		}
-		if c.Fec {
-			if c.FecData == 0 {
-				c.FecData = 10
-			}
-			if c.FecParity == 0 {
-				c.FecParity = 3
-			}
+	}
+	if c.Fec { // FEC defaults apply on any datagram carrier that has it enabled
+		if c.FecData == 0 {
+			c.FecData = 10
+		}
+		if c.FecParity == 0 {
+			c.FecParity = 3
 		}
 	}
 	if c.Transport == "ws" && c.WSPath == "" {
@@ -276,13 +276,6 @@ func (c *Config) validate() error {
 		default:
 			return errors.New("flux_shape must be \"random\", \"quic\", \"video\", or \"webrtc\"")
 		}
-		// FEC geometry (0 means "use the default" — applied after validation).
-		if c.FecData < 0 || c.FecParity < 0 {
-			return errors.New("fec_data / fec_parity must be >= 0 (0 defaults to 10 / 3)")
-		}
-		if c.FecData+c.FecParity > 255 {
-			return errors.New("fec_data + fec_parity must be <= 255")
-		}
 	case "ws":
 		// WebSocket carrier. Client-side TLS to a CDN edge needs an SNI/Host, so
 		// ws_tls requires ws_host; the server side (plain, behind the CDN) needs neither.
@@ -301,8 +294,21 @@ func (c *Config) validate() error {
 	if c.Obfs && !c.Crypto.Enabled {
 		return errors.New("obfs requires crypto enabled")
 	}
-	if c.Fec && c.Transport != "flux" {
-		return errors.New("fec is only supported on the \"flux\" transport (its datagram carriers)")
+	if c.Fec {
+		// FEC repairs lost datagrams from parity — it only makes sense on the datagram
+		// carriers (udp / raw / flux). On tcp/ws the stream is already reliable, so FEC
+		// there is wasted bandwidth that fights TCP's own retransmit/congestion control.
+		switch c.Transport {
+		case "", "udp", "raw", "flux":
+		default:
+			return errors.New("fec is only supported on the datagram carriers (udp, raw, flux) — not tcp/ws")
+		}
+		if c.FecData < 0 || c.FecParity < 0 {
+			return errors.New("fec_data / fec_parity must be >= 0 (0 defaults to 10 / 3)")
+		}
+		if c.FecData+c.FecParity > 255 {
+			return errors.New("fec_data + fec_parity must be <= 255")
+		}
 	}
 	if c.Cover && c.Transport != "tcp" {
 		return errors.New("cover (TLS) requires transport \"tcp\"")
