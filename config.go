@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 )
 
@@ -35,6 +36,14 @@ type Config struct {
 	// IP-layer carrier header — and thus how the traffic looks — changes. Raw
 	// sockets need CAP_NET_RAW and Linux; ipip/gre often do not cross NAT.
 	RawProfile string `json:"raw_profile"`
+
+	// SpoofSrc (client) forges the outer IPv4 source address of raw-transport packets
+	// so per-source/stateful egress filters can't pin the real IP. SpoofPeer (server)
+	// is the client's REAL IP: with a forged source the server cannot learn where to
+	// reply, so it is told here (the AEAD still authenticates every frame). Raw + bip +
+	// crypto only; needs CAP_NET_RAW. Both empty = no spoofing.
+	SpoofSrc  string `json:"spoof_src_ip"`
+	SpoofPeer string `json:"spoof_peer"`
 
 	Listen string `json:"listen"` // server: bind address, e.g. "0.0.0.0:9000"
 	Peer   string `json:"peer"`   // client: server address, e.g. "1.2.3.4:9000"
@@ -141,6 +150,15 @@ func (c *Config) validate() error {
 		}
 		if !c.Crypto.Enabled {
 			return errors.New("raw transport requires crypto enabled (the AEAD both encrypts and authenticates each raw packet)")
+		}
+		if (c.SpoofSrc != "" || c.SpoofPeer != "") && c.RawProfile != "" && c.RawProfile != "bip" {
+			return errors.New("source spoofing is only supported on the raw \"bip\" profile for now")
+		}
+		if c.SpoofSrc != "" && net.ParseIP(c.SpoofSrc).To4() == nil {
+			return errors.New("spoof_src_ip must be an IPv4 address")
+		}
+		if c.SpoofPeer != "" && net.ParseIP(c.SpoofPeer).To4() == nil {
+			return errors.New("spoof_peer must be an IPv4 address")
 		}
 	default:
 		return errors.New("transport must be \"udp\", \"tcp\", or \"raw\"")
