@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net"
@@ -94,6 +95,13 @@ type Config struct {
 	WSHost string `json:"ws_host"`
 	WSPath string `json:"ws_path"`
 	WSTLS  bool   `json:"ws_tls"`
+	// WSECH is a base64 ECHConfigList (draft-ietf-tls-esni / RFC 9460 HTTPS-record
+	// "ech="). On a wss client it encrypts the real SNI (WSHost) inside the ClientHello,
+	// leaving only a benign public name on the wire — so an SNI-blocklisting censor
+	// cannot tell which domain is being reached and must block the whole CDN IP range
+	// (collateral cost) to stop it. The node fetches this from the domain's HTTPS DNS
+	// record over DoH (ordinary DNS is often poisoned). Empty = no ECH.
+	WSECH string `json:"ws_ech"`
 
 	// FluxCarrier selects how "flux" frames ride the wire: "udp" (default) sends
 	// real UDP datagrams on protocol 17 whose ports rotate each epoch among common
@@ -281,6 +289,17 @@ func (c *Config) validate() error {
 		// ws_tls requires ws_host; the server side (plain, behind the CDN) needs neither.
 		if c.WSTLS && c.Role == "client" && c.WSHost == "" {
 			return errors.New("ws_tls requires ws_host (the TLS SNI / fronting domain)")
+		}
+		// ECH hides the SNI, so it only makes sense on a wss client (it is carried in
+		// the TLS ClientHello). Reject a config that asks for ECH without wss, and make
+		// sure the supplied ECHConfigList actually decodes.
+		if c.WSECH != "" {
+			if !c.WSTLS || c.Role != "client" {
+				return errors.New("ws_ech requires ws_tls on a client")
+			}
+			if _, err := base64.StdEncoding.DecodeString(c.WSECH); err != nil {
+				return errors.New("ws_ech is not valid base64")
+			}
 		}
 	default:
 		return errors.New("transport must be \"udp\", \"tcp\", \"raw\", \"flux\", or \"ws\"")

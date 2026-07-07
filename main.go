@@ -10,6 +10,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -154,11 +155,18 @@ func main() {
 				log.Printf("tnl-core: listening (core/ws%s) on %s", obfsTag, cfg.Listen)
 			}
 		case "client":
-			b, err = packet.DialWS(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.WSHost, cfg.WSPath, cfg.WSTLS)
+			var echList []byte
+			if cfg.WSECH != "" { // validated as base64 in Config.Validate
+				echList, _ = base64.StdEncoding.DecodeString(cfg.WSECH)
+			}
+			b, err = packet.DialWS(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.WSHost, cfg.WSPath, cfg.WSTLS, echList)
 			if err == nil {
 				tlsTag := ""
 				if cfg.WSTLS {
 					tlsTag = " wss"
+				}
+				if len(echList) > 0 {
+					tlsTag += " ech"
 				}
 				log.Printf("tnl-core: dialing (core/ws%s%s) %s", obfsTag, tlsTag, cfg.Peer)
 			}

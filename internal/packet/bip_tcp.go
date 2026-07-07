@@ -265,6 +265,7 @@ type BipTCP struct {
 	wsHost string // client: Host header + TLS SNI (the fronting/origin domain)
 	wsPath string // client: request path (default "/")
 	wsTLS  bool   // client: TLS to the edge before the WebSocket upgrade
+	wsECH  []byte // client: ECHConfigList — when set, the SNI is encrypted (hidden)
 
 	isClient bool
 	addr     string // server: listen addr; client: peer addr
@@ -296,9 +297,9 @@ func DialTCP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cr
 // DialWS (client role) is DialTCP over a WebSocket carrier: it dials peerAddr (a
 // CDN edge or the origin), optionally wraps it in TLS (wsTLS, ServerName=wsHost),
 // then performs the WebSocket upgrade with Host=wsHost before the bip framing runs.
-func DialWS(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher, wsHost, wsPath string, wsTLS bool) (*BipTCP, error) {
+func DialWS(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher, wsHost, wsPath string, wsTLS bool, wsECH []byte) (*BipTCP, error) {
 	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
-		ws: true, wsHost: wsHost, wsPath: wsPath, wsTLS: wsTLS,
+		ws: true, wsHost: wsHost, wsPath: wsPath, wsTLS: wsTLS, wsECH: wsECH,
 		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
 }
 
@@ -538,6 +539,41 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 	b.serve(cf)
 }
 
+// tlsToEdge performs the client-side TLS handshake to the CDN edge over an
+// already-dialed conn. ServerName=wsHost is the SNI; when wsECH is set that SNI
+// is encrypted (ECH) so only a benign public name is visible on the wire. If the
+// edge rejects a stale ECH config it returns a fresh RetryConfigList — we redial
+// once and retry with it, so Cloudflare's periodic ECH-key rotation self-heals
+// without a rebuild. On any failure the passed (or redialed) conn is closed.
+func (b *BipTCP) tlsToEdge(conn net.Conn) (net.Conn, error) {
+	ech := b.wsECH
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		cfg := &tls.Config{ServerName: b.wsHost}
+		if len(ech) > 0 {
+			cfg.EncryptedClientHelloConfigList = ech
+		}
+		tc := tls.Client(conn, cfg)
+		tc.SetDeadline(time.Now().Add(handshakeTimeout))
+		if err = tc.Handshake(); err == nil {
+			var zero time.Time
+			tc.SetDeadline(zero)
+			return tc, nil
+		}
+		conn.Close()
+		var echErr *tls.ECHRejectionError
+		if attempt == 0 && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
+			ech = echErr.RetryConfigList // stale ECH key: redial and retry with the fresh one
+			if conn, err = net.DialTimeout("tcp", b.addr, 10*time.Second); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		break
+	}
+	return nil, err
+}
+
 // dialLoop (client) keeps a connection to the server alive, retrying on drop.
 func (b *BipTCP) dialLoop() {
 	for {
@@ -554,18 +590,14 @@ func (b *BipTCP) dialLoop() {
 		}
 		if b.ws { // optional TLS to the edge, then the WebSocket upgrade
 			if b.wsTLS {
-				tc := tls.Client(conn, &tls.Config{ServerName: b.wsHost})
-				tc.SetDeadline(time.Now().Add(handshakeTimeout))
-				if herr := tc.Handshake(); herr != nil {
-					conn.Close()
-					log.Printf("bip/ws: tls to %s failed: %v", b.addr, herr)
+				tc, terr := b.tlsToEdge(conn)
+				if terr != nil {
+					log.Printf("bip/ws: tls to %s failed: %v", b.addr, terr)
 					if b.sleep(1 * time.Second) {
 						return
 					}
 					continue
 				}
-				var zero time.Time
-				tc.SetDeadline(zero)
 				conn = tc
 			}
 			host := b.wsHost

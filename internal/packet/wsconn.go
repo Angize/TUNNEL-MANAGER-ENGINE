@@ -177,8 +177,13 @@ func wsClientHandshake(conn net.Conn, host, path string, deadline time.Time) (*b
 		return nil, err
 	}
 	key := base64.StdEncoding.EncodeToString(kb[:])
+	// A browser-like User-Agent and Origin make the upgrade look like an ordinary
+	// in-page WebSocket, so a CDN's bot heuristics (e.g. Cloudflare Bot Fight Mode)
+	// don't answer a bare request with a challenge page instead of the 101 upgrade.
 	req := "GET " + path + " HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
+		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
+		"Origin: https://" + host + "\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Key: " + key + "\r\n" +
