@@ -42,7 +42,7 @@ import (
 )
 
 const (
-	authMagic  = "TNLREAL1" // 8 bytes; marks a genuine token after decryption
+	authMagic  = "TNLR"     // 4 bytes; marks a genuine token after decryption
 	authWindow = 120        // seconds a token stays valid (replay bound)
 	maxRelays  = 256        // concurrent probe→dest relays cap
 )
@@ -61,32 +61,42 @@ func authKey(psk string) []byte {
 	return k[:]
 }
 
-// sealToken builds the 32-byte session-id token: AEAD(magic||timestamp) keyed by
-// the PSK, using the first 12 bytes of the ClientHello random as the nonce.
-func sealToken(psk string, chRandom []byte, ts int64) ([]byte, error) {
+// sealToken builds the 32-byte session-id token: a fresh 8-byte random nonce carried in the
+// clear, followed by AEAD(magic4 || ts32) keyed by the PSK. The nonce is random per seal —
+// deriving it from the ClientHello random (as before) gave no per-message uniqueness guarantee
+// for the fixed-key AEAD. Layout: 8 nonce + (8 pt + 16 tag) = 32 bytes.
+func sealToken(psk string, ts int64) ([]byte, error) {
 	a, err := chacha20poly1305.New(authKey(psk))
 	if err != nil {
 		return nil, err
 	}
-	pt := make([]byte, 16)
+	nonce8 := make([]byte, 8)
+	if _, err := rand.Read(nonce8); err != nil {
+		return nil, err
+	}
+	pt := make([]byte, 8)
 	copy(pt, authMagic)
-	binary.BigEndian.PutUint64(pt[8:], uint64(ts))
-	return a.Seal(nil, chRandom[:12], pt, nil), nil // 16 + 16 tag = 32 bytes
+	binary.BigEndian.PutUint32(pt[4:], uint32(ts))
+	var nonce [12]byte
+	copy(nonce[:], nonce8)
+	return append(nonce8, a.Seal(nil, nonce[:], pt, nil)...), nil
 }
 
-func openToken(psk string, chRandom, sid []byte) bool {
-	if len(sid) != 32 || len(chRandom) < 12 {
+func openToken(psk string, sid []byte) bool {
+	if len(sid) != 32 {
 		return false
 	}
 	a, err := chacha20poly1305.New(authKey(psk))
 	if err != nil {
 		return false
 	}
-	pt, err := a.Open(nil, chRandom[:12], sid, nil)
-	if err != nil || len(pt) != 16 || string(pt[:8]) != authMagic {
+	var nonce [12]byte
+	copy(nonce[:], sid[:8])
+	pt, err := a.Open(nil, nonce[:], sid[8:], nil)
+	if err != nil || len(pt) != 8 || string(pt[:4]) != authMagic {
 		return false
 	}
-	ts := int64(binary.BigEndian.Uint64(pt[8:16]))
+	ts := int64(binary.BigEndian.Uint32(pt[4:8]))
 	now := time.Now().Unix()
 	return ts >= now-authWindow && ts <= now+authWindow
 }
@@ -101,7 +111,7 @@ func ClientConn(raw net.Conn, sni, psk string, deadline time.Time) (net.Conn, er
 	if err := u.BuildHandshakeState(); err != nil {
 		return nil, err
 	}
-	tok, err := sealToken(psk, u.HandshakeState.Hello.Random, time.Now().Unix())
+	tok, err := sealToken(psk, time.Now().Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +137,7 @@ type Server struct {
 	relay chan struct{}
 
 	mu   sync.Mutex
-	seen map[[32]byte]int64 // ClientHello random -> expiry (anti-replay)
+	seen map[[32]byte]int64 // session-id token -> expiry (anti-replay)
 }
 
 // NewServer builds a cover server that borrows destHost (its :443 is proxied to
@@ -147,11 +157,11 @@ func (sv *Server) Handle(raw net.Conn, deadline time.Time) (net.Conn, error) {
 	if !deadline.IsZero() {
 		_ = raw.SetDeadline(deadline)
 	}
-	hello, random, sid, err := readClientHello(raw)
+	hello, _, sid, err := readClientHello(raw)
 	if err != nil {
 		return nil, err
 	}
-	if openToken(sv.psk, random, sid) && sv.firstSight(random) {
+	if openToken(sv.psk, sid) && sv.firstSight(sid) {
 		if !deadline.IsZero() {
 			_ = raw.SetDeadline(time.Time{})
 		}
@@ -174,12 +184,13 @@ func (sv *Server) Handle(raw net.Conn, deadline time.Time) (net.Conn, error) {
 	return nil, ErrProbe
 }
 
-// firstSight records a ClientHello random and reports whether it is new (an exact
-// replay returns false → the caller proxies it to dest, so a replayer sees the
-// real site rather than our termination).
-func (sv *Server) firstSight(random []byte) bool {
+// firstSight records a token (the ClientHello session-id) and reports whether it is new (a
+// replay — the same token in ANY hello, since the token now carries its own nonce rather than
+// binding to the hello random — returns false → the caller proxies it to dest, so a replayer
+// sees the real site rather than our termination).
+func (sv *Server) firstSight(token []byte) bool {
 	var k [32]byte
-	copy(k[:], random)
+	copy(k[:], token)
 	now := time.Now().Unix()
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
