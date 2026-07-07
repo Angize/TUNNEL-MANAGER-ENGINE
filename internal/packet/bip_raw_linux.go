@@ -235,6 +235,9 @@ func (r *Raw) Run() error {
 // not, so it exits on the next SO_RCVTIMEO tick (<=1s) via its closeCh check.
 func (r *Raw) Close() error {
 	r.closeOnce.Do(func() { close(r.closeCh) })
+	if r.fecEnc != nil {
+		r.fecEnc.Close() // stop the FEC flush timer before the raw fd is closed (else a late Sendto hits a reused fd)
+	}
 	if r.antiLeak != nil {
 		r.antiLeak()
 	}
