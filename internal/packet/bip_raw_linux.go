@@ -768,11 +768,18 @@ func (r *Raw) sendInit() {
 	if peer == nil {
 		return
 	}
-	ci, err := crypto.GenerateEphemeral()
-	if err != nil {
-		return
+	// Reuse the current ephemeral across retransmits — regenerate only for a fresh handshake
+	// cycle (ci==nil). Regenerating each 1s retransmit races the reply on high-RTT links: the
+	// resp (verified against the current ci) would always check against a newer ephemeral and
+	// be dropped, so the handshake could never complete on exactly the throttled links we target.
+	ci := r.ci.Load()
+	if ci == nil {
+		var err error
+		if ci, err = crypto.GenerateEphemeral(); err != nil {
+			return
+		}
+		r.ci.Store(ci)
 	}
-	r.ci.Store(ci)
 	r.writeCtrl(crypto.InitMsg(r.psk, ci), peer)
 }
 

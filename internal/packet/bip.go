@@ -432,11 +432,19 @@ func (b *Bip) sendInit() {
 	if peer == nil {
 		return
 	}
-	ci, err := crypto.GenerateEphemeral()
-	if err != nil {
-		return
+	// Reuse the current ephemeral across retransmits — regenerate ONLY to start a fresh
+	// handshake cycle (ci==nil: first attempt, or after a stale-session reset). Regenerating
+	// every 1s retransmit would race the reply: on a link whose init->resp RTT exceeds the
+	// retransmit interval, the response (checked against the CURRENT ci) would always verify
+	// against a newer ephemeral and be dropped, so the handshake could never complete.
+	ci := b.ci.Load()
+	if ci == nil {
+		var err error
+		if ci, err = crypto.GenerateEphemeral(); err != nil {
+			return
+		}
+		b.ci.Store(ci)
 	}
-	b.ci.Store(ci)
 	b.writeCtrl(crypto.InitMsg(b.psk, ci), peer)
 }
 
