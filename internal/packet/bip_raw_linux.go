@@ -230,8 +230,9 @@ func (r *Raw) Run() error {
 	return <-errc
 }
 
-// Close tears down the sockets (unblocking both loops), the client loop, and any
-// kernel anti-leak rule installed for a decoy destination.
+// Close tears down the sockets, the client loop, and any kernel anti-leak rule installed for a
+// decoy destination. The AF_INET loop is woken by closing its conn; the AF_PACKET decoy loop is
+// not, so it exits on the next SO_RCVTIMEO tick (<=1s) via its closeCh check.
 func (r *Raw) Close() error {
 	r.closeOnce.Do(func() { close(r.closeCh) })
 	if r.antiLeak != nil {
@@ -399,7 +400,20 @@ func openHdrincl(proto int) (int, error) {
 // openAfpacket opens an AF_PACKET SOCK_DGRAM socket for IPv4 frames, used to receive
 // packets addressed to the decoy destination (which the IP stack would otherwise drop).
 func openAfpacket() (int, error) {
-	return syscall.Socket(syscall.AF_PACKET, syscall.SOCK_DGRAM, int(htons(ethPIP)))
+	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_DGRAM, int(htons(ethPIP)))
+	if err != nil {
+		return -1, err
+	}
+	// A finite receive timeout makes the AF_PACKET Recvfrom loops interruptible: on Linux,
+	// closing the fd does NOT wake a thread already blocked in recvfrom(2), so without this a
+	// receive goroutine parks until the next matching frame and leaks past Close(). With
+	// SO_RCVTIMEO the loop wakes ~once/sec with EAGAIN and re-checks closeCh.
+	tv := syscall.Timeval{Sec: 1}
+	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
+		syscall.Close(fd)
+		return -1, err
+	}
+	return fd, nil
 }
 
 // addAntiLeak installs a best-effort iptables rule that drops the decoy-destined
@@ -482,8 +496,8 @@ func (r *Raw) afpacketToTun() error {
 				return nil
 			default:
 			}
-			if err == syscall.EINTR {
-				continue
+			if err == syscall.EINTR || err == syscall.EAGAIN {
+				continue // EAGAIN: the SO_RCVTIMEO tick fired (lets Close be noticed); EINTR: a signal
 			}
 			return err
 		}

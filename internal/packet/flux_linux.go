@@ -67,8 +67,8 @@ type Flux struct {
 	lastRx   atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
 	logEp    atomic.Int64 // last epoch whose rotation was logged (rotation visibility)
 
-	antiLeak  func()    // removes the kernel anti-ICMP (iptables) rule for the peer on Close
-	leakOnce  sync.Once // installs antiLeak exactly once (the server learns the peer late)
+	antiLeak  atomic.Pointer[func()] // anti-ICMP cleanup, written from the receive goroutine, read in Close -> atomic
+	leakOnce  sync.Once              // installs antiLeak exactly once (the server learns the peer late)
 	closeCh   chan struct{}
 	closeOnce sync.Once
 }
@@ -172,12 +172,13 @@ func (f *Flux) Run() error {
 	return <-errc
 }
 
-// Close tears down the sockets (unblocking the loops), the client loop, and any
-// kernel anti-ICMP rule installed for the peer.
+// Close tears down the sockets, the client loop, and any kernel anti-ICMP rule installed for
+// the peer. Closing the fd does NOT wake a thread blocked in the AF_PACKET recvfrom, so the
+// receive loop exits on its next SO_RCVTIMEO tick (<=1s) via its closeCh check, not instantly.
 func (f *Flux) Close() error {
 	f.closeOnce.Do(func() { close(f.closeCh) })
-	if f.antiLeak != nil {
-		f.antiLeak()
+	if p := f.antiLeak.Load(); p != nil && *p != nil {
+		(*p)()
 	}
 	if f.sendFd >= 0 {
 		syscall.Close(f.sendFd)
@@ -196,7 +197,7 @@ func (f *Flux) Close() error {
 // peer — e.g. a raw/bip link on proto 253 — is not collaterally dropped. Best-effort,
 // installed exactly once (the server learns the peer late).
 func (f *Flux) installAntiLeak(peer net.IP) {
-	f.leakOnce.Do(func() { f.antiLeak = addFluxDrop(peer, f.carrier) })
+	f.leakOnce.Do(func() { fn := addFluxDrop(peer, f.carrier); f.antiLeak.Store(&fn) })
 }
 
 func (f *Flux) sealer() Sealer {
@@ -391,8 +392,8 @@ func (f *Flux) netToTun() error {
 				return nil
 			default:
 			}
-			if err == syscall.EINTR {
-				continue
+			if err == syscall.EINTR || err == syscall.EAGAIN {
+				continue // EAGAIN: the SO_RCVTIMEO tick fired (lets Close be noticed); EINTR: a signal
 			}
 			return err
 		}
