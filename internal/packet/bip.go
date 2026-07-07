@@ -159,6 +159,9 @@ func (b *Bip) Run() error {
 // loop. Safe to call more than once.
 func (b *Bip) Close() error {
 	b.closeOnce.Do(func() { close(b.closeCh) })
+	if b.fecEnc != nil {
+		b.fecEnc.Close() // stop the FEC flush timer before the socket goes away
+	}
 	return b.conn.Close()
 }
 

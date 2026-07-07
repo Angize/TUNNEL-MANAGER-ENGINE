@@ -71,6 +71,7 @@ type fecEncoder struct {
 	block  uint32
 	shards [][]byte // pending data payloads, each already [len:2][sealed]
 	timer  *time.Timer
+	closed bool // set by Close(): no more flushes/emits (a late timer callback becomes a no-op)
 }
 
 func newFecEncoder(n, k int, emit func([]byte)) (*fecEncoder, error) {
@@ -81,12 +82,29 @@ func newFecEncoder(n, k int, emit func([]byte)) (*fecEncoder, error) {
 	return &fecEncoder{codec: c, n: n, k: k, emit: emit}, nil
 }
 
+// Close stops the flush timer and marks the encoder closed, so a timer callback that already
+// fired and is blocked on e.mu (or a later addData) cannot emit a shard on an
+// already-closed carrier socket. Idempotent.
+func (e *fecEncoder) Close() {
+	e.mu.Lock()
+	e.closed = true
+	if e.timer != nil {
+		e.timer.Stop()
+		e.timer = nil
+	}
+	e.mu.Unlock()
+}
+
 // addData queues one sealed data frame; flushes the block when it fills, else arms the timer.
 func (e *fecEncoder) addData(sealed []byte) {
 	sp := make([]byte, 2+len(sealed))
 	binary.BigEndian.PutUint16(sp[:2], uint16(len(sealed)))
 	copy(sp[2:], sealed)
 	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
 	e.shards = append(e.shards, sp)
 	if len(e.shards) >= e.n {
 		e.flushLocked()
@@ -101,6 +119,9 @@ func (e *fecEncoder) flushLocked() {
 	if e.timer != nil {
 		e.timer.Stop()
 		e.timer = nil
+	}
+	if e.closed {
+		return // a late timer callback after Close(): do not emit on a closed socket
 	}
 	count := len(e.shards)
 	if count == 0 {

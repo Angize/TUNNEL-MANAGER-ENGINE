@@ -177,6 +177,9 @@ func (f *Flux) Run() error {
 // receive loop exits on its next SO_RCVTIMEO tick (<=1s) via its closeCh check, not instantly.
 func (f *Flux) Close() error {
 	f.closeOnce.Do(func() { close(f.closeCh) })
+	if f.fecEnc != nil {
+		f.fecEnc.Close() // stop the FEC flush timer before the raw fd is closed (else a late Sendto hits a reused fd)
+	}
 	if p := f.antiLeak.Load(); p != nil && *p != nil {
 		(*p)()
 	}
