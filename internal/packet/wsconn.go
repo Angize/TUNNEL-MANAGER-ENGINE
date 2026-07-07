@@ -15,6 +15,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -177,8 +178,13 @@ func wsClientHandshake(conn net.Conn, host, path string, deadline time.Time) (*b
 		return nil, err
 	}
 	key := base64.StdEncoding.EncodeToString(kb[:])
+	// A browser-like User-Agent and Origin make the upgrade look like an ordinary
+	// in-page WebSocket, so a CDN's bot heuristics (e.g. Cloudflare Bot Fight Mode)
+	// don't answer a bare request with a challenge page instead of the 101 upgrade.
 	req := "GET " + path + " HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
+		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
+		"Origin: https://" + host + "\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Key: " + key + "\r\n" +
@@ -193,8 +199,13 @@ func wsClientHandshake(conn net.Conn, host, path string, deadline time.Time) (*b
 		return nil, err
 	}
 	resp.Body.Close()
-	if resp.StatusCode != http.StatusSwitchingProtocols ||
-		!strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
+	// Surface the status when the edge/CDN answers with something other than 101 (a 403/503
+	// challenge, a 522 origin-unreachable, a 200 error page) so the log names the actual cause
+	// instead of a vague "not a websocket upgrade".
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return nil, fmt.Errorf("ws: upgrade got HTTP %d (want 101 Switching Protocols)", resp.StatusCode)
+	}
+	if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
 		resp.Header.Get("Sec-WebSocket-Accept") != wsAccept(key) {
 		return nil, errNotWS
 	}
