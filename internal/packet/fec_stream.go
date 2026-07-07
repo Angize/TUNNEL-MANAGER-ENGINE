@@ -150,7 +150,8 @@ type fecBlock struct {
 	n, k, count, shardLen int
 	shards                [][]byte // len n+k; nil = missing
 	present               int
-	bytes                 int // bytes buffered for this block (for the decoder byte budget)
+	bytes                 int    // bytes buffered for this block (for the decoder byte budget)
+	arrival               uint64 // decoder-local insertion order; the eviction key
 	done                  bool
 }
 
@@ -158,7 +159,7 @@ type fecBlock struct {
 type fecDecoder struct {
 	mu      sync.Mutex
 	blocks  map[uint32]*fecBlock
-	maxSeen uint32
+	seq     uint64            // monotonic arrival counter stamped on each new block (the eviction key)
 	bytes   int               // total bytes buffered across all live blocks (budgeted by fecMaxBytes)
 	codecs  map[int]*fecCodec // keyed by n<<8|k
 	deliver func([]byte)      // called with each recovered sealed frame (in block order)
@@ -213,10 +214,12 @@ func (d *fecDecoder) input(pkt []byte) {
 	if slot < 0 || slot >= n+k {
 		return
 	}
+	if typ == fecTypeData && idx >= count {
+		return // a data shard's index must fall inside the real data shards (the encoder only emits idx<count)
+	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.evictLocked(blk)
 	b := d.blocks[blk]
 	if b == nil {
 		// Reserve this block's pad shards (plus the incoming shard) up front and refuse
@@ -234,7 +237,10 @@ func (d *fecDecoder) input(pkt []byte) {
 		}
 		b.bytes = padBytes
 		d.bytes += padBytes
+		b.arrival = d.seq
+		d.seq++
 		d.blocks[blk] = b
+		d.evictLocked() // keep only the most-recently-inserted fecKeepBlocks
 	} else if b.n != n || b.k != k || b.count != count || b.shardLen != shardLen {
 		// A shard whose geometry disagrees with the block already created for this id.
 		// Dropping it is what prevents an out-of-range slot (slot is bounded only by the
@@ -276,19 +282,24 @@ func (d *fecDecoder) input(pkt []byte) {
 	}
 }
 
-// evictLocked drops blocks far behind the newest one so the map cannot grow unbounded
-// (a permanently-incomplete block is eventually forgotten). Caller holds d.mu.
-func (d *fecDecoder) evictLocked(blk uint32) {
-	if blk > d.maxSeen {
-		d.maxSeen = blk
-	}
-	if len(d.blocks) <= fecKeepBlocks {
-		return
-	}
-	for id, b := range d.blocks {
-		if d.maxSeen-id >= fecKeepBlocks {
-			d.bytes -= b.bytes
-			delete(d.blocks, id)
+// evictLocked bounds the number of live blocks by dropping the OLDEST-INSERTED ones. Eviction
+// is keyed on a decoder-local arrival counter, NOT the wire block id, so (a) a peer cannot pin the
+// eviction horizon with a forged block number — a single packet with block=0xFFFFFFFF used to make
+// every real (small-id) block satisfy the old maxSeen-distance test and get evicted forever — and
+// (b) there is no uint32 block-id wraparound hazard. Caller holds d.mu.
+func (d *fecDecoder) evictLocked() {
+	for len(d.blocks) > fecKeepBlocks {
+		var oldID uint32
+		var oldB *fecBlock
+		for id, b := range d.blocks {
+			if oldB == nil || b.arrival < oldB.arrival {
+				oldID, oldB = id, b
+			}
 		}
+		if oldB == nil {
+			return
+		}
+		d.bytes -= oldB.bytes
+		delete(d.blocks, oldID)
 	}
 }
