@@ -178,17 +178,23 @@ func wsClientHandshake(conn net.Conn, host, path string, deadline time.Time) (*b
 		return nil, err
 	}
 	key := base64.StdEncoding.EncodeToString(kb[:])
-	// A browser-like User-Agent and Origin make the upgrade look like an ordinary
-	// in-page WebSocket, so a CDN's bot heuristics (e.g. Cloudflare Bot Fight Mode)
-	// don't answer a bare request with a challenge page instead of the 101 upgrade.
+	// Present the full header set (order and values) that Chrome sends for an in-page
+	// WebSocket, so a CDN's bot/integrity checks (Cloudflare Browser Integrity Check,
+	// Bot Fight Mode, managed WAF rules that block requests missing Accept-* headers)
+	// pass it through to the 101 upgrade instead of answering with a 403/challenge.
 	req := "GET " + path + " HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
-		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
-		"Origin: https://" + host + "\r\n" +
-		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
+		"Pragma: no-cache\r\n" +
+		"Cache-Control: no-cache\r\n" +
+		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Origin: https://" + host + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Accept-Encoding: gzip, deflate, br\r\n" +
+		"Accept-Language: en-US,en;q=0.9\r\n" +
 		"Sec-WebSocket-Key: " + key + "\r\n" +
-		"Sec-WebSocket-Version: 13\r\n\r\n"
+		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n"
 	conn.SetDeadline(deadline)
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return nil, err
