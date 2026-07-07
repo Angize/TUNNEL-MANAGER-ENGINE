@@ -21,6 +21,7 @@
 package packet
 
 import (
+	"bytes"
 	"errors"
 	"log"
 	"net"
@@ -66,13 +67,15 @@ type Bip struct {
 	cipher    string
 	isClient  bool
 
-	peer    atomic.Pointer[net.UDPAddr]      // current known peer (server learns it)
-	session atomic.Pointer[sealerBox]        // negotiated session sealer (nil until handshake / clear mode)
-	rp      replayGuard                      // driven only by netToTun (single receiver goroutine)
-	pend    *sealerBox                       // server: session staged by a recent init, promoted only once a frame opens under it
-	pendRp  replayGuard                      // replay guard for the pending session (adopted on promotion)
-	ci      atomic.Pointer[crypto.Ephemeral] // client's current handshake ephemeral
-	lastRx  atomic.Int64                     // unix-nano of the last authenticated frame (client staleness)
+	peer     atomic.Pointer[net.UDPAddr]      // current known peer (server learns it)
+	session  atomic.Pointer[sealerBox]        // negotiated session sealer (nil until handshake / clear mode)
+	rp       replayGuard                      // driven only by netToTun (single receiver goroutine)
+	pend     *sealerBox                       // server: session staged by a recent init, promoted only once a frame opens under it
+	pendRp   replayGuard                      // replay guard for the pending session (adopted on promotion)
+	lastInit []byte                           // server: bytes of the init that staged pend (compute-DoS replay cache)
+	lastResp []byte                           // server: the response we sent for lastInit, re-sent verbatim on a replay
+	ci       atomic.Pointer[crypto.Ephemeral] // client's current handshake ephemeral
+	lastRx   atomic.Int64                     // unix-nano of the last authenticated frame (client staleness)
 
 	fecEnc *fecEncoder                 // non-nil when FEC is on: buffers data frames into RS blocks on send
 	fecDec *fecDecoder                 // non-nil when FEC is on: reassembles + reconstructs blocks on receive
@@ -333,6 +336,18 @@ func (b *Bip) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 		return
 	}
 	// server: authenticate an init, reply, and install the fresh session.
+	// Compute-DoS mitigation: an attacker replaying one captured valid init at high rate
+	// would otherwise force a fresh ECDH+HKDF (GenerateEphemeral+SessionSealer) per packet.
+	// If this init is byte-identical to the one that staged the still-current pending
+	// session, just re-send the response we already computed and return before that
+	// expensive crypto. The handshake outcome is unchanged (pend/promote-on-open is
+	// untouched); a genuinely different init falls through to the full handshake below.
+	// lastInit/lastResp are touched only on this single receive goroutine (like pend/rp),
+	// so no locking is needed.
+	if b.pend != nil && b.lastInit != nil && bytes.Equal(pkt, b.lastInit) {
+		b.writeCtrl(b.lastResp, addr)
+		return
+	}
 	eInit, err := crypto.ParseInit(b.psk, pkt)
 	if err != nil {
 		return
@@ -352,6 +367,10 @@ func (b *Bip) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 	b.pend = &sealerBox{s: s}
 	b.pendRp = replayGuard{}
 	if msg2 := crypto.RespMsg(b.psk, eInit, sr); msg2 != nil {
+		// Cache this init and its response so a replay of the same init (while pend is
+		// still current) is served from lastResp without recomputing the crypto above.
+		b.lastInit = append([]byte(nil), pkt...) // pkt aliases the receive buffer — copy it
+		b.lastResp = msg2                        // RespMsg returns a fresh slice, safe to keep
 		b.writeCtrl(msg2, addr)
 	}
 }

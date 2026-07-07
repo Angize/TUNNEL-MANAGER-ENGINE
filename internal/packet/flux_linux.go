@@ -17,6 +17,7 @@
 package packet
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"log"
@@ -49,8 +50,8 @@ type Flux struct {
 	shapeProf   string // statistical shape profile: "quic" | "video" | "webrtc" | "random"
 	epochOffset int64  // manual epoch bump ("rotate now"): epoch = clock-epoch + offset (both ends set identically)
 
-	fecEnc *fecEncoder // non-nil when FEC is on: buffers data frames into RS blocks on send
-	fecDec *fecDecoder // non-nil when FEC is on: reassembles + reconstructs blocks on receive
+	fecEnc *fecEncoder                // non-nil when FEC is on: buffers data frames into RS blocks on send
+	fecDec *fecDecoder                // non-nil when FEC is on: reassembles + reconstructs blocks on receive
 	rxSrc  atomic.Pointer[net.IPAddr] // src of the packet currently feeding fecDec (deliver reads it)
 
 	sendFd int // AF_INET SOCK_RAW + IP_HDRINCL: builds each packet's IPv4 header (any protocol)
@@ -63,6 +64,8 @@ type Flux struct {
 	rp       replayGuard
 	pend     *sealerBox // server: session staged by a recent init, promoted only once a frame opens under it
 	pendRp   replayGuard
+	lastInit []byte // server: bytes of the init that staged pend (compute-DoS replay cache)
+	lastResp []byte // server: the response we sent for lastInit, re-sent verbatim on a replay
 	ci       atomic.Pointer[crypto.Ephemeral]
 	lastRx   atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
 	logEp    atomic.Int64 // last epoch whose rotation was logged (rotation visibility)
@@ -576,6 +579,17 @@ func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
 		f.lastRx.Store(time.Now().UnixNano())
 		return
 	}
+	// Compute-DoS mitigation: an attacker replaying one captured valid init at high rate
+	// would otherwise force a fresh ECDH+HKDF (GenerateEphemeral+SessionSealer) per packet.
+	// If this init is byte-identical to the one that staged the still-current pending
+	// session, re-send the already-computed response and return before that expensive
+	// crypto. The handshake outcome is unchanged (pend/promote-on-open is untouched); a
+	// genuinely different init falls through to the full handshake below. lastInit/lastResp
+	// are touched only on this single receive goroutine (like pend/rp), so no locking is needed.
+	if f.pend != nil && f.lastInit != nil && bytes.Equal(body, f.lastInit) {
+		f.sendCtrl(f.lastResp, addr)
+		return
+	}
 	eInit, err := crypto.ParseInit(f.psk, body)
 	if err != nil {
 		return
@@ -599,6 +613,10 @@ func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
 		}
 	}
 	if msg2 := crypto.RespMsg(f.psk, eInit, sr); msg2 != nil {
+		// Cache this init and its response so a replay of the same init (while pend is
+		// still current) is served from lastResp without recomputing the crypto above.
+		f.lastInit = append([]byte(nil), body...) // body aliases the receive buffer — copy it
+		f.lastResp = msg2                         // RespMsg returns a fresh slice, safe to keep
 		f.sendCtrl(msg2, addr)
 	}
 }

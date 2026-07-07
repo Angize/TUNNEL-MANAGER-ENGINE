@@ -306,8 +306,21 @@ func (c *Config) validate() error {
 		if c.FecData < 0 || c.FecParity < 0 {
 			return errors.New("fec_data / fec_parity must be >= 0 (0 defaults to 10 / 3)")
 		}
-		if c.FecData+c.FecParity > 255 {
-			return errors.New("fec_data + fec_parity must be <= 255")
+		// Validate the EFFECTIVE geometry — the same defaulting applyDefaults() will do
+		// AFTER validate() runs. Checking the raw values would let e.g. fec_data=254 with
+		// fec_parity omitted pass (254<=255) and then become 254+3=257, which the codec
+		// rejects (newFECCodec needs n+k<=256) so newFecPair silently disables FEC even
+		// though the user asked for it. An out-of-range request must be a clean config
+		// error here, not a silent FEC-off at runtime.
+		ed, ep := c.FecData, c.FecParity
+		if ed == 0 {
+			ed = 10
+		}
+		if ep == 0 {
+			ep = 3
+		}
+		if ed < 1 || ep < 1 || ed+ep > 255 {
+			return errors.New("effective fec_data (default 10) + fec_parity (default 3) must satisfy fec_data>=1, fec_parity>=1, fec_data+fec_parity<=255")
 		}
 	}
 	if c.Cover && c.Transport != "tcp" {

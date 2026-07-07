@@ -56,9 +56,9 @@ const (
 	fecTypeData   = 1
 	fecTypeParity = 2
 	fecHdrLen     = 1 + 4 + 1 + 1 + 1 + 1 + 2 // type + block,idx,n,k,count,shardLen
-	fecFlushDelay = 15 * time.Millisecond      // flush a partial block after this idle gap
-	fecKeepBlocks = 64                          // receiver: how many recent blocks to retain
-	fecMaxBytes   = 64 << 20                    // receiver: cap total bytes buffered across live blocks (anti-amplification)
+	fecFlushDelay = 15 * time.Millisecond     // flush a partial block after this idle gap
+	fecKeepBlocks = 64                        // receiver: how many recent blocks to retain
+	fecMaxBytes   = 64 << 20                  // receiver: cap total bytes buffered across live blocks (anti-amplification)
 )
 
 // fecEncoder buffers sealed data frames and emits FEC block packets via emit().
@@ -210,6 +210,9 @@ func (d *fecDecoder) input(pkt []byte) {
 	}
 	switch pkt[0] {
 	case fecTypePass:
+		if len(pkt) < 2 {
+			return // drop a bare 1-byte passthrough; hygiene only (the downstream AEAD is the real auth gate)
+		}
 		d.deliver(pkt[1:])
 		return
 	case fecTypeData, fecTypeParity:
