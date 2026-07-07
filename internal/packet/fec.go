@@ -115,6 +115,12 @@ func (c *fecCodec) Reconstruct(shards [][]byte) ([][]byte, error) {
 	sz := 0
 	for i := 0; i < c.n+c.k; i++ {
 		if shards[i] != nil {
+			// All present shards must share one length; bail rather than read past a
+			// shorter shard in the XOR loops below (defence in depth against a decoder
+			// that ever admits mixed-length shards for one block).
+			if sz != 0 && len(shards[i]) != sz {
+				return nil, errors.New("fec: mixed shard lengths")
+			}
 			sz = len(shards[i])
 		}
 		if i < c.n && shards[i] == nil {

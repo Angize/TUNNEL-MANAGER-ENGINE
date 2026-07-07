@@ -58,6 +58,7 @@ const (
 	fecHdrLen     = 1 + 4 + 1 + 1 + 1 + 1 + 2 // type + block,idx,n,k,count,shardLen
 	fecFlushDelay = 15 * time.Millisecond      // flush a partial block after this idle gap
 	fecKeepBlocks = 64                          // receiver: how many recent blocks to retain
+	fecMaxBytes   = 64 << 20                    // receiver: cap total bytes buffered across live blocks (anti-amplification)
 )
 
 // fecEncoder buffers sealed data frames and emits FEC block packets via emit().
@@ -149,6 +150,7 @@ type fecBlock struct {
 	n, k, count, shardLen int
 	shards                [][]byte // len n+k; nil = missing
 	present               int
+	bytes                 int // bytes buffered for this block (for the decoder byte budget)
 	done                  bool
 }
 
@@ -157,6 +159,7 @@ type fecDecoder struct {
 	mu      sync.Mutex
 	blocks  map[uint32]*fecBlock
 	maxSeen uint32
+	bytes   int               // total bytes buffered across all live blocks (budgeted by fecMaxBytes)
 	codecs  map[int]*fecCodec // keyed by n<<8|k
 	deliver func([]byte)      // called with each recovered sealed frame (in block order)
 }
@@ -216,19 +219,39 @@ func (d *fecDecoder) input(pkt []byte) {
 	d.evictLocked(blk)
 	b := d.blocks[blk]
 	if b == nil {
+		// Reserve this block's pad shards (plus the incoming shard) up front and refuse
+		// if the decoder's total buffered bytes would exceed the budget: an unauthenticated
+		// peer must not be able to pin ~n*shardLen*fecKeepBlocks of RAM (amplification DoS).
+		padBytes := (n - count) * shardLen
+		if d.bytes+padBytes+shardLen > fecMaxBytes {
+			return
+		}
 		b = &fecBlock{n: n, k: k, count: count, shardLen: shardLen, shards: make([][]byte, n+k)}
 		// pad shards [count, n) are known-zero and count as present for the RS math.
 		for i := count; i < n; i++ {
 			b.shards[i] = make([]byte, shardLen)
 			b.present++
 		}
+		b.bytes = padBytes
+		d.bytes += padBytes
 		d.blocks[blk] = b
+	} else if b.n != n || b.k != k || b.count != count || b.shardLen != shardLen {
+		// A shard whose geometry disagrees with the block already created for this id.
+		// Dropping it is what prevents an out-of-range slot (slot is bounded only by the
+		// incoming header's n+k, not by len(b.shards)) and mixed shard lengths — either of
+		// which is a remote, pre-crypto out-of-range panic that crashes the root process.
+		return
 	}
 	if b.done || b.shards[slot] != nil {
 		return
 	}
+	if d.bytes+shardLen > fecMaxBytes {
+		return
+	}
 	b.shards[slot] = append([]byte(nil), shard...)
 	b.present++
+	b.bytes += shardLen
+	d.bytes += shardLen
 	if b.present < n {
 		return
 	}
@@ -262,8 +285,9 @@ func (d *fecDecoder) evictLocked(blk uint32) {
 	if len(d.blocks) <= fecKeepBlocks {
 		return
 	}
-	for id := range d.blocks {
+	for id, b := range d.blocks {
 		if d.maxSeen-id >= fecKeepBlocks {
+			d.bytes -= b.bytes
 			delete(d.blocks, id)
 		}
 	}

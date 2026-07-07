@@ -69,6 +69,8 @@ type Bip struct {
 	peer    atomic.Pointer[net.UDPAddr]      // current known peer (server learns it)
 	session atomic.Pointer[sealerBox]        // negotiated session sealer (nil until handshake / clear mode)
 	rp      replayGuard                      // driven only by netToTun (single receiver goroutine)
+	pend    *sealerBox                       // server: session staged by a recent init, promoted only once a frame opens under it
+	pendRp  replayGuard                      // replay guard for the pending session (adopted on promotion)
 	ci      atomic.Pointer[crypto.Ephemeral] // client's current handshake ephemeral
 	lastRx  atomic.Int64                     // unix-nano of the last authenticated frame (client staleness)
 
@@ -260,32 +262,48 @@ func (b *Bip) deliver(pkt []byte, addr *net.UDPAddr) {
 	b.dispatch(pkt[1], iff(pkt[1] == typeData, pkt[2:], nil), addr)
 }
 
-// handleCrypto is the crypto-on receive path: try the frame as data under the
-// current session; failing that, try it as a handshake message.
+// openWith tries to open one datagram under a specific session sealer, returning the
+// authenticated frame. It touches no session/replay state, so a frame can safely be tried
+// against both the live and a pending session.
+func (b *Bip) openWith(s Sealer, pkt []byte) (typ byte, session, seq uint64, payload []byte, oerr error) {
+	if b.obfs {
+		return obfsOpen(s, pkt)
+	}
+	if len(pkt) >= 2 && pkt[0] == magic {
+		typ = pkt[1]
+		session, seq, payload, oerr = s.Open(pkt[2:], []byte{typ})
+		return
+	}
+	return 0, 0, 0, nil, errBadFrame
+}
+
+// handleCrypto is the crypto-on receive path: try the frame as data under the current
+// session; failing that, under a pending session staged by a recent init (promoting it if
+// it opens); failing that, as a handshake message.
 func (b *Bip) handleCrypto(pkt []byte, addr *net.UDPAddr) {
 	if s := b.sealer(); s != nil {
-		var (
-			typ          byte
-			session, seq uint64
-			payload      []byte
-			oerr         error
-		)
-		if b.obfs {
-			typ, session, seq, payload, oerr = obfsOpen(s, pkt)
-		} else if len(pkt) >= 2 && pkt[0] == magic {
-			typ = pkt[1]
-			session, seq, payload, oerr = s.Open(pkt[2:], []byte{typ})
-		} else {
-			oerr = errBadFrame
-		}
-		if oerr == nil && b.rp.ok(session, seq) {
+		if typ, session, seq, payload, oerr := b.openWith(s, pkt); oerr == nil && b.rp.ok(session, seq) {
 			// authenticated, fresh frame -> now safe to (re)learn the peer address
 			b.lastRx.Store(time.Now().UnixNano()) // liveness: the session is answering
 			b.peer.Store(addr)
 			b.dispatch(typ, payload, addr)
 			return
 		}
-		// fall through: maybe this is a re-handshake from a restarted peer
+	}
+	// A frame that did not open under the live session may open under a PENDING session
+	// staged by a recent init. Only a frame that actually opens under it promotes it (and
+	// rebinds the peer), so a replayed init — which stages a session an attacker cannot
+	// produce a frame for — never tears down the live session or resets its replay window.
+	if b.pend != nil {
+		if typ, session, seq, payload, oerr := b.openWith(b.pend.s, pkt); oerr == nil && b.pendRp.ok(session, seq) {
+			b.session.Store(b.pend)
+			b.rp = b.pendRp
+			b.pend = nil
+			b.lastRx.Store(time.Now().UnixNano())
+			b.peer.Store(addr)
+			b.dispatch(typ, payload, addr)
+			return
+		}
 	}
 	b.tryHandshake(pkt, addr)
 }
@@ -324,11 +342,12 @@ func (b *Bip) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 	if err != nil {
 		return
 	}
-	b.rp = replayGuard{}
-	b.session.Store(&sealerBox{s: s})
-	// Reply to the init source, but do NOT rebind the tunnel here — rebinding
-	// waits for a data/ping frame that opens under the new session, so a replayed
-	// init cannot redirect traffic.
+	// Stage the new session as PENDING rather than swapping it in now. The live session and
+	// its replay window stay intact until a frame actually opens under these new keys (see
+	// handleCrypto), so a replayed init cannot wedge the tunnel by resetting them. Rebinding
+	// the peer is likewise deferred to that first opening frame.
+	b.pend = &sealerBox{s: s}
+	b.pendRp = replayGuard{}
 	if msg2 := crypto.RespMsg(b.psk, eInit, sr); msg2 != nil {
 		b.writeCtrl(msg2, addr)
 	}

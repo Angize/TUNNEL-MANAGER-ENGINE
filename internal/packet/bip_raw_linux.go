@@ -67,6 +67,8 @@ type Raw struct {
 	peer    atomic.Pointer[net.IPAddr] // current known peer (server learns it)
 	session atomic.Pointer[sealerBox]
 	rp      replayGuard
+	pend    *sealerBox // server: session staged by a recent init, promoted only once a frame opens under it
+	pendRp  replayGuard
 	ci      atomic.Pointer[crypto.Ephemeral]
 	seq     atomic.Uint32
 	lastRx  atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
@@ -542,24 +544,38 @@ func (r *Raw) deliver(body []byte, addr *net.IPAddr) {
 	r.dispatch(body[1], iff(body[1] == typeData, body[2:], nil), addr)
 }
 
+// openWith tries to open one datagram under a specific session sealer, touching no
+// session/replay state so a frame can be tried against both the live and a pending session.
+func (r *Raw) openWith(s Sealer, body []byte) (typ byte, session, seq uint64, payload []byte, oerr error) {
+	if r.obfs {
+		return obfsOpen(s, body)
+	}
+	if len(body) >= 2 && body[0] == magic {
+		typ = body[1]
+		session, seq, payload, oerr = s.Open(body[2:], []byte{typ})
+		return
+	}
+	return 0, 0, 0, nil, errBadFrame
+}
+
 func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
 	if s := r.sealer(); s != nil {
-		var (
-			typ          byte
-			session, seq uint64
-			payload      []byte
-			oerr         error
-		)
-		if r.obfs {
-			typ, session, seq, payload, oerr = obfsOpen(s, body)
-		} else if len(body) >= 2 && body[0] == magic {
-			typ = body[1]
-			session, seq, payload, oerr = s.Open(body[2:], []byte{typ})
-		} else {
-			oerr = errBadFrame
-		}
-		if oerr == nil && r.rp.ok(session, seq) {
+		if typ, session, seq, payload, oerr := r.openWith(s, body); oerr == nil && r.rp.ok(session, seq) {
 			r.lastRx.Store(time.Now().UnixNano()) // liveness: the session is answering
+			r.learnPeer(addr)
+			r.dispatch(typ, payload, addr)
+			return
+		}
+	}
+	// A frame that did not open under the live session may open under a PENDING session
+	// staged by a recent init; promote it only when a frame actually opens under it, so a
+	// replayed init cannot tear down the live session or its replay window.
+	if r.pend != nil {
+		if typ, session, seq, payload, oerr := r.openWith(r.pend.s, body); oerr == nil && r.pendRp.ok(session, seq) {
+			r.session.Store(r.pend)
+			r.rp = r.pendRp
+			r.pend = nil
+			r.lastRx.Store(time.Now().UnixNano())
 			r.learnPeer(addr)
 			r.dispatch(typ, payload, addr)
 			return
@@ -612,11 +628,11 @@ func (r *Raw) tryHandshake(body []byte, addr *net.IPAddr) {
 	if err != nil {
 		return
 	}
-	r.rp = replayGuard{}
-	r.session.Store(&sealerBox{s: s})
-	// Reply to the init source but do NOT rebind here — rebinding waits for a
-	// frame that opens under the new session (learnPeer), so a replayed init
-	// cannot redirect traffic.
+	// Stage the new session as PENDING; the live session and its replay window survive until
+	// a frame actually opens under these new keys (see handleCrypto), so a replayed init
+	// cannot wedge the tunnel. Peer rebinding is likewise deferred to that first frame.
+	r.pend = &sealerBox{s: s}
+	r.pendRp = replayGuard{}
 	if r.localIP.Load() == nil {
 		if lip := routeLocalIP(addr.IP); lip != nil {
 			r.localIP.Store(&net.IPAddr{IP: lip})
