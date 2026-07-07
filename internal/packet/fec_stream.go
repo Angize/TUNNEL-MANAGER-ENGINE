@@ -59,6 +59,16 @@ const (
 	fecFlushDelay = 15 * time.Millisecond     // flush a partial block after this idle gap
 	fecKeepBlocks = 64                        // receiver: how many recent blocks to retain
 	fecMaxBytes   = 64 << 20                  // receiver: cap total bytes buffered across live blocks (anti-amplification)
+
+	// fecMaxShardLen caps the shard length a peer may declare in a block header. A real
+	// shard is one sealed frame ([len:2]+ciphertext) zero-padded to the block's largest
+	// shard, so it is MTU-bounded — well under this even for jumbo frames. Rejecting a
+	// larger shardLen blocks a forged block with maximal geometry (n=255, count=1,
+	// shardLen~65495) from reserving (n-count)*shardLen ~= 16 MB of pad out of a single
+	// ~64 KB packet; a few such never-completed blocks could otherwise pin the whole
+	// fecMaxBytes budget until process exit (amplification DoS). 16 KiB never rejects a
+	// legitimate shard.
+	fecMaxShardLen = 16 << 10
 )
 
 // fecEncoder buffers sealed data frames and emits FEC block packets via emit().
@@ -228,7 +238,7 @@ func (d *fecDecoder) input(pkt []byte) {
 	n, k, count := int(pkt[6]), int(pkt[7]), int(pkt[8])
 	shardLen := int(binary.BigEndian.Uint16(pkt[9:11]))
 	shard := pkt[fecHdrLen:]
-	if n < 1 || k < 1 || n+k > 256 || count < 1 || count > n || shardLen < 2 || len(shard) != shardLen {
+	if n < 1 || k < 1 || n+k > 256 || count < 1 || count > n || shardLen < 2 || shardLen > fecMaxShardLen || len(shard) != shardLen {
 		return
 	}
 	slot := idx

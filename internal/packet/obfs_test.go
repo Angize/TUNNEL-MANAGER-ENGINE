@@ -160,23 +160,3 @@ func TestRandUintBoundsAndUniformity(t *testing.T) {
 		}
 	}
 }
-
-// TestAtomicReplayGuardConcurrent exercises the mutex-backed guard from many
-// goroutines: it must never accept a duplicate (session,seq) even under races.
-func TestAtomicReplayGuardConcurrent(t *testing.T) {
-	var g atomicReplayGuard
-	const workers = 16
-	accepted := make(chan bool, workers)
-	for w := 0; w < workers; w++ {
-		go func() { accepted <- g.ok(7, 1) }() // same (session,seq) from all
-	}
-	oks := 0
-	for i := 0; i < workers; i++ {
-		if <-accepted {
-			oks++
-		}
-	}
-	if oks != 1 {
-		t.Fatalf("exactly one goroutine should accept (session,seq)=(7,1); got %d", oks)
-	}
-}

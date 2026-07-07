@@ -11,8 +11,6 @@
 // legitimately restarted peer (new random prefix, counter back to 1) reconnect.
 package packet
 
-import "sync"
-
 const replayWindow = 64
 
 // replayGuard tracks the highest sequence accepted for the current peer session
@@ -58,22 +56,4 @@ func (g *replayGuard) ok(session, seq uint64) bool {
 	}
 	g.bits |= mask
 	return true
-}
-
-// atomicReplayGuard is the concurrency-safe variant used where more than one
-// goroutine may validate frames for the same inbound direction (the TCP server
-// authenticates a connection's first frame on the accept goroutine, then the
-// serve loop continues on the same goroutine — but a stray second connection
-// could race). Contention is rare and the critical section is a few field
-// updates, so a plain mutex is both correct and cheaper than a busy-spin (which
-// could burn a core while the holder is descheduled under a connection flood).
-type atomicReplayGuard struct {
-	mu sync.Mutex
-	g  replayGuard
-}
-
-func (a *atomicReplayGuard) ok(session, seq uint64) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.g.ok(session, seq)
 }

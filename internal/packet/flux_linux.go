@@ -17,7 +17,6 @@
 package packet
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"log"
@@ -64,8 +63,7 @@ type Flux struct {
 	rp       replayGuard
 	pend     *sealerBox // server: session staged by a recent init, promoted only once a frame opens under it
 	pendRp   replayGuard
-	lastInit []byte // server: bytes of the init that staged pend (compute-DoS replay cache)
-	lastResp []byte // server: the response we sent for lastInit, re-sent verbatim on a replay
+	hsCache  initCache // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
 	ci       atomic.Pointer[crypto.Ephemeral]
 	lastRx   atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
 	logEp    atomic.Int64 // last epoch whose rotation was logged (rotation visibility)
@@ -306,27 +304,48 @@ func (f *Flux) carrierOut(body []byte, to *net.IPAddr) {
 // stunMagic is the STUN magic cookie (RFC 5389) at bytes 4..8 of every STUN message.
 const stunMagic = 0x2112A442
 
-// buildSTUN wraps payload in a STUN Binding-request header so the carrier parses as
-// WebRTC: type 0x0001 (Binding Request, high two bits zero as STUN requires), the
-// message length set to the payload length, the magic cookie, and a random 96-bit
-// transaction id (indistinguishable from a real one — it is meant to look random).
+// stunAttrType is the STUN attribute we stash the tunnel payload in. 0x8022 is
+// SOFTWARE (RFC 5389): a comprehension-OPTIONAL attribute (top bit set) that a STUN
+// parser is required to skip when it can't use it — so a DPI that walks the attribute
+// stream sees a well-formed, ignorable attribute rather than opaque trailing bytes.
+const stunAttrType = 0x8022
+
+// buildSTUN wraps payload in a STUN Binding request so the carrier parses as WebRTC.
+// The payload is carried as ONE STUN attribute — [type:2][len:2][value][pad to a
+// 4-byte boundary] — and the STUN message-length counts the padded attribute, so it
+// is a multiple of 4 exactly as a real STUN attribute stream is. Without this a
+// parser that walks attributes (they must be 4-byte aligned) could tell our opaque
+// ciphertext apart from genuine STUN. Fields: type 0x0001 (Binding Request, high two
+// bits zero as STUN requires), the magic cookie, and a random 96-bit transaction id
+// (indistinguishable from a real one — it is meant to look random).
 func buildSTUN(payload []byte) []byte {
-	h := make([]byte, 20+len(payload))
-	binary.BigEndian.PutUint16(h[0:2], 0x0001)
-	binary.BigEndian.PutUint16(h[2:4], uint16(len(payload)))
+	valLen := len(payload)
+	padded := (valLen + 3) &^ 3 // round the attribute value up to a 4-byte boundary
+	msgLen := 4 + padded        // 4-byte attribute header + padded value
+	h := make([]byte, 20+msgLen)
+	binary.BigEndian.PutUint16(h[0:2], 0x0001) // Binding Request
+	binary.BigEndian.PutUint16(h[2:4], uint16(msgLen))
 	binary.BigEndian.PutUint32(h[4:8], stunMagic)
 	_, _ = rand.Read(h[8:20]) // transaction id
-	copy(h[20:], payload)
+	binary.BigEndian.PutUint16(h[20:22], stunAttrType)
+	binary.BigEndian.PutUint16(h[22:24], uint16(valLen)) // attribute length excludes the pad
+	copy(h[24:], payload)
+	// h[24+valLen : 24+padded] stays zero — the attribute's alignment padding.
 	return h
 }
 
-// parseSTUN strips a STUN header, returning the inner frame. It requires the magic
-// cookie so a stray non-STUN datagram on the port is rejected before the AEAD.
+// parseSTUN strips the 20-byte STUN header AND the 4-byte attribute header, returning
+// exactly the attribute value (ignoring the 4-byte-boundary pad). It requires the
+// magic cookie so a stray non-STUN datagram on the port is rejected before the AEAD.
 func parseSTUN(pkt []byte) ([]byte, bool) {
-	if len(pkt) < 20 || binary.BigEndian.Uint32(pkt[4:8]) != stunMagic {
+	if len(pkt) < 24 || binary.BigEndian.Uint32(pkt[4:8]) != stunMagic {
 		return nil, false
 	}
-	return pkt[20:], true
+	valLen := int(binary.BigEndian.Uint16(pkt[22:24])) // attribute length = real payload size (no pad)
+	if 24+valLen > len(pkt) {
+		return nil, false
+	}
+	return pkt[24 : 24+valLen], true
 }
 
 // buildUDPSeg wraps payload in a UDP header with the given ports and a correct
@@ -582,16 +601,19 @@ func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
 		f.lastRx.Store(time.Now().UnixNano())
 		return
 	}
-	// Compute-DoS mitigation: an attacker replaying one captured valid init at high rate
+	// Compute-DoS mitigation: an attacker replaying captured valid inits at high rate
 	// would otherwise force a fresh ECDH+HKDF (GenerateEphemeral+SessionSealer) per packet.
-	// If this init is byte-identical to the one that staged the still-current pending
-	// session, re-send the already-computed response and return before that expensive
-	// crypto. The handshake outcome is unchanged (pend/promote-on-open is untouched); a
-	// genuinely different init falls through to the full handshake below. lastInit/lastResp
-	// are touched only on this single receive goroutine (like pend/rp), so no locking is needed.
-	if f.pend != nil && f.lastInit != nil && bytes.Equal(body, f.lastInit) {
-		f.sendCtrl(f.lastResp, addr)
-		return
+	// If this init matches one we recently answered (while a pending session is current),
+	// re-send the already-computed response and return before that expensive crypto. The
+	// handshake outcome is unchanged (pend/promote-on-open is untouched); a genuinely new
+	// init falls through to the full handshake below. The cache is a small LRU (not a
+	// single entry) so alternating two captured inits cannot bust it. It is touched only on
+	// this single receive goroutine (like pend/rp), so no locking is needed.
+	if f.pend != nil {
+		if resp, ok := f.hsCache.get(body); ok {
+			f.sendCtrl(resp, addr)
+			return
+		}
 	}
 	eInit, err := crypto.ParseInit(f.psk, body)
 	if err != nil {
@@ -617,9 +639,9 @@ func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
 	}
 	if msg2 := crypto.RespMsg(f.psk, eInit, sr); msg2 != nil {
 		// Cache this init and its response so a replay of the same init (while pend is
-		// still current) is served from lastResp without recomputing the crypto above.
-		f.lastInit = append([]byte(nil), body...) // body aliases the receive buffer — copy it
-		f.lastResp = msg2                         // RespMsg returns a fresh slice, safe to keep
+		// still current) is served without recomputing the crypto above. put copies body
+		// (it aliases the receive buffer); msg2 is a fresh slice, safe to keep.
+		f.hsCache.put(body, msg2)
 		f.sendCtrl(msg2, addr)
 	}
 }

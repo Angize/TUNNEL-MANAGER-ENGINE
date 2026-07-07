@@ -128,8 +128,14 @@ func rawDecap(profile string, pkt []byte) ([]byte, bool) {
 	if len(pkt) >= 20 && pkt[0]>>4 == 4 {
 		ihl := int(pkt[0]&0x0f) * 4
 		total := int(binary.BigEndian.Uint16(pkt[2:4]))
-		if ihl >= 20 && ihl <= len(pkt) && total == len(pkt) && int(pkt[9]) == proto {
-			pkt = pkt[ihl:] // a real IPv4 header was included; strip it
+		// A genuine included IPv4 header: version 4, a sane IHL, this carrier's own
+		// protocol at byte 9, and a total-length that fits within the bytes read.
+		// Keying off total <= len(pkt) (rather than an exact match) tolerates a
+		// platform that pads the raw read with trailing bytes; we then slice out
+		// exactly the [ihl:total] payload so any trailing pad is dropped instead of
+		// being mistaken for frame bytes.
+		if ihl >= 20 && total >= ihl && total <= len(pkt) && int(pkt[9]) == proto {
+			pkt = pkt[ihl:total] // a real IPv4 header was included; strip it (and any trailing pad)
 		}
 	}
 	switch proto {

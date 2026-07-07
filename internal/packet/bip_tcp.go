@@ -87,6 +87,15 @@ type connFramer struct {
 	writeKS  *chacha20.Cipher
 	readKS   *chacha20.Cipher
 	saltSent bool
+
+	// rp is this connection's inbound anti-replay window. It is PER-CONNECTION (not
+	// shared across connections) so two briefly-overlapping connections during a
+	// client reconnect cannot flip-flop a shared window's session id and let a
+	// captured frame from either session slip through. A single connection only ever
+	// carries one peer session and is read by exactly one goroutine (the handler that
+	// authenticates its first frame and then runs serve), so the lock-free
+	// replayGuard is safe here.
+	rp replayGuard
 }
 
 // sendSalt emits our per-connection salt once and arms the write keystream.
@@ -264,8 +273,7 @@ type BipTCP struct {
 	cur     atomic.Pointer[connFramer] // currently live connection (nil when none)
 	closed  atomic.Bool
 	closeCh chan struct{}
-	rp      atomicReplayGuard // inbound anti-replay, shared across (re)connections
-	preAuth chan struct{}     // permits: caps concurrent unauthenticated handlers
+	preAuth chan struct{} // permits: caps concurrent unauthenticated handlers
 }
 
 func idleFor(keepalive time.Duration) time.Duration {
@@ -511,7 +519,7 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 		return
 	}
 	typ, session, seq, payload, err := cf.readFrame()
-	if err != nil || !b.rp.ok(session, seq) {
+	if err != nil || !cf.rp.ok(session, seq) {
 		conn.Close() // probe / wrong PSK / replay: no reply, no log noise
 		return
 	}
@@ -644,7 +652,7 @@ func (b *BipTCP) serve(cf *connFramer) {
 			b.onConnErr(cf, err)
 			return
 		}
-		if cf.sealer != nil && !b.rp.ok(session, seq) {
+		if cf.sealer != nil && !cf.rp.ok(session, seq) {
 			continue // authenticated but replayed -> ignore, keep the connection
 		}
 		b.handleFrame(cf, typ, payload)
