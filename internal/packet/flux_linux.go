@@ -288,6 +288,9 @@ func (f *Flux) carrierOut(body []byte, to *net.IPAddr) {
 	default: // "udp"
 		out = buildIP4(src, to.IP, protoUDP, buildUDPSeg(src, to.IP, sh.sport, sh.dport, body))
 	}
+	if out == nil {
+		return // buildIP4 refused an oversize packet (16-bit IPv4 length); not reachable under normal MTUs
+	}
 	var sa syscall.SockaddrInet4
 	copy(sa.Addr[:], to.IP.To4())
 	// Guard the bare-fd Sendto: an RLock lets Close() (write lock) wait for in-flight sends

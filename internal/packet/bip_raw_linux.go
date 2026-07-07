@@ -329,6 +329,9 @@ func (r *Raw) writeOut(pkt []byte, to *net.IPAddr) {
 			dst = r.spoofDst
 		}
 		out := buildIP4(src, dst, r.proto, pkt)
+		if out == nil {
+			return // oversize for the IPv4 length field (not reachable under normal MTUs)
+		}
 		var sa syscall.SockaddrInet4
 		copy(sa.Addr[:], to.IP.To4())
 		// Guard the bare-fd Sendto so Close() can wait for in-flight sends and flip sendDown
@@ -355,6 +358,9 @@ func (r *Raw) replyAddr(addr *net.IPAddr) *net.IPAddr {
 
 // buildIP4 assembles an IPv4 header (with a computed checksum) in front of payload.
 func buildIP4(src, dst net.IP, proto int, payload []byte) []byte {
+	if len(payload) > 0xffff-20 {
+		return nil // the IPv4 total-length field is 16-bit; refuse rather than truncate it (MTU-bounded, so defensive)
+	}
 	h := make([]byte, 20+len(payload))
 	h[0] = 0x45 // version 4, IHL 5 (no options)
 	binary.BigEndian.PutUint16(h[2:4], uint16(len(h)))
