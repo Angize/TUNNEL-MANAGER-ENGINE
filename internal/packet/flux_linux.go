@@ -69,6 +69,8 @@ type Flux struct {
 
 	antiLeak  atomic.Pointer[func()] // anti-ICMP cleanup, written from the receive goroutine, read in Close -> atomic
 	leakOnce  sync.Once              // installs antiLeak exactly once (the server learns the peer late)
+	sendMu    sync.RWMutex           // senders RLock around the raw-fd Sendto; Close takes the write lock before closing it
+	sendDown  bool                   // set under sendMu.Lock in Close: no more Sendto on the (about-to-be-closed) raw fd
 	closeCh   chan struct{}
 	closeOnce sync.Once
 }
@@ -183,6 +185,12 @@ func (f *Flux) Close() error {
 	if p := f.antiLeak.Load(); p != nil && *p != nil {
 		(*p)()
 	}
+	// Block new sends and wait for any in-flight Sendto to finish BEFORE closing the raw fd,
+	// so a sibling goroutine (clientLoop / rotateWatcher / FEC emit) can't Sendto on a closed
+	// fd number that has since been reused by another socket.
+	f.sendMu.Lock()
+	f.sendDown = true
+	f.sendMu.Unlock()
 	if f.sendFd >= 0 {
 		syscall.Close(f.sendFd)
 	}
@@ -279,7 +287,14 @@ func (f *Flux) carrierOut(body []byte, to *net.IPAddr) {
 	}
 	var sa syscall.SockaddrInet4
 	copy(sa.Addr[:], to.IP.To4())
-	_ = syscall.Sendto(f.sendFd, out, 0, &sa)
+	// Guard the bare-fd Sendto: an RLock lets Close() (write lock) wait for in-flight sends
+	// and then flip sendDown before syscall.Close, so we never Sendto on a closed/reused fd.
+	// The RLock is uncontended in steady state and cheap next to the syscall itself.
+	f.sendMu.RLock()
+	if !f.sendDown {
+		_ = syscall.Sendto(f.sendFd, out, 0, &sa)
+	}
+	f.sendMu.RUnlock()
 }
 
 // stunMagic is the STUN magic cookie (RFC 5389) at bytes 4..8 of every STUN message.

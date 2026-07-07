@@ -77,6 +77,9 @@ type Raw struct {
 	fecDec *fecDecoder                // non-nil when FEC is on: reassembles + reconstructs blocks on receive
 	rxAddr atomic.Pointer[net.IPAddr] // src of the packet currently feeding fecDec (deliver reads it)
 
+	sendMu   sync.RWMutex // senders RLock around the raw spoofFd Sendto; Close write-locks before closing it
+	sendDown bool         // set under sendMu.Lock in Close: no more Sendto on the (about-to-be-closed) spoofFd
+
 	closeCh   chan struct{}
 	closeOnce sync.Once
 }
@@ -241,6 +244,11 @@ func (r *Raw) Close() error {
 	if r.antiLeak != nil {
 		r.antiLeak()
 	}
+	// Block new sends and wait for any in-flight Sendto to finish before closing the raw
+	// spoofFd, so a sibling goroutine can't Sendto on a closed fd number that was reused.
+	r.sendMu.Lock()
+	r.sendDown = true
+	r.sendMu.Unlock()
 	if r.spoofFd >= 0 {
 		syscall.Close(r.spoofFd)
 	}
@@ -320,7 +328,14 @@ func (r *Raw) writeOut(pkt []byte, to *net.IPAddr) {
 		out := buildIP4(src, dst, r.proto, pkt)
 		var sa syscall.SockaddrInet4
 		copy(sa.Addr[:], to.IP.To4())
-		_ = syscall.Sendto(r.spoofFd, out, 0, &sa)
+		// Guard the bare-fd Sendto so Close() can wait for in-flight sends and flip sendDown
+		// before syscall.Close(spoofFd) — else a sibling goroutine could Sendto on a reused fd.
+		// (The conn.WriteToIP path below is poller-managed and safe against a concurrent Close.)
+		r.sendMu.RLock()
+		if !r.sendDown {
+			_ = syscall.Sendto(r.spoofFd, out, 0, &sa)
+		}
+		r.sendMu.RUnlock()
 		return
 	}
 	_, _ = r.conn.WriteToIP(pkt, to)
