@@ -150,11 +150,29 @@ func main() {
 	case "ws":
 		switch cfg.Role {
 		case "server":
+			if cfg.WSXHTTP {
+				b, err = packet.ListenXHTTP(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
+				if err == nil {
+					log.Printf("tnl-core: listening (core/xhttp%s) on %s", obfsTag, cfg.Listen)
+				}
+				break
+			}
 			b, err = packet.ListenWS(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher)
 			if err == nil {
 				log.Printf("tnl-core: listening (core/ws%s) on %s", obfsTag, cfg.Listen)
 			}
 		case "client":
+			if cfg.WSXHTTP { // xhttp carrier (single edge; pool not combined with xhttp)
+				var echList []byte
+				if cfg.WSECH != "" {
+					echList, _ = base64.StdEncoding.DecodeString(cfg.WSECH)
+				}
+				b, err = packet.DialXHTTP(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.WSHost, cfg.WSPath, cfg.WSTLS, echList)
+				if err == nil {
+					log.Printf("tnl-core: dialing (core/xhttp%s wss) %s", obfsTag, cfg.Peer)
+				}
+				break
+			}
 			if len(cfg.WSEdgeIPs) > 0 { // rotating edge pool overrides the single edge
 				snis := make([]packet.WSPoolSNI, len(cfg.WSEdgeSNIs))
 				for i, s := range cfg.WSEdgeSNIs {

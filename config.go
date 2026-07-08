@@ -103,6 +103,10 @@ type Config struct {
 	WSHost string `json:"ws_host"`
 	WSPath string `json:"ws_path"`
 	WSTLS  bool   `json:"ws_tls"`
+	// WSXHTTP switches the ws carrier from a WebSocket upgrade to the xhttp mode (a
+	// GET-down + POST-up HTTP request pair), which passes CDNs that block WebSocket.
+	// Same fronting fields (ws_host/ws_tls/ws_ech/ws_path). Not combined with the pool.
+	WSXHTTP bool `json:"ws_xhttp"`
 	// WSECH is a base64 ECHConfigList (draft-ietf-tls-esni / RFC 9460 HTTPS-record
 	// "ech="). On a wss client it encrypts the real SNI (WSHost) inside the ClientHello,
 	// leaving only a benign public name on the wire — so an SNI-blocklisting censor

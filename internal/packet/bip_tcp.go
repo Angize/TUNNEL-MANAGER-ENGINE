@@ -33,6 +33,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -270,6 +271,14 @@ type BipTCP struct {
 	pool   *wsPool       // client: rotating edge pool (nil = single fixed edge above)
 	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
 
+	// xhttp carrier (transport "ws" with ws_xhttp): the bip stream rides a GET(down) +
+	// POST(up) request pair instead of a WebSocket upgrade, so it passes CDNs that block
+	// WebSocket. Same fronting fields (wsHost/wsTLS/wsECH/wsPath) apply.
+	xhttp      bool
+	httpSrv    *http.Server // server: the xhttp endpoint (nil otherwise)
+	xhMu       sync.Mutex
+	xhSessions map[string]*xhttpSession
+
 	isClient bool
 	addr     string // server: listen addr; client: peer addr
 
@@ -325,6 +334,27 @@ func newWSPoolFromCfg(ips []string, snis []wsSNIEntry, autoBurn bool, statusPath
 	return newWSPool(ips, snis, autoBurn, statusPath)
 }
 
+// DialXHTTP (client role) is DialWS over the xhttp carrier: it reaches the edge with the
+// same wss/ECH/Host, but carries the stream over a GET(down)+POST(up) pair rather than a
+// WebSocket upgrade, so it passes a CDN that blocks WebSocket.
+func DialXHTTP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher, wsHost, wsPath string, wsTLS bool, wsECH []byte) (*BipTCP, error) {
+	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+		ws: true, xhttp: true, wsHost: wsHost, wsPath: wsPath, wsTLS: wsTLS, wsECH: wsECH,
+		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
+}
+
+// ListenXHTTP (server role) serves the xhttp endpoint over plain HTTP (a CDN in front
+// terminates TLS). A non-session request gets a plausible 404.
+func ListenXHTTP(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*BipTCP, error) {
+	ln, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+		ws: true, xhttp: true, idle: idleFor(keepalive), addr: listenAddr, ln: ln, closeCh: make(chan struct{}),
+		preAuth: make(chan struct{}, maxPreAuthConns), xhSessions: make(map[string]*xhttpSession)}, nil
+}
+
 // ListenWS (server role) accepts WebSocket connections (plain HTTP upgrade; a CDN
 // in front terminates TLS and forwards the WebSocket to us). A non-WS request gets
 // a plausible 404 and is dropped, so the port looks like an ordinary web endpoint.
@@ -371,6 +401,8 @@ func (b *BipTCP) Run() error {
 	if b.isClient {
 		go b.keepaliveLoop()
 		b.dialLoop()
+	} else if b.xhttp {
+		b.runXHTTPServer()
 	} else {
 		b.acceptLoop()
 	}
@@ -383,6 +415,9 @@ func (b *BipTCP) Close() error {
 		return nil
 	}
 	close(b.closeCh)
+	if b.httpSrv != nil {
+		b.httpSrv.Close()
+	}
 	if b.ln != nil {
 		b.ln.Close()
 	}
@@ -658,7 +693,14 @@ func (b *BipTCP) dialLoop() {
 		var conn net.Conn
 		label := b.addr
 		if b.ws { // pool or single edge: dial + wss(+ECH) + upgrade, burning on failure
-			c, edge, err := b.establishWS()
+			var c net.Conn
+			var edge string
+			var err error
+			if b.xhttp {
+				c, edge, err = b.establishXHTTP()
+			} else {
+				c, edge, err = b.establishWS()
+			}
 			if err != nil {
 				log.Printf("bip/ws: connect via %s failed: %v", edge, err)
 				if b.sleep(1 * time.Second) {
