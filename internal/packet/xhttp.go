@@ -416,8 +416,8 @@ func (b *TCP) dialXHTTPGrpc(hc *http.Client, tr *http.Transport, ctx context.Con
 	if err != nil {
 		cancel()
 		pw.Close()
-		if b.pool != nil { // a transport failure (dial/TLS) points at the IP
-			b.pool.burnIP(dialAddr)
+		if b.pool != nil { // dial+TLS are bundled here, so which axis failed is ambiguous
+			b.pool.handshakeFailed(dialAddr, host)
 		}
 		return nil, dialAddr, err
 	}
@@ -425,10 +425,13 @@ func (b *TCP) dialXHTTPGrpc(hc *http.Client, tr *http.Transport, ctx context.Con
 		resp.Body.Close()
 		cancel()
 		pw.Close()
-		if b.pool != nil { // the edge answered but rejected this domain/path — burn the SNI
-			b.pool.burnSNI(host)
+		if b.pool != nil { // the edge answered but rejected this combo — attribute by evidence
+			b.pool.handshakeFailed(dialAddr, host)
 		}
 		return nil, dialAddr, fmt.Errorf("xhttp/grpc: got HTTP %d (want 200)", resp.StatusCode)
+	}
+	if b.pool != nil {
+		b.pool.succeeded(dialAddr, host)
 	}
 	conn := &xhttpConn{
 		r:  &grpcDeframingReader{r: resp.Body}, // Read <- deframed downstream
@@ -447,18 +450,21 @@ func (b *TCP) dialXHTTPPacket(hc *http.Client, tr *http.Transport, ctx context.C
 	gresp, err := hc.Do(greq)
 	if err != nil {
 		cancel()
-		if b.pool != nil { // a transport failure (dial/TLS) points at the IP
-			b.pool.burnIP(dialAddr)
+		if b.pool != nil { // dial+TLS are bundled here, so which axis failed is ambiguous
+			b.pool.handshakeFailed(dialAddr, host)
 		}
 		return nil, dialAddr, err
 	}
 	if gresp.StatusCode != http.StatusOK {
 		gresp.Body.Close()
 		cancel()
-		if b.pool != nil { // the edge answered but rejected this domain/path — burn the SNI
-			b.pool.burnSNI(host)
+		if b.pool != nil { // the edge answered but rejected this combo — attribute by evidence
+			b.pool.handshakeFailed(dialAddr, host)
 		}
 		return nil, dialAddr, fmt.Errorf("xhttp: down got HTTP %d (want 200)", gresp.StatusCode)
+	}
+	if b.pool != nil {
+		b.pool.succeeded(dialAddr, host)
 	}
 	urlFor := func(seq uint64) string {
 		return base + "?s=" + sid + "&seq=" + strconv.FormatUint(seq, 10)

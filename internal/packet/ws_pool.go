@@ -50,16 +50,26 @@ type wsSNIEntry struct {
 	path string
 }
 
+// burnEvidence is how many distinct partners on the OTHER axis an entry must fail a
+// handshake with before an (ambiguous) TLS/WS failure burns it. A single failed combo
+// can't tell whether the IP or the SNI is at fault — a throttled edge IP resets the TLS
+// handshake exactly like a blocked SNI does — so we wait for corroboration: an IP that
+// fails across several SNIs is the culprit; an SNI that fails across several IPs is.
+const burnEvidence = 2
+
 // wsPool holds the clean IP/SNI lists, runtime burn tracking, and the active index.
 // Auto-burn (when enabled) removes a failing IP or SNI from selection; the burn set
-// is snapshotted to statusPath after every change.
+// is snapshotted to statusPath after every change. ipFails/sniFails accumulate the
+// per-axis evidence used to attribute an ambiguous handshake failure (see burnEvidence).
 type wsPool struct {
 	mu         sync.Mutex
 	ips        []string
 	snis       []wsSNIEntry
 	burnedIP   map[string]bool
 	burnedSNI  map[string]bool
-	i, j       int // current ip / sni index
+	ipFails    map[string]map[string]bool // ip  -> distinct SNIs it failed a handshake with
+	sniFails   map[string]map[string]bool // sni -> distinct IPs it failed a handshake with
+	i, j       int                        // current ip / sni index
 	autoBurn   bool
 	statusPath string
 	active     string
@@ -67,6 +77,7 @@ type wsPool struct {
 
 func newWSPool(ips []string, snis []wsSNIEntry, autoBurn bool, statusPath string) *wsPool {
 	p := &wsPool{ips: ips, snis: snis, burnedIP: map[string]bool{}, burnedSNI: map[string]bool{},
+		ipFails: map[string]map[string]bool{}, sniFails: map[string]map[string]bool{},
 		autoBurn: autoBurn, statusPath: statusPath}
 	p.writeStatus()
 	return p
@@ -131,11 +142,13 @@ func (p *wsPool) advanceSNI() {
 
 // burnIP/burnSNI drop a failing entry from rotation (when autoBurn is on) and step
 // past it. A no-op on autoBurn=off except for advancing, so a manual-only pool still
-// rotates away from a dead edge for this attempt without persisting the burn.
+// rotates away from a dead edge for this attempt without persisting the burn. These are
+// the UNAMBIGUOUS burns — burnIP for a TCP-dial failure (the SNI never went on the wire,
+// so the IP alone is at fault). Ambiguous TLS/WS failures go through handshakeFailed.
 func (p *wsPool) burnIP(ip string) {
 	p.mu.Lock()
 	if p.autoBurn {
-		p.burnedIP[ip] = true
+		p.burnIPLocked(ip)
 	}
 	p.stepLocked()
 	p.mu.Unlock()
@@ -145,11 +158,75 @@ func (p *wsPool) burnIP(ip string) {
 func (p *wsPool) burnSNI(host string) {
 	p.mu.Lock()
 	if p.autoBurn {
-		p.burnedSNI[host] = true
+		p.burnSNILocked(host)
 	}
 	p.stepLocked()
 	p.mu.Unlock()
 	p.writeStatus()
+}
+
+// burnIPLocked marks an IP burned and drops its blame votes against SNIs: now that the
+// IP is known bad, its past handshake failures are no evidence against those domains, so
+// they must not push a healthy SNI over the threshold. Caller holds the lock.
+func (p *wsPool) burnIPLocked(ip string) {
+	p.burnedIP[ip] = true
+	for sni := range p.ipFails[ip] {
+		if s := p.sniFails[sni]; s != nil {
+			delete(s, ip)
+		}
+	}
+	delete(p.ipFails, ip)
+}
+
+func (p *wsPool) burnSNILocked(host string) {
+	p.burnedSNI[host] = true
+	for ip := range p.sniFails[host] {
+		if m := p.ipFails[ip]; m != nil {
+			delete(m, host)
+		}
+	}
+	delete(p.sniFails, host)
+}
+
+// handshakeFailed records a TLS/WS-upgrade failure of a specific (ip, sni) combo. Which
+// axis is at fault is ambiguous, so nothing is burned on the first data point: the IP is
+// burned only once it has failed across burnEvidence distinct SNIs, the SNI only once it
+// has failed across burnEvidence distinct IPs. Until then we rotate on and let the next
+// combo corroborate — this is what stops one dead edge IP from burning healthy SNIs.
+func (p *wsPool) handshakeFailed(ip, sni string) {
+	p.mu.Lock()
+	if p.autoBurn {
+		if p.ipFails[ip] == nil {
+			p.ipFails[ip] = map[string]bool{}
+		}
+		p.ipFails[ip][sni] = true
+		if p.sniFails[sni] == nil {
+			p.sniFails[sni] = map[string]bool{}
+		}
+		p.sniFails[sni][ip] = true
+		switch {
+		case len(p.ipFails[ip]) >= burnEvidence:
+			p.burnIPLocked(ip)
+		case len(p.sniFails[sni]) >= burnEvidence:
+			p.burnSNILocked(sni)
+		}
+	}
+	p.stepLocked()
+	p.mu.Unlock()
+	p.writeStatus()
+}
+
+// succeeded clears the accumulated blame for a combo that just connected, so a stale
+// transient failure never adds up to a false burn later.
+func (p *wsPool) succeeded(ip, sni string) {
+	p.mu.Lock()
+	if m := p.ipFails[ip]; m != nil {
+		delete(m, sni)
+	}
+	if s := p.sniFails[sni]; s != nil {
+		delete(s, ip)
+	}
+	p.mu.Unlock()
 }
 
 // resetBurns clears the burn sets — called when the pool is exhausted so a link never
@@ -158,6 +235,8 @@ func (p *wsPool) resetBurns() {
 	p.mu.Lock()
 	p.burnedIP = map[string]bool{}
 	p.burnedSNI = map[string]bool{}
+	p.ipFails = map[string]map[string]bool{}
+	p.sniFails = map[string]map[string]bool{}
 	p.mu.Unlock()
 	p.writeStatus()
 }

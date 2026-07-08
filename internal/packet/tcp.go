@@ -683,7 +683,7 @@ func (b *TCP) establishWS() (net.Conn, string, error) {
 	conn, err := b.dialer(10 * time.Second).Dial("tcp", dialAddr)
 	if err != nil {
 		if b.pool != nil {
-			b.pool.burnIP(dialAddr)
+			b.pool.burnIP(dialAddr) // TCP dial failed: SNI never went on the wire → the IP is at fault
 		}
 		return nil, dialAddr, err
 	}
@@ -691,7 +691,7 @@ func (b *TCP) establishWS() (net.Conn, string, error) {
 		tc, terr := b.tlsToEdge(conn, dialAddr, host, ech)
 		if terr != nil {
 			if b.pool != nil {
-				b.pool.burnSNI(host)
+				b.pool.handshakeFailed(dialAddr, host) // TLS reset: IP-throttle or SNI-block — attribute by evidence
 			}
 			return nil, dialAddr, terr
 		}
@@ -701,9 +701,12 @@ func (b *TCP) establishWS() (net.Conn, string, error) {
 	if werr != nil {
 		conn.Close()
 		if b.pool != nil {
-			b.pool.burnSNI(host)
+			b.pool.handshakeFailed(dialAddr, host) // WS upgrade failed: same ambiguity as a TLS reset
 		}
 		return nil, dialAddr, werr
+	}
+	if b.pool != nil {
+		b.pool.succeeded(dialAddr, host) // combo works: clear any stale blame so it never falsely burns
 	}
 	return &wsConn{Conn: conn, r: r, client: true}, dialAddr, nil
 }
