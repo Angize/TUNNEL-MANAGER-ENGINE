@@ -319,9 +319,9 @@ func DialWS(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cry
 // combinations from the pool (each SNI with its own ECH), moving before any single
 // edge is fingerprinted and burning a blocked one. rotate is the proactive rotation
 // interval (0 = rotate only on failure). wsTLS is always on (the pool is a wss set).
-func DialWSPool(dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, pool *wsPool, rotate time.Duration) (*BipTCP, error) {
+func DialWSPool(dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, pool *wsPool, rotate time.Duration, xhttp bool) (*BipTCP, error) {
 	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
-		ws: true, wsTLS: true, pool: pool, rotate: rotate,
+		ws: true, wsTLS: true, xhttp: xhttp, pool: pool, rotate: rotate,
 		idle: idleFor(keepalive), isClient: true, addr: "pool", closeCh: make(chan struct{})}, nil
 }
 

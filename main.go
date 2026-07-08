@@ -162,33 +162,33 @@ func main() {
 				log.Printf("tnl-core: listening (core/ws%s) on %s", obfsTag, cfg.Listen)
 			}
 		case "client":
-			if cfg.WSXHTTP { // xhttp carrier (single edge; pool not combined with xhttp)
-				var echList []byte
-				if cfg.WSECH != "" {
-					echList, _ = base64.StdEncoding.DecodeString(cfg.WSECH)
-				}
-				b, err = packet.DialXHTTP(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.WSHost, cfg.WSPath, cfg.WSTLS, echList)
-				if err == nil {
-					log.Printf("tnl-core: dialing (core/xhttp%s wss) %s", obfsTag, cfg.Peer)
-				}
-				break
+			carrier := "ws"
+			if cfg.WSXHTTP {
+				carrier = "xhttp"
 			}
-			if len(cfg.WSEdgeIPs) > 0 { // rotating edge pool overrides the single edge
+			if len(cfg.WSEdgeIPs) > 0 { // rotating edge pool overrides the single edge (ws or xhttp)
 				snis := make([]packet.WSPoolSNI, len(cfg.WSEdgeSNIs))
 				for i, s := range cfg.WSEdgeSNIs {
 					snis[i] = packet.WSPoolSNI{Host: s.Host, ECH: s.ECH, Path: s.Path}
 				}
 				b, err = packet.DialWSPoolCfg(dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher,
-					cfg.WSEdgeIPs, snis, time.Duration(cfg.WSRotateSecs)*time.Second, cfg.WSAutoBurn, cfg.WSStatusPath)
+					cfg.WSEdgeIPs, snis, time.Duration(cfg.WSRotateSecs)*time.Second, cfg.WSAutoBurn, cfg.WSStatusPath, cfg.WSXHTTP)
 				if err == nil {
-					log.Printf("tnl-core: dialing (core/ws%s wss ech pool: %dIP×%dSNI rotate=%ds auto_burn=%v)",
-						obfsTag, len(cfg.WSEdgeIPs), len(cfg.WSEdgeSNIs), cfg.WSRotateSecs, cfg.WSAutoBurn)
+					log.Printf("tnl-core: dialing (core/%s%s wss ech pool: %dIP×%dSNI rotate=%ds auto_burn=%v)",
+						carrier, obfsTag, len(cfg.WSEdgeIPs), len(cfg.WSEdgeSNIs), cfg.WSRotateSecs, cfg.WSAutoBurn)
 				}
 				break
 			}
 			var echList []byte
 			if cfg.WSECH != "" { // validated as base64 in Config.Validate
 				echList, _ = base64.StdEncoding.DecodeString(cfg.WSECH)
+			}
+			if cfg.WSXHTTP { // single-edge xhttp carrier
+				b, err = packet.DialXHTTP(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.WSHost, cfg.WSPath, cfg.WSTLS, echList)
+				if err == nil {
+					log.Printf("tnl-core: dialing (core/xhttp%s wss) %s", obfsTag, cfg.Peer)
+				}
+				break
 			}
 			b, err = packet.DialWS(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.WSHost, cfg.WSPath, cfg.WSTLS, echList)
 			if err == nil {

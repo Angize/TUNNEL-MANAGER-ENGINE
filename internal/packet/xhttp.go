@@ -131,10 +131,21 @@ func xhttpPath(p string) string {
 }
 
 // establishXHTTP (client) opens the downstream GET and the upstream POST for a fresh
-// session and returns a net.Conn over the pair. TLS+ECH to the edge mirror wss.
+// session and returns a net.Conn over the pair. TLS+ECH to the edge mirror wss. When an
+// edge pool is configured it rotates like establishWS: each attempt uses the pool's
+// current (IP × SNI), and a failure burns the offending IP or SNI.
 func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
-	dialAddr := b.addr
-	host := b.wsHost
+	dialAddr, host, ech, path := b.addr, b.wsHost, b.wsECH, b.wsPath
+	if b.pool != nil {
+		ip, sni, ok := b.pool.current()
+		if !ok {
+			b.pool.resetBurns() // every combo burned — fresh cycle so we never dead-end
+			if ip, sni, ok = b.pool.current(); !ok {
+				return nil, "", fmt.Errorf("xhttp: edge pool is empty")
+			}
+		}
+		dialAddr, host, ech, path = ip, sni.host, sni.ech, sni.path
+	}
 	if host == "" {
 		host = dialAddr
 	}
@@ -153,13 +164,13 @@ func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
 	if b.wsTLS {
 		scheme = "https"
 		cfg := &tls.Config{ServerName: host}
-		if len(b.wsECH) > 0 {
-			cfg.EncryptedClientHelloConfigList = b.wsECH
+		if len(ech) > 0 {
+			cfg.EncryptedClientHelloConfigList = ech
 		}
 		tr.TLSClientConfig = cfg
 	}
 	sid := randSID()
-	base := scheme + "://" + host + xhttpPath(b.wsPath)
+	base := scheme + "://" + host + xhttpPath(path)
 	hc := &http.Client{Transport: tr}
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -174,11 +185,17 @@ func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
 	gresp, err := hc.Do(greq)
 	if err != nil {
 		cancel()
+		if b.pool != nil { // a transport failure (dial/TLS) points at the IP
+			b.pool.burnIP(dialAddr)
+		}
 		return nil, dialAddr, err
 	}
 	if gresp.StatusCode != http.StatusOK {
 		gresp.Body.Close()
 		cancel()
+		if b.pool != nil { // the edge answered but rejected this domain/path — burn the SNI
+			b.pool.burnSNI(host)
+		}
 		return nil, dialAddr, fmt.Errorf("xhttp: down got HTTP %d (want 200)", gresp.StatusCode)
 	}
 	pr, pw := io.Pipe()
