@@ -275,7 +275,7 @@ func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
 		// Always dial the fixed edge, regardless of the request URL host, so the Host/SNI stays
 		// the fronting domain while we connect to a specific (clean) CDN IP.
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", dialAddr)
+			return b.dialer(10 * time.Second).DialContext(ctx, "tcp", dialAddr)
 		},
 		// packet-up rides HTTP/1.1 (each POST is a complete request); stream-one and grpc are
 		// full-duplex and need HTTP/2 to the edge so upstream frames flush per-write, not buffer.

@@ -68,6 +68,11 @@ type Config struct {
 
 	Listen string `json:"listen"` // server: bind address, e.g. "0.0.0.0:9000"
 	Peer   string `json:"peer"`   // client: server address, e.g. "1.2.3.4:9000"
+	// BindIP is the source IP the client dials FROM (its own node IP). On a host with
+	// several IPs the kernel would otherwise egress from the primary IP; binding pins the
+	// outbound socket to this node's registered IP so the peer/CDN sees the expected source.
+	// Empty = let the kernel choose. TCP-family carriers only (tcp/ws/xhttp).
+	BindIP string `json:"bind_ip"`
 
 	TunName string `json:"tun_name"` // requested interface name, e.g. "tnl0"
 	TunAddr string `json:"tun_addr"` // local L3 address with prefix, e.g. "10.200.0.1/24"
@@ -273,6 +278,9 @@ func (c *Config) validate() error {
 		}
 	default:
 		return errors.New("role must be \"server\" or \"client\"")
+	}
+	if c.BindIP != "" && net.ParseIP(c.BindIP) == nil {
+		return errors.New("bind_ip must be a valid IP address")
 	}
 	switch c.Transport {
 	case "", "udp", "tcp":
