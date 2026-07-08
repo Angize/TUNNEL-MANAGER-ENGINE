@@ -110,6 +110,25 @@ func (p *wsPool) advance() {
 	p.mu.Unlock()
 }
 
+// advanceIP / advanceSNI rotate a single dimension (manual "rotate now, IP only" /
+// "rotate now, SNI only" from the panel). current() still skips burned entries, so a
+// bump that lands on a burned one is passed over on the next dial.
+func (p *wsPool) advanceIP() {
+	p.mu.Lock()
+	if len(p.ips) > 0 {
+		p.i = (p.i + 1) % len(p.ips)
+	}
+	p.mu.Unlock()
+}
+
+func (p *wsPool) advanceSNI() {
+	p.mu.Lock()
+	if len(p.snis) > 0 {
+		p.j = (p.j + 1) % len(p.snis)
+	}
+	p.mu.Unlock()
+}
+
 // burnIP/burnSNI drop a failing entry from rotation (when autoBurn is on) and step
 // past it. A no-op on autoBurn=off except for advancing, so a manual-only pool still
 // rotates away from a dead edge for this attempt without persisting the burn.

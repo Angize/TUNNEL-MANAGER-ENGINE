@@ -232,6 +232,28 @@ func main() {
 		os.Exit(0)
 	}()
 
+	// Live "rotate now" for a ws edge pool, driven by the node via `systemctl kill`:
+	// SIGUSR1 rotates the edge IP, SIGUSR2 rotates the SNI — one dimension, no rebuild,
+	// the TUN stays up while the carrier re-dials on the new edge.
+	if r, ok := b.(interface {
+		RotateIP()
+		RotateSNI()
+	}); ok {
+		rsig := make(chan os.Signal, 2)
+		signal.Notify(rsig, syscall.SIGUSR1, syscall.SIGUSR2)
+		go func() {
+			for s := range rsig {
+				if s == syscall.SIGUSR1 {
+					log.Print("tnl-core: rotate-now (edge IP)")
+					r.RotateIP()
+				} else {
+					log.Print("tnl-core: rotate-now (SNI)")
+					r.RotateSNI()
+				}
+			}
+		}()
+	}
+
 	if err := b.Run(); err != nil {
 		log.Printf("tnl-core: stopped: %v", err)
 	}
