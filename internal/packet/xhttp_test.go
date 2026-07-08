@@ -4,43 +4,65 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 )
 
-// echoXHTTP is a minimal server mirroring the real GET(down)+POST(up) correlation:
-// whatever the client POSTs (upstream) is streamed back on its GET (downstream).
+// echoXHTTP is a minimal packet-up server: it reassembles the client's seq-tagged upstream POSTs
+// into an ordered byte stream and echoes it back on the session's long-lived downstream GET.
 func echoXHTTP() *httptest.Server {
+	type sess struct {
+		pr   *io.PipeReader
+		pw   *io.PipeWriter
+		mu   sync.Mutex
+		next uint64
+		pend map[uint64][]byte
+	}
 	var mu sync.Mutex
-	type pipe struct{ pr *io.PipeReader; pw *io.PipeWriter }
-	pipes := map[string]*pipe{}
-	get := func(sid string) *pipe {
+	sessions := map[string]*sess{}
+	get := func(sid string) *sess {
 		mu.Lock()
 		defer mu.Unlock()
-		if p := pipes[sid]; p != nil {
-			return p
+		if s := sessions[sid]; s != nil {
+			return s
 		}
 		pr, pw := io.Pipe()
-		p := &pipe{pr, pw}
-		pipes[sid] = p
-		return p
+		s := &sess{pr: pr, pw: pw, pend: map[uint64][]byte{}}
+		sessions[sid] = s
+		return s
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		sid := r.URL.Query().Get("s")
-		p := get(sid)
+		s := get(r.URL.Query().Get("s"))
 		if r.Method == http.MethodPost {
-			io.Copy(p.pw, r.Body)
-			p.pw.Close()
+			seq, _ := strconv.ParseUint(r.URL.Query().Get("seq"), 10, 64)
+			data, _ := io.ReadAll(r.Body)
+			s.mu.Lock()
+			s.pend[seq] = data
+			for {
+				d, ok := s.pend[s.next]
+				if !ok {
+					break
+				}
+				delete(s.pend, s.next)
+				s.next++
+				if len(d) > 0 {
+					s.pw.Write(d)
+				}
+			}
+			s.mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		fl := w.(http.Flusher)
 		w.WriteHeader(200)
 		fl.Flush()
+		go func() { <-r.Context().Done(); s.pw.Close() }() // client gone -> unblock the read loop
 		buf := make([]byte, 4096)
 		for {
-			n, e := p.pr.Read(buf)
+			n, e := s.pr.Read(buf)
 			if n > 0 {
 				w.Write(buf[:n])
 				fl.Flush()
@@ -63,7 +85,7 @@ func TestXHTTPCarrierRoundTrip(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// write several framed-ish chunks upstream; expect them echoed on the downstream.
+	// write several framed-ish chunks upstream; expect them echoed (in order) on the downstream.
 	msgs := [][]byte{[]byte("hello xhttp"), []byte("second frame"), make([]byte, 5000)}
 	for i := range msgs[2] {
 		msgs[2][i] = byte(i)
@@ -77,7 +99,7 @@ func TestXHTTPCarrierRoundTrip(t *testing.T) {
 	want := append(append([]byte("hello xhttp"), []byte("second frame")...), msgs[2]...)
 	got := make([]byte, 0, len(want))
 	buf := make([]byte, 4096)
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	for len(got) < len(want) {
 		n, e := conn.Read(buf)
 		got = append(got, buf[:n]...)
@@ -88,7 +110,7 @@ func TestXHTTPCarrierRoundTrip(t *testing.T) {
 	if string(got) != string(want) {
 		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(want))
 	}
-	t.Logf("xhttp carrier round-tripped %d bytes both ways", len(got))
+	t.Logf("xhttp packet-up round-tripped %d bytes both ways", len(got))
 }
 
 func TestXHTTPConnReadDeadline(t *testing.T) {
