@@ -310,6 +310,41 @@ func TestXHTTPServerH2C(t *testing.T) {
 	}
 }
 
+// TestSourceIPBind proves the client dialer binds its outbound socket to the configured source
+// IP: a server on 127.0.0.1 must see the connection arrive FROM 127.0.0.2 (a loopback alias),
+// not from 127.0.0.1. This is what pins egress to a node's own IP on a multi-IP host.
+func TestSourceIPBind(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	seen := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			seen <- "accept-err"
+			return
+		}
+		seen <- c.RemoteAddr().(*net.TCPAddr).IP.String()
+		c.Close()
+	}()
+	b := &BipTCP{bindIP: "127.0.0.2"}
+	c, err := b.dialer(2 * time.Second).Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial with bound source: %v", err)
+	}
+	defer c.Close()
+	select {
+	case src := <-seen:
+		if src != "127.0.0.2" {
+			t.Fatalf("server saw source %s, want 127.0.0.2 (bind not applied)", src)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no connection observed")
+	}
+}
+
 func TestXHTTPConnReadDeadline(t *testing.T) {
 	pr, _ := io.Pipe()
 	c := &xhttpConn{r: pr, w: io.Discard}

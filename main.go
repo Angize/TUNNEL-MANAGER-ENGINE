@@ -223,6 +223,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("tnl-core: transport: %v", err)
 	}
+	// Pin the client's outbound source IP to this node's own registered IP when set, so on a
+	// multi-IP host the peer/CDN sees that IP instead of the kernel's default primary. Only the
+	// TCP-family carriers (tcp/ws/xhttp) implement it; others ignore it.
+	if cfg.Role == "client" && cfg.BindIP != "" {
+		if s, ok := b.(interface{ SetSourceIP(string) }); ok {
+			s.SetSourceIP(cfg.BindIP)
+			log.Printf("tnl-core: binding outbound source IP to %s", cfg.BindIP)
+		}
+	}
 	defer b.Close()
 
 	// Clean shutdown removes the TUN (via defers) on SIGINT/SIGTERM.

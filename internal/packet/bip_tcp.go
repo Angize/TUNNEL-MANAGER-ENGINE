@@ -286,6 +286,7 @@ type BipTCP struct {
 
 	isClient bool
 	addr     string // server: listen addr; client: peer addr
+	bindIP   string // client: source IP to dial FROM (empty = kernel default); tcp/ws/xhttp only
 
 	ln      net.Listener
 	cur     atomic.Pointer[connFramer] // currently live connection (nil when none)
@@ -293,6 +294,23 @@ type BipTCP struct {
 	closed  atomic.Bool
 	closeCh chan struct{}
 	preAuth chan struct{} // permits: caps concurrent unauthenticated handlers
+}
+
+// SetSourceIP pins the client's outbound dials to a specific source IP (the node's own
+// registered IP), so on a multi-IP host the peer/CDN sees that IP instead of the kernel's
+// default primary. No effect on the server side or on raw/flux carriers. Call before Run.
+func (b *BipTCP) SetSourceIP(ip string) { b.bindIP = ip }
+
+// dialer returns a net.Dialer that, when a source IP is pinned, binds the outbound socket to
+// it (LocalAddr). A malformed or non-local IP is ignored (falls back to the kernel default).
+func (b *BipTCP) dialer(timeout time.Duration) *net.Dialer {
+	d := &net.Dialer{Timeout: timeout}
+	if b.bindIP != "" {
+		if ip := net.ParseIP(b.bindIP); ip != nil {
+			d.LocalAddr = &net.TCPAddr{IP: ip}
+		}
+	}
+	return d
 }
 
 func idleFor(keepalive time.Duration) time.Duration {
@@ -629,7 +647,7 @@ func (b *BipTCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte) (ne
 		var echErr *tls.ECHRejectionError
 		if attempt == 0 && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
 			ech = echErr.RetryConfigList // stale ECH key: redial and retry with the fresh one
-			if conn, err = net.DialTimeout("tcp", dialAddr, 10*time.Second); err != nil {
+			if conn, err = b.dialer(10 * time.Second).Dial("tcp", dialAddr); err != nil {
 				return nil, err
 			}
 			continue
@@ -662,7 +680,7 @@ func (b *BipTCP) establishWS() (net.Conn, string, error) {
 	if host == "" {
 		host = dialAddr
 	}
-	conn, err := net.DialTimeout("tcp", dialAddr, 10*time.Second)
+	conn, err := b.dialer(10 * time.Second).Dial("tcp", dialAddr)
 	if err != nil {
 		if b.pool != nil {
 			b.pool.burnIP(dialAddr)
@@ -719,7 +737,7 @@ func (b *BipTCP) dialLoop() {
 			}
 			conn, label = c, edge
 		} else {
-			c, err := net.DialTimeout("tcp", b.addr, 10*time.Second)
+			c, err := b.dialer(10 * time.Second).Dial("tcp", b.addr)
 			if err != nil {
 				log.Printf("bip/tcp: dial %s failed: %v", b.addr, err)
 				if b.sleep(1 * time.Second) {
