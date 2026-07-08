@@ -66,9 +66,21 @@ const (
 	// maxPreAuthConns bounds concurrent not-yet-authenticated server handlers, so
 	// a connection flood cannot exhaust goroutines/fds/memory before auth.
 	maxPreAuthConns = 128
+
+	// pingLossThreshold closes a CLIENT connection after this many consecutive keepalive
+	// pings go unanswered (no inbound frame of ANY type in between). It is a faster liveness
+	// signal than the b.idle read deadline for a silently black-holed carrier: at ~3×keepalive
+	// it trips well before idle (≥60s), so dialLoop re-dials sooner. b.idle stays as a backstop.
+	pingLossThreshold = 3
+
+	// probeTimeout bounds a single differential/retest edge probe (TCP dial + TLS, no WS, no data).
+	probeTimeout = 5 * time.Second
 )
 
-var errDesync = errors.New("core/tcp: stream desync")
+var (
+	errDesync      = errors.New("core/tcp: stream desync")
+	errPingTimeout = errors.New("core/tcp: keepalive pings unanswered")
+)
 
 // connFramer wraps a stream connection and owns the seal<->frame transform in
 // both directions. A write lock lets the TUN reader and the keepalive loop emit
@@ -97,6 +109,12 @@ type connFramer struct {
 	// authenticates its first frame and then runs serve), so the lock-free
 	// replayGuard is safe here.
 	rp replayGuard
+
+	// unanswered counts CLIENT keepalive pings sent with no inbound frame in between.
+	// keepaliveLoop bumps it per ping and drops the connection once it hits
+	// pingLossThreshold; serve() resets it to 0 on any received frame. Touched by the
+	// keepalive goroutine and the read goroutine, so it is atomic.
+	unanswered atomic.Int32
 }
 
 // sendSalt emits our per-connection salt once and arms the write keystream.
@@ -424,6 +442,9 @@ func (b *TCP) Run() error {
 	go b.tunLoop()
 	if b.isClient {
 		go b.keepaliveLoop()
+		if b.pool != nil {
+			go b.retestLoop() // background health retests with exponential backoff
+		}
 		b.dialLoop()
 	} else if b.xhttp {
 		b.runXHTTPServer()
@@ -659,40 +680,31 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte) (net.C
 
 // establishWS opens one WebSocket connection: it picks the current pool edge (or the
 // single configured edge), dials it, does the wss TLS+ECH, and performs the upgrade.
-// In pool mode a failure is classified and the offending IP or SNI is burned before
-// the error is returned, so dialLoop advances to the next edge on retry:
-//
-//	dial timeout / refused → the IP is unreachable/blocked  → burn IP
-//	TLS handshake failure  → the SNI drew a reset (or bad cert) → burn SNI
-//	WS upgrade not 101      → the domain/zone/account blocks WS → burn SNI
+// In pool mode ANY failure is handed to attributeFailure, which runs a differential probe
+// to decide by TRUTH — not a guess — whether the IP, the SNI, or neither is at fault, and
+// pulls the guilty axis into the health FSM. A successful connect clears both axes.
 func (b *TCP) establishWS() (net.Conn, string, error) {
 	dialAddr, host, ech, path := b.addr, b.wsHost, b.wsECH, b.wsPath
 	if b.pool != nil {
 		ip, sni, ok := b.pool.current()
 		if !ok {
-			b.pool.resetBurns() // every combo burned — fresh cycle so we never dead-end
-			if ip, sni, ok = b.pool.current(); !ok {
-				return nil, "", errors.New("ws: edge pool is empty")
-			}
+			return nil, "", errors.New("ws: edge pool is empty")
 		}
 		dialAddr, host, ech, path = ip, sni.host, sni.ech, sni.path
 	}
 	if host == "" {
 		host = dialAddr
 	}
+	sniEnt := wsSNIEntry{host: host, ech: ech, path: path} // for failure attribution / probes
 	conn, err := b.dialer(10 * time.Second).Dial("tcp", dialAddr)
 	if err != nil {
-		if b.pool != nil {
-			b.pool.burnIP(dialAddr) // TCP dial failed: SNI never went on the wire → the IP is at fault
-		}
+		b.attributeFailure(dialAddr, sniEnt) // differential probe: IP vs SNI vs transient
 		return nil, dialAddr, err
 	}
 	if b.wsTLS {
 		tc, terr := b.tlsToEdge(conn, dialAddr, host, ech)
 		if terr != nil {
-			if b.pool != nil {
-				b.pool.handshakeFailed(dialAddr, host) // TLS reset: IP-throttle or SNI-block — attribute by evidence
-			}
+			b.attributeFailure(dialAddr, sniEnt)
 			return nil, dialAddr, terr
 		}
 		conn = tc
@@ -700,15 +712,121 @@ func (b *TCP) establishWS() (net.Conn, string, error) {
 	r, werr := wsClientHandshake(conn, host, path, time.Now().Add(handshakeTimeout))
 	if werr != nil {
 		conn.Close()
-		if b.pool != nil {
-			b.pool.handshakeFailed(dialAddr, host) // WS upgrade failed: same ambiguity as a TLS reset
-		}
+		b.attributeFailure(dialAddr, sniEnt)
 		return nil, dialAddr, werr
 	}
 	if b.pool != nil {
-		b.pool.succeeded(dialAddr, host) // combo works: clear any stale blame so it never falsely burns
+		b.pool.succeeded(dialAddr, host) // combo works: clear any suspicion on this IP and SNI
 	}
 	return &wsConn{Conn: conn, r: r, client: true}, dialAddr, nil
+}
+
+// probeVerdict is the outcome of a differential failure probe: which axis of a failed
+// (ip, sni) combo is actually at fault.
+type probeVerdict int
+
+const (
+	verdictUnknown   probeVerdict = iota // no healthy alternative answered -> blame nothing
+	verdictTransient                     // the same combo worked on retry -> a blip, blame nothing
+	verdictIPGuilty                      // a healthy SNI proved the IP the culprit
+	verdictSNIGuilty                     // a healthy IP proved the SNI the culprit
+)
+
+// probeEdge does a quick TCP dial + TLS handshake to (ip, sni) — presenting that SNI with its
+// ECH — then closes: NO WebSocket upgrade, NO data. It reports only whether the edge completes
+// a TLS session for that SNI, which is exactly the signal the health FSM needs. Used by both
+// the differential failure probe and the retest scheduler. (Pool clients always run wss, so a
+// TLS probe is a valid reachability test for ws and xhttp edges alike.)
+func (b *TCP) probeEdge(ip string, sni wsSNIEntry) bool {
+	conn, err := b.dialer(probeTimeout).Dial("tcp", ip)
+	if err != nil {
+		return false
+	}
+	host := sni.host
+	if host == "" {
+		host = ip
+	}
+	tc, err := b.tlsToEdge(conn, ip, host, sni.ech) // closes conn on failure
+	if err != nil {
+		return false
+	}
+	tc.Close()
+	return true
+}
+
+// differentialProbe attributes a failed (ip, sni) connect to a specific axis by changing ONE
+// variable at a time against OTHER healthy pool entries, racing the arms and taking the first
+// definitive success:
+//
+//	same IP + a different healthy SNI succeeds -> the IP is fine, the SNI is guilty
+//	a different healthy IP + same SNI succeeds -> the SNI is fine, the IP is guilty
+//	the same (IP, SNI) succeeds on retry       -> the failure was transient, blame nothing
+//
+// When no healthy alternative of the needed axis exists (single edge, or everything already
+// suspect) that arm is skipped; if nothing answers the verdict is UNKNOWN (blame nothing —
+// there is nowhere better to move, and the retest scheduler / current() fallback cope).
+func (b *TCP) differentialProbe(failIP string, failSNI wsSNIEntry) probeVerdict {
+	type res struct {
+		v  probeVerdict
+		ok bool
+	}
+	var arms []func() res
+	if altSNI, ok := b.pool.altHealthySNI(failSNI.host); ok {
+		arms = append(arms, func() res { return res{verdictSNIGuilty, b.probeEdge(failIP, altSNI)} })
+	}
+	if altIP, ok := b.pool.altHealthyIP(failIP); ok {
+		arms = append(arms, func() res { return res{verdictIPGuilty, b.probeEdge(altIP, failSNI)} })
+	}
+	arms = append(arms, func() res { return res{verdictTransient, b.probeEdge(failIP, failSNI)} }) // retry
+	ch := make(chan res, len(arms))                                                                // buffered so late arms never block after we return
+	for _, arm := range arms {
+		arm := arm
+		go func() { ch <- arm() }()
+	}
+	for range arms {
+		if r := <-ch; r.ok {
+			return r.v // first definitive answer wins
+		}
+	}
+	return verdictUnknown
+}
+
+// attributeFailure runs the differential probe for a failed pool combo and moves the guilty
+// axis (if any) into suspect. A no-op when there is no pool or autoBurn is off (nothing would
+// be marked, so the probe traffic is skipped).
+func (b *TCP) attributeFailure(ip string, sni wsSNIEntry) {
+	if b.pool == nil || !b.pool.autoBurn {
+		return
+	}
+	switch b.differentialProbe(ip, sni) {
+	case verdictIPGuilty:
+		b.pool.markSuspect("ip", ip)
+	case verdictSNIGuilty:
+		b.pool.markSuspect("sni", sni.host)
+	}
+	// transient / unknown: mark nothing
+}
+
+// retestLoop (pooled client) periodically retests suspect/dead pool entries whose backoff has
+// elapsed. Each due entry is probed against a known-healthy partner (or the active one), and
+// the outcome walks the entry's FSM (success -> healthy, failure -> longer backoff / dead), so
+// a temporary block heals itself with no rebuild. Runs until Close.
+func (b *TCP) retestLoop() {
+	t := time.NewTicker(1 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-b.closeCh:
+			return
+		case <-t.C:
+			for _, spec := range b.pool.dueRetests() {
+				if b.closed.Load() {
+					return
+				}
+				b.pool.retestResult(spec.kind, spec.key, b.probeEdge(spec.ip, spec.sni))
+			}
+		}
+	}
 }
 
 // dialLoop (client) keeps a connection to the server alive, retrying on drop. For a
@@ -733,6 +851,9 @@ func (b *TCP) dialLoop() {
 			}
 			if err != nil {
 				log.Printf("core/ws: connect via %s failed: %v", edge, err)
+				if b.pool != nil {
+					b.pool.advance() // rotate to the next combo for the retry
+				}
 				if b.sleep(1 * time.Second) {
 					return
 				}
@@ -820,6 +941,22 @@ func (b *TCP) dialLoop() {
 func (b *TCP) RotateIP()  { b.rotate1(func() { b.pool.advanceIP() }) }
 func (b *TCP) RotateSNI() { b.rotate1(func() { b.pool.advanceSNI() }) }
 
+// ProbeNow forces an immediate retest of a pool entry (kind "ip"|"sni") on the retest
+// scheduler's next tick — backs a panel/node "probe now" control. No-op unless pooled.
+func (b *TCP) ProbeNow(kind, key string) {
+	if b.pool != nil {
+		b.pool.probeNow(kind, key)
+	}
+}
+
+// ProbeAllNow forces an immediate retest of every suspect/dead pool entry (backs the
+// panel "probe now" button, delivered as a signal that carries no key). No-op unless pooled.
+func (b *TCP) ProbeAllNow() {
+	if b.pool != nil {
+		b.pool.probeAllNow()
+	}
+}
+
 func (b *TCP) rotate1(step func()) {
 	if b.pool == nil {
 		return
@@ -857,6 +994,7 @@ func (b *TCP) serve(cf *connFramer) {
 			b.onConnErr(cf, err)
 			return
 		}
+		cf.unanswered.Store(0) // any inbound frame proves the peer is alive -> reset ping-loss
 		if cf.sealer != nil && !cf.rp.ok(session, seq) {
 			continue // authenticated but replayed -> ignore, keep the connection
 		}
@@ -906,10 +1044,20 @@ func (b *TCP) keepaliveLoop() {
 		case <-b.closeCh:
 			return
 		case <-time.After(jitter(b.keepalive)):
-			if cf := b.cur.Load(); cf != nil {
-				if err := cf.writeFrame(typePing, nil); err != nil {
-					b.onConnErr(cf, err)
-				}
+			cf := b.cur.Load()
+			if cf == nil {
+				continue
+			}
+			if err := cf.writeFrame(typePing, nil); err != nil {
+				b.onConnErr(cf, err)
+				continue
+			}
+			// Count pings with no intervening inbound frame; a silently black-holed
+			// connection trips this well before the idle deadline, so we drop it now to
+			// force a fast dialLoop reconnect. serve() resets the counter on any frame.
+			if cf.unanswered.Add(1) >= pingLossThreshold {
+				log.Printf("core/tcp: %d keepalive pings unanswered — dropping stale connection", pingLossThreshold)
+				b.onConnErr(cf, errPingTimeout)
 			}
 		}
 	}
