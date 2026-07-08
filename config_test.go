@@ -112,3 +112,28 @@ func TestSpoofValidation(t *testing.T) {
 		t.Errorf("decoy server with spoof_peer rejected: %v", err)
 	}
 }
+
+// TestWSPoolNoHost guards the regression where a rotating edge pool (which carries
+// its own per-SNI hosts) was rejected because ws_host was empty — the same check
+// that must still fire for a single-edge wss client.
+func TestWSPoolNoHost(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Role: "client", Mode: "packet", Profile: "core", Transport: "ws",
+			Peer: "203.0.113.9", TunAddr: "10.200.0.2/24", WSTLS: true,
+			Crypto: CryptoCfg{Enabled: true, PSK: "a-sufficiently-long-preshared-key"},
+		}
+	}
+	// A pool with no ws_host must be ACCEPTED (the SNI list supplies the hosts).
+	c := base()
+	c.WSEdgeIPs = []string{"104.16.0.1:443"}
+	c.WSEdgeSNIs = []WSSNI{{Host: "cdn.example.com"}}
+	if err := c.validate(); err != nil {
+		t.Fatalf("ws edge pool without ws_host rejected: %v", err)
+	}
+	// A single-edge wss client with no ws_host and no pool must still be REJECTED.
+	c = base()
+	if err := c.validate(); err == nil {
+		t.Error("single-edge wss client without ws_host was accepted")
+	}
+}

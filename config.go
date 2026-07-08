@@ -314,7 +314,9 @@ func (c *Config) validate() error {
 	case "ws":
 		// WebSocket carrier. Client-side TLS to a CDN edge needs an SNI/Host, so
 		// ws_tls requires ws_host; the server side (plain, behind the CDN) needs neither.
-		if c.WSTLS && c.Role == "client" && c.WSHost == "" {
+		// A rotating edge POOL carries its own per-SNI hosts (WSEdgeSNIs) instead of a
+		// single WSHost, so ws_host is not required when a pool is configured.
+		if c.WSTLS && c.Role == "client" && c.WSHost == "" && len(c.WSEdgeIPs) == 0 {
 			return errors.New("ws_tls requires ws_host (the TLS SNI / fronting domain)")
 		}
 		// ECH hides the SNI, so it only makes sense on a wss client (it is carried in
