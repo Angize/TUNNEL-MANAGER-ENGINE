@@ -263,8 +263,8 @@ func (b *BipTCP) xhttpClientTLS(host string, ech []byte) *tls.Config {
 //	packet-up (default): a long-lived downstream GET plus short seq-tagged POSTs — most
 //	                     CDN-compatible, since a CDN that buffers request bodies still forwards
 //	                     short complete POSTs at once.
-//	stream-one (b.xhMode=="stream"): one full-duplex request (body up, response down) — needs
-//	                     HTTP/2 to the edge (ws_tls) so upstream frames flush per-write.
+//	grpc (b.xhMode=="grpc", or the legacy "stream" alias): one full-duplex request presented as a
+//	                     real gRPC call — needs HTTP/2 to the edge (ws_tls) so a CDN streams it.
 func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
 	dialAddr, host, ech, path, err := b.xhttpEdge()
 	if err != nil {
@@ -300,55 +300,14 @@ func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
 		r.Header.Set("Accept-Language", "en-US,en;q=0.9")
 		r.Header.Set("Cache-Control", "no-store")
 	}
+	// "stream" is a legacy alias for grpc: plain stream-one (octet-stream) was removed because it
+	// stalled through CDNs that buffer the origin leg; grpc is the full-duplex mode that streams.
 	switch b.xhMode {
-	case "grpc":
+	case "grpc", "stream":
 		return b.dialXHTTPGrpc(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
-	case "stream":
-		return b.dialXHTTPStream(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
 	default:
 		return b.dialXHTTPPacket(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
 	}
-}
-
-// dialXHTTPStream (stream-one) opens ONE full-duplex request: the request body — a pipe we feed
-// on Write — carries the upstream, and the response body carries the downstream, concurrently.
-// The server sends its response head immediately (before the body completes), so hc.Do returns
-// and both directions flow at once. Needs HTTP/2 end-to-end so per-frame writes are flushed.
-func (b *BipTCP) dialXHTTPStream(hc *http.Client, tr *http.Transport, ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
-	pr, pw := io.Pipe()
-	req, err := http.NewRequestWithContext(ctx, "POST", base+"?s="+sid, pr)
-	if err != nil {
-		cancel()
-		pw.Close()
-		return nil, dialAddr, err
-	}
-	setHdr(req)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = -1 // unknown length: stream the body (h2 DATA / chunked), never buffer it whole
-	resp, err := hc.Do(req)
-	if err != nil {
-		cancel()
-		pw.Close()
-		if b.pool != nil { // a transport failure (dial/TLS) points at the IP
-			b.pool.burnIP(dialAddr)
-		}
-		return nil, dialAddr, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		cancel()
-		pw.Close()
-		if b.pool != nil { // the edge answered but rejected this domain/path — burn the SNI
-			b.pool.burnSNI(host)
-		}
-		return nil, dialAddr, fmt.Errorf("xhttp: stream got HTTP %d (want 200)", resp.StatusCode)
-	}
-	conn := &xhttpConn{
-		r: resp.Body, w: pw, // Write -> pipe -> request body (upstream); Read <- response body (downstream)
-		ra: strAddr(dialAddr), la: strAddr("xhttp-client"),
-	}
-	conn.closeFn = func() { cancel(); pw.Close(); resp.Body.Close(); tr.CloseIdleConnections() }
-	return conn, dialAddr, nil
 }
 
 // --- gRPC framing (mode "grpc") ---------------------------------------------------------------
@@ -587,31 +546,8 @@ func (s *xhttpSession) close(b *BipTCP, sid string) {
 	})
 }
 
-// serveXHTTPStream handles a stream-one request: the single full-duplex request IS the session —
-// the request body is the upstream and the response body is the downstream. No session map, seq,
-// or reassembly is needed; handleServerConn runs the bip session directly on the pair, and the
-// request is held open until that session ends.
-func (b *BipTCP) serveXHTTPStream(w http.ResponseWriter, r *http.Request) {
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Accel-Buffering", "no") // ask any nginx/CDN in front not to buffer
-	w.WriteHeader(http.StatusOK)
-	fl.Flush() // send the response head now so the client's request returns and the duplex opens
-	conn := &xhttpConn{
-		r: r.Body, w: w, flush: fl.Flush,
-		ra: strAddr(r.RemoteAddr), la: strAddr("xhttp-server"),
-	}
-	defer conn.Close()
-	b.handleServerConn(conn) // the request lifetime IS the session; blocks until it ends
-}
-
-// serveXHTTPGrpc handles a gRPC-framed stream-one request: like serveXHTTPStream, the single
-// full-duplex request IS the session, but the body carries gRPC message framing and the response
+// serveXHTTPGrpc handles a gRPC-framed full-duplex request: the single request IS the session, the
+// body carries gRPC message framing and the response
 // presents as gRPC (Content-Type application/grpc + a grpc-status trailer on clean close), so a
 // CDN proxies it as a gRPC call (h2c to the origin, streamed, not buffered).
 func (b *BipTCP) serveXHTTPGrpc(w http.ResponseWriter, r *http.Request) {
@@ -636,10 +572,10 @@ func (b *BipTCP) serveXHTTPGrpc(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("grpc-status", "0") // OK (trailer)
 }
 
-// xhttpHandler routes a session's requests. stream-one is a single full-duplex POST (no seq).
-// packet-up uses a GET (downstream body, drives handleServerConn once) plus seq-tagged POSTs
-// (?seq=N) fed into the upstream. The server auto-detects the style per request, so a stream
-// client and a packet client both work against one endpoint regardless of its own mode setting.
+// xhttpHandler routes a session's requests by shape. grpc is a single full-duplex POST with
+// Content-Type application/grpc. packet-up uses a GET (downstream body, drives handleServerConn
+// once) plus seq-tagged POSTs (?seq=N) fed into the upstream. The server auto-detects the style
+// per request, so a grpc client and a packet client both work against one endpoint.
 func (b *BipTCP) xhttpHandler(w http.ResponseWriter, r *http.Request) {
 	sid := r.URL.Query().Get("s")
 	if len(sid) != 32 || strings.Trim(sid, "0123456789abcdef") != "" {
@@ -647,15 +583,8 @@ func (b *BipTCP) xhttpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// grpc: a single full-duplex POST presenting as a gRPC call (Content-Type application/grpc).
-	// Checked first because it is the most specific shape.
 	if r.Method == http.MethodPost && strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") {
 		b.serveXHTTPGrpc(w, r)
-		return
-	}
-	// stream-one: a single full-duplex POST with no seq. Route it before touching the packet-up
-	// session map (which only the GET-down + seq-POST style uses).
-	if r.Method == http.MethodPost && r.URL.Query().Get("seq") == "" {
-		b.serveXHTTPStream(w, r)
 		return
 	}
 	s := b.xhttpGetOrCreate(sid)

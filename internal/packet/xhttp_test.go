@@ -181,11 +181,11 @@ func testTunnelXHTTP(t *testing.T, mode string, obfs bool) {
 	xhttpInject(t, cliCtrl, srvCtrl)
 }
 
-// TestTunnelXHTTPStreamOne runs a full tunnel in stream-one mode: a single full-duplex request
-// over an HTTP/2 TLS edge (a stand-in for the CDN). The server's handler is served by an h2
-// httptest server so the client negotiates h2 and upstream frames flush per-write; its own plain
-// listener is idle. Proves stream-one round-trips both ways over one request.
-func TestTunnelXHTTPStreamOne(t *testing.T) {
+// TestTunnelXHTTPStreamAlias runs a full tunnel with the legacy mode value "stream", which now
+// routes to gRPC (plain stream-one was removed). It proves the alias still round-trips both ways
+// over one full-duplex request against an HTTP/2 TLS edge — so old ws_xhttp_mode="stream" configs
+// keep working via gRPC. (TestTunnelXHTTPGrpc covers the "grpc" value itself.)
+func TestTunnelXHTTPStreamAlias(t *testing.T) {
 	const psk = "e2e-shared-pre-shared-key-1234567890"
 	const cipher = "aes-256-gcm"
 	srvDev, srvCtrl := tunPair(t, "xhssrv")

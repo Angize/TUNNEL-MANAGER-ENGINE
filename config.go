@@ -114,14 +114,14 @@ type Config struct {
 	WSXHTTP bool `json:"ws_xhttp"`
 	// WSXHTTPMode picks the xhttp upstream style. "packet" (default) is packet-up: each
 	// write is a short discrete POST — the most CDN-compatible, since a CDN that buffers
-	// request bodies still forwards short complete POSTs at once. "stream" is stream-one:
-	// a single full-duplex request (request body up, response body down concurrently),
-	// which needs HTTP/2 to the edge, so it must be paired with ws_tls. "grpc" is stream-one
-	// wrapped as a real gRPC stream (Content-Type application/grpc + gRPC message framing):
-	// a CDN like Cloudflare connects to the origin with h2c and streams a gRPC call instead
-	// of buffering it, which is what makes a full-duplex stream survive the CDN->origin leg
-	// (also needs ws_tls). Only meaningful when ws_xhttp is set; the server auto-detects the
-	// client's style per request (and serves h2c so the CDN can reach it over HTTP/2).
+	// request bodies still forwards short complete POSTs at once. "grpc" is a single
+	// full-duplex request wrapped as a real gRPC stream (Content-Type application/grpc +
+	// gRPC message framing): a CDN like Cloudflare connects to the origin with h2c and
+	// streams the gRPC call instead of buffering it, which is what makes a full-duplex
+	// stream survive the CDN->origin leg (needs ws_tls). "stream" is a legacy alias for
+	// "grpc" (plain stream-one was removed — it stalled through buffering CDNs). Only
+	// meaningful when ws_xhttp is set; the server auto-detects the client's style per
+	// request (and serves h2c so the CDN can reach it over HTTP/2).
 	WSXHTTPMode string `json:"ws_xhttp_mode"`
 	// WSECH is a base64 ECHConfigList (draft-ietf-tls-esni / RFC 9460 HTTPS-record
 	// "ech="). On a wss client it encrypts the real SNI (WSHost) inside the ClientHello,
@@ -349,9 +349,9 @@ func (c *Config) validate() error {
 				return errors.New("ws_ech is not valid base64")
 			}
 		}
-		// xhttp upstream style: packet-up (default) or stream-one. stream-one is a single
-		// full-duplex request and needs HTTP/2 to the edge, so on a single-edge client it
-		// requires ws_tls (a pool is always wss; the server auto-detects and needs neither).
+		// xhttp upstream style: packet-up (default) or grpc ("stream" is a legacy alias for
+		// grpc). grpc is a single full-duplex request and needs HTTP/2 to the edge, so on a
+		// single-edge client it requires ws_tls (a pool is always wss; the server auto-detects).
 		switch c.WSXHTTPMode {
 		case "", "packet", "stream", "grpc":
 		default:
