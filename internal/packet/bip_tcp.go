@@ -757,6 +757,12 @@ func (b *BipTCP) dialLoop() {
 		b.cur.Store(cf)
 		cc := conn
 		b.curConn.Store(&cc) // expose the live conn so RotateIP/RotateSNI can drop it
+		if b.pool != nil {
+			// current() set the active (ip · sni) in memory when it picked this edge, but
+			// only burns flushed it to the status file — so a plain rotation left the file
+			// stale and the panel kept showing the old active row. Flush it on every connect.
+			b.pool.writeStatus()
+		}
 		_ = cf.writeFrame(typePing, nil) // prime + authenticate us to the server
 		// Proactive rotation: after b.rotate, advance the pool and drop this connection
 		// so dialLoop reconnects on the next edge. A connection that dies on its own
