@@ -379,6 +379,73 @@ func (p *wsPool) probeAllNow() {
 	p.mu.Unlock()
 }
 
+// selectEntry pins a SPECIFIC edge as the active one: it moves the rotation index onto that
+// entry and clears any suspect/dead mark on it — the operator explicitly chose it, so give it a
+// clean shot (the FSM re-suspects it if it fails again). Returns false if the key is unknown.
+func (p *wsPool) selectEntry(kind, key string) bool {
+	p.mu.Lock()
+	ok := false
+	if kind == "sni" {
+		for idx, s := range p.snis {
+			if s.host == key {
+				p.j = idx
+				delete(p.sniHealth, key)
+				ok = true
+				break
+			}
+		}
+	} else {
+		for idx, ip := range p.ips {
+			if ip == key {
+				p.i = idx
+				delete(p.ipHealth, key)
+				ok = true
+				break
+			}
+		}
+	}
+	p.mu.Unlock()
+	if ok {
+		p.writeStatus()
+	}
+	return ok
+}
+
+// cmdPath is the sidecar file the node writes a "select edge" request into (JSON {kind,key}).
+// Empty when the pool has no status path (nothing to poll).
+func (p *wsPool) cmdPath() string {
+	if p.statusPath == "" {
+		return ""
+	}
+	return p.statusPath + ".cmd"
+}
+
+// readSelectCmd consumes a pending select-edge command (written by the node for the panel's
+// per-edge pin button) and returns the requested (kind,key). ok=false when none is pending or
+// it is malformed. The file is removed once read so a command fires exactly once.
+func (p *wsPool) readSelectCmd() (kind, key string, ok bool) {
+	cp := p.cmdPath()
+	if cp == "" {
+		return "", "", false
+	}
+	data, err := os.ReadFile(cp)
+	if err != nil {
+		return "", "", false
+	}
+	os.Remove(cp)
+	var c struct {
+		Kind string `json:"kind"`
+		Key  string `json:"key"`
+	}
+	if json.Unmarshal(data, &c) != nil || c.Key == "" {
+		return "", "", false
+	}
+	if c.Kind != "sni" {
+		c.Kind = "ip"
+	}
+	return c.Kind, c.Key, true
+}
+
 // healthStatus is one entry's health as published to the status file.
 type healthStatus struct {
 	Key        string `json:"key"`
