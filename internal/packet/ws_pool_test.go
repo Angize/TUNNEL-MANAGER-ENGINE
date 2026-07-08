@@ -109,3 +109,30 @@ func TestStatusFileWritten(t *testing.T) {
 		t.Fatalf("expected burned_ips=[a], got %v", st.BurnedIPs)
 	}
 }
+
+// TestAdvanceIPAndSNIIndependently checks the manual per-dimension "rotate now": advanceIP
+// steps the IP while the SNI stays put, and advanceSNI does the reverse.
+func TestAdvanceIPAndSNIIndependently(t *testing.T) {
+	p := newWSPool([]string{"a", "b", "c"}, snis("x", "y"), true, "")
+	ip0, sni0, _ := p.current()
+	if ip0 != "a" || sni0.host != "x" {
+		t.Fatalf("start = %s/%s, want a/x", ip0, sni0.host)
+	}
+	p.advanceIP()
+	ip1, sni1, _ := p.current()
+	if ip1 != "b" || sni1.host != "x" {
+		t.Fatalf("after advanceIP = %s/%s, want b/x (SNI unchanged)", ip1, sni1.host)
+	}
+	p.advanceSNI()
+	ip2, sni2, _ := p.current()
+	if ip2 != "b" || sni2.host != "y" {
+		t.Fatalf("after advanceSNI = %s/%s, want b/y (IP unchanged)", ip2, sni2.host)
+	}
+	// IP wraps a,b,c -> back to a after three advances.
+	p.advanceIP()
+	p.advanceIP()
+	ip3, _, _ := p.current()
+	if ip3 != "a" {
+		t.Fatalf("after wrap = %s, want a", ip3)
+	}
+}

@@ -284,6 +284,7 @@ type BipTCP struct {
 
 	ln      net.Listener
 	cur     atomic.Pointer[connFramer] // currently live connection (nil when none)
+	curConn atomic.Pointer[net.Conn]   // client+pool: the live carrier conn, closed to force a re-dial on rotation
 	closed  atomic.Bool
 	closeCh chan struct{}
 	preAuth chan struct{} // permits: caps concurrent unauthenticated handlers
@@ -754,6 +755,8 @@ func (b *BipTCP) dialLoop() {
 		}
 		log.Printf("bip/tcp: connected to %s", label)
 		b.cur.Store(cf)
+		cc := conn
+		b.curConn.Store(&cc) // expose the live conn so RotateIP/RotateSNI can drop it
 		_ = cf.writeFrame(typePing, nil) // prime + authenticate us to the server
 		// Proactive rotation: after b.rotate, advance the pool and drop this connection
 		// so dialLoop reconnects on the next edge. A connection that dies on its own
@@ -767,10 +770,28 @@ func (b *BipTCP) dialLoop() {
 		if rot != nil {
 			rot.Stop()
 		}
+		b.curConn.CompareAndSwap(&cc, nil)
 		b.cur.CompareAndSwap(cf, nil)
 		if b.sleep(1 * time.Second) {
 			return
 		}
+	}
+}
+
+// RotateIP / RotateSNI are the live "rotate now" controls for a ws edge pool: they advance
+// a single dimension and drop the current carrier connection, so dialLoop immediately
+// re-dials on the new edge. The TUN device stays up throughout (only the sub-second carrier
+// redial happens) — no rebuild, no interface teardown. No-op unless this is a pooled client.
+func (b *BipTCP) RotateIP()  { b.rotate1(func() { b.pool.advanceIP() }) }
+func (b *BipTCP) RotateSNI() { b.rotate1(func() { b.pool.advanceSNI() }) }
+
+func (b *BipTCP) rotate1(step func()) {
+	if b.pool == nil {
+		return
+	}
+	step()
+	if c := b.curConn.Load(); c != nil {
+		(*c).Close() // unblocks serve(); dialLoop re-dials on the advanced edge
 	}
 }
 
