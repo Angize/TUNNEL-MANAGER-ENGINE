@@ -172,7 +172,7 @@ func main() {
 					snis[i] = packet.WSPoolSNI{Host: s.Host, ECH: s.ECH, Path: s.Path}
 				}
 				b, err = packet.DialWSPoolCfg(dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher,
-					cfg.WSEdgeIPs, snis, time.Duration(cfg.WSRotateSecs)*time.Second, cfg.WSAutoBurn, cfg.WSStatusPath, cfg.WSXHTTP)
+					cfg.WSEdgeIPs, snis, time.Duration(cfg.WSRotateSecs)*time.Second, cfg.WSAutoBurn, cfg.WSStatusPath, cfg.WSXHTTP, cfg.WSXHTTPMode)
 				if err == nil {
 					log.Printf("tnl-core: dialing (core/%s%s wss ech pool: %dIP×%dSNI rotate=%ds auto_burn=%v)",
 						carrier, obfsTag, len(cfg.WSEdgeIPs), len(cfg.WSEdgeSNIs), cfg.WSRotateSecs, cfg.WSAutoBurn)
@@ -184,9 +184,13 @@ func main() {
 				echList, _ = base64.StdEncoding.DecodeString(cfg.WSECH)
 			}
 			if cfg.WSXHTTP { // single-edge xhttp carrier
-				b, err = packet.DialXHTTP(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.WSHost, cfg.WSPath, cfg.WSTLS, echList)
+				b, err = packet.DialXHTTP(cfg.Peer, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.WSHost, cfg.WSPath, cfg.WSTLS, echList, cfg.WSXHTTPMode)
 				if err == nil {
-					log.Printf("tnl-core: dialing (core/xhttp%s wss) %s", obfsTag, cfg.Peer)
+					mode := cfg.WSXHTTPMode
+					if mode == "" {
+						mode = "packet"
+					}
+					log.Printf("tnl-core: dialing (core/xhttp:%s%s wss) %s", mode, obfsTag, cfg.Peer)
 				}
 				break
 			}

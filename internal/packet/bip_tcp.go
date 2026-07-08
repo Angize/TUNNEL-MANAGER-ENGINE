@@ -271,10 +271,15 @@ type BipTCP struct {
 	pool   *wsPool       // client: rotating edge pool (nil = single fixed edge above)
 	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
 
-	// xhttp carrier (transport "ws" with ws_xhttp): the bip stream rides a GET(down) +
-	// POST(up) request pair instead of a WebSocket upgrade, so it passes CDNs that block
-	// WebSocket. Same fronting fields (wsHost/wsTLS/wsECH/wsPath) apply.
+	// xhttp carrier (transport "ws" with ws_xhttp): the bip stream rides an HTTP request
+	// pair (packet-up: GET-down + seq-POSTs-up) or a single full-duplex request
+	// (stream-one) instead of a WebSocket upgrade, so it passes CDNs that block WebSocket.
+	// Same fronting fields (wsHost/wsTLS/wsECH/wsPath) apply. Because the client carries
+	// bip frames directly over these requests (the HTTP layer replaces the WS upgrade),
+	// the server must NOT run wsServerHandshake on an xhttp conn — see handleServerConn.
 	xhttp      bool
+	xhMode     string       // client: "stream" (single full-duplex request) else packet-up
+	xhTLS      *tls.Config  // test-only: overrides the client edge TLS config (nil in production)
 	httpSrv    *http.Server // server: the xhttp endpoint (nil otherwise)
 	xhMu       sync.Mutex
 	xhSessions map[string]*xhttpSession
@@ -320,9 +325,9 @@ func DialWS(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cry
 // combinations from the pool (each SNI with its own ECH), moving before any single
 // edge is fingerprinted and burning a blocked one. rotate is the proactive rotation
 // interval (0 = rotate only on failure). wsTLS is always on (the pool is a wss set).
-func DialWSPool(dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, pool *wsPool, rotate time.Duration, xhttp bool) (*BipTCP, error) {
+func DialWSPool(dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, pool *wsPool, rotate time.Duration, xhttp bool, xhMode string) (*BipTCP, error) {
 	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
-		ws: true, wsTLS: true, xhttp: xhttp, pool: pool, rotate: rotate,
+		ws: true, wsTLS: true, xhttp: xhttp, xhMode: xhMode, pool: pool, rotate: rotate,
 		idle: idleFor(keepalive), isClient: true, addr: "pool", closeCh: make(chan struct{})}, nil
 }
 
@@ -338,9 +343,9 @@ func newWSPoolFromCfg(ips []string, snis []wsSNIEntry, autoBurn bool, statusPath
 // DialXHTTP (client role) is DialWS over the xhttp carrier: it reaches the edge with the
 // same wss/ECH/Host, but carries the stream over a GET(down)+POST(up) pair rather than a
 // WebSocket upgrade, so it passes a CDN that blocks WebSocket.
-func DialXHTTP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher, wsHost, wsPath string, wsTLS bool, wsECH []byte) (*BipTCP, error) {
+func DialXHTTP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher, wsHost, wsPath string, wsTLS bool, wsECH []byte, xhMode string) (*BipTCP, error) {
 	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
-		ws: true, xhttp: true, wsHost: wsHost, wsPath: wsPath, wsTLS: wsTLS, wsECH: wsECH,
+		ws: true, xhttp: true, xhMode: xhMode, wsHost: wsHost, wsPath: wsPath, wsTLS: wsTLS, wsECH: wsECH,
 		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
 }
 
@@ -539,7 +544,10 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 	}
 	defer release()
 
-	if b.ws { // WebSocket upgrade; a non-WS probe gets a 404 and is dropped
+	if b.ws && !b.xhttp { // WebSocket upgrade; a non-WS probe gets a 404 and is dropped
+		// (xhttp is excluded: its conn already carries bip frames — the HTTP GET/POST pair
+		// or the single full-duplex request replaced the WS upgrade — so a ws handshake here
+		// would misread the client's bip handshake as an HTTP request and drop the session.)
 		r, werr := wsServerHandshake(conn, time.Now().Add(handshakeTimeout))
 		if werr != nil {
 			conn.Close()

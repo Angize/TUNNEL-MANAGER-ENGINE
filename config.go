@@ -107,6 +107,13 @@ type Config struct {
 	// GET-down + POST-up HTTP request pair), which passes CDNs that block WebSocket.
 	// Same fronting fields (ws_host/ws_tls/ws_ech/ws_path). Not combined with the pool.
 	WSXHTTP bool `json:"ws_xhttp"`
+	// WSXHTTPMode picks the xhttp upstream style. "packet" (default) is packet-up: each
+	// write is a short discrete POST — the most CDN-compatible, since a CDN that buffers
+	// request bodies still forwards short complete POSTs at once. "stream" is stream-one:
+	// a single full-duplex request (request body up, response body down concurrently),
+	// which needs HTTP/2 to the edge, so it must be paired with ws_tls. Only meaningful
+	// when ws_xhttp is set; the server auto-detects the client's style per request.
+	WSXHTTPMode string `json:"ws_xhttp_mode"`
 	// WSECH is a base64 ECHConfigList (draft-ietf-tls-esni / RFC 9460 HTTPS-record
 	// "ech="). On a wss client it encrypts the real SNI (WSHost) inside the ClientHello,
 	// leaving only a benign public name on the wire — so an SNI-blocklisting censor
@@ -329,6 +336,17 @@ func (c *Config) validate() error {
 			if _, err := base64.StdEncoding.DecodeString(c.WSECH); err != nil {
 				return errors.New("ws_ech is not valid base64")
 			}
+		}
+		// xhttp upstream style: packet-up (default) or stream-one. stream-one is a single
+		// full-duplex request and needs HTTP/2 to the edge, so on a single-edge client it
+		// requires ws_tls (a pool is always wss; the server auto-detects and needs neither).
+		switch c.WSXHTTPMode {
+		case "", "packet", "stream":
+		default:
+			return errors.New("ws_xhttp_mode must be \"packet\" or \"stream\"")
+		}
+		if c.WSXHTTPMode == "stream" && c.Role == "client" && !c.WSTLS && len(c.WSEdgeIPs) == 0 {
+			return errors.New("ws_xhttp_mode \"stream\" requires ws_tls (stream-one needs HTTP/2 to the edge)")
 		}
 		// Edge pool: a client+wss rotation set; every SNI's ECH must decode.
 		if len(c.WSEdgeIPs) > 0 || len(c.WSEdgeSNIs) > 0 {
