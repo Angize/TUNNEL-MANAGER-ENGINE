@@ -1,4 +1,4 @@
-// xhttp carrier: the bip stream rides plain HTTP requests instead of a WebSocket upgrade, so
+// xhttp carrier: the core stream rides plain HTTP requests instead of a WebSocket upgrade, so
 // it passes through CDNs that block or don't proxy WebSocket (e.g. a Cloudflare account with
 // WebSocket disabled) while still looking like ordinary HTTPS.
 //
@@ -225,7 +225,7 @@ func (u *xhUp) post(sc seqChunk) error {
 // xhttpEdge resolves the (dialAddr, host, ech, path) for this attempt. With an edge pool it uses
 // the pool's current (IP × SNI), resetting burns if every combination is burned so the client
 // never dead-ends. A single fixed edge uses the plain WSHost/WSECH/WSPath.
-func (b *BipTCP) xhttpEdge() (dialAddr, host string, ech []byte, path string, err error) {
+func (b *TCP) xhttpEdge() (dialAddr, host string, ech []byte, path string, err error) {
 	dialAddr, host, ech, path = b.addr, b.wsHost, b.wsECH, b.wsPath
 	if b.pool != nil {
 		ip, sni, ok := b.pool.current()
@@ -245,7 +245,7 @@ func (b *BipTCP) xhttpEdge() (dialAddr, host string, ech []byte, path string, er
 
 // xhttpClientTLS builds the client TLS config for the edge: SNI = the fronting host, with ECH
 // when configured. xhTLS (test-only) overrides it wholesale.
-func (b *BipTCP) xhttpClientTLS(host string, ech []byte) *tls.Config {
+func (b *TCP) xhttpClientTLS(host string, ech []byte) *tls.Config {
 	if b.xhTLS != nil {
 		return b.xhTLS
 	}
@@ -265,7 +265,7 @@ func (b *BipTCP) xhttpClientTLS(host string, ech []byte) *tls.Config {
 //	                     short complete POSTs at once.
 //	grpc (b.xhMode=="grpc", or the legacy "stream" alias): one full-duplex request presented as a
 //	                     real gRPC call — needs HTTP/2 to the edge (ws_tls) so a CDN streams it.
-func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
+func (b *TCP) establishXHTTP() (net.Conn, string, error) {
 	dialAddr, host, ech, path, err := b.xhttpEdge()
 	if err != nil {
 		return nil, "", err
@@ -399,7 +399,7 @@ func (g *grpcDeframingReader) Close() error {
 
 // dialXHTTPGrpc (grpc) is stream-one dressed as a gRPC call: one full-duplex POST with
 // Content-Type application/grpc and gRPC message framing on both directions.
-func (b *BipTCP) dialXHTTPGrpc(hc *http.Client, tr *http.Transport, ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
+func (b *TCP) dialXHTTPGrpc(hc *http.Client, tr *http.Transport, ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
 	pr, pw := io.Pipe()
 	req, err := http.NewRequestWithContext(ctx, "POST", base+"?s="+sid, pr)
 	if err != nil {
@@ -441,7 +441,7 @@ func (b *BipTCP) dialXHTTPGrpc(hc *http.Client, tr *http.Transport, ctx context.
 
 // dialXHTTPPacket (packet-up) opens the long-lived downstream GET and starts the packet-up
 // upstream sender for a fresh session, returning a net.Conn over the pair.
-func (b *BipTCP) dialXHTTPPacket(hc *http.Client, tr *http.Transport, ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
+func (b *TCP) dialXHTTPPacket(hc *http.Client, tr *http.Transport, ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
 	greq, _ := http.NewRequestWithContext(ctx, "GET", base+"?s="+sid, nil)
 	setHdr(greq)
 	gresp, err := hc.Do(greq)
@@ -488,7 +488,7 @@ type xhttpSession struct {
 
 // xhttpGetOrCreate returns the session for sid, creating it (with a fresh upstream pipe and a
 // watchdog that reaps a session whose GET never arrives) on first sight.
-func (b *BipTCP) xhttpGetOrCreate(sid string) *xhttpSession {
+func (b *TCP) xhttpGetOrCreate(sid string) *xhttpSession {
 	b.xhMu.Lock()
 	defer b.xhMu.Unlock()
 	if s := b.xhSessions[sid]; s != nil {
@@ -535,7 +535,7 @@ func (s *xhttpSession) deliver(seq uint64, data []byte) {
 	}
 }
 
-func (s *xhttpSession) close(b *BipTCP, sid string) {
+func (s *xhttpSession) close(b *TCP, sid string) {
 	s.end.Do(func() {
 		close(s.done)
 		s.upW.Close()
@@ -550,7 +550,7 @@ func (s *xhttpSession) close(b *BipTCP, sid string) {
 // body carries gRPC message framing and the response
 // presents as gRPC (Content-Type application/grpc + a grpc-status trailer on clean close), so a
 // CDN proxies it as a gRPC call (h2c to the origin, streamed, not buffered).
-func (b *BipTCP) serveXHTTPGrpc(w http.ResponseWriter, r *http.Request) {
+func (b *TCP) serveXHTTPGrpc(w http.ResponseWriter, r *http.Request) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "", http.StatusInternalServerError)
@@ -576,7 +576,7 @@ func (b *BipTCP) serveXHTTPGrpc(w http.ResponseWriter, r *http.Request) {
 // Content-Type application/grpc. packet-up uses a GET (downstream body, drives handleServerConn
 // once) plus seq-tagged POSTs (?seq=N) fed into the upstream. The server auto-detects the style
 // per request, so a grpc client and a packet client both work against one endpoint.
-func (b *BipTCP) xhttpHandler(w http.ResponseWriter, r *http.Request) {
+func (b *TCP) xhttpHandler(w http.ResponseWriter, r *http.Request) {
 	sid := r.URL.Query().Get("s")
 	if len(sid) != 32 || strings.Trim(sid, "0123456789abcdef") != "" {
 		http.Error(w, "Not Found", http.StatusNotFound) // a probe/scanner sees a plain 404
@@ -618,14 +618,14 @@ func (b *BipTCP) xhttpHandler(w http.ResponseWriter, r *http.Request) {
 		ra: strAddr(r.RemoteAddr), la: strAddr("xhttp-server"),
 		closeFn: func() { s.close(b, sid) },
 	}
-	// Drive the authenticated bip session once (the GET owns the downstream writer).
+	// Drive the authenticated core session once (the GET owns the downstream writer).
 	s.start.Do(func() { go b.handleServerConn(conn) })
 	<-s.done // hold the GET open (streaming downstream) until the session ends
 }
 
 // runXHTTPServer serves the xhttp endpoint until Close. A non-matching path/probe gets a plain
 // 404 from the handler, so the port looks like an ordinary idle web endpoint.
-func (b *BipTCP) runXHTTPServer() {
+func (b *TCP) runXHTTPServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", b.xhttpHandler)
 	// Wrap in an h2c handler so a CDN can reach us over HTTP/2 cleartext. Cloudflare connects to
@@ -634,6 +634,6 @@ func (b *BipTCP) runXHTTPServer() {
 	// h2c falls through to HTTP/1.1 for packet-up, so every mode shares this one plaintext listener.
 	b.httpSrv = &http.Server{Handler: h2c.NewHandler(mux, &http2.Server{})}
 	if err := b.httpSrv.Serve(b.ln); err != nil && !b.closed.Load() {
-		log.Printf("bip/xhttp: server: %v", err)
+		log.Printf("core/xhttp: server: %v", err)
 	}
 }

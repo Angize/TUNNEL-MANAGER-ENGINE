@@ -89,8 +89,9 @@ func main() {
 	log.Printf("tnl-core %s: tun=%s addr=%s mtu=%d cipher=%s role=%s%s",
 		version, dev.Name, cfg.TunAddr, cfg.MTU, cipherName, cfg.Role, gsoTag)
 
-	// carrier is satisfied by both the UDP (packet.Bip) and TCP (packet.BipTCP)
-	// bip implementations; cfg.Transport selects which one is built.
+	// carrier is satisfied by all four core implementations — UDP (packet.UDP),
+	// TCP-family (packet.TCP), raw (packet.Raw) and flux (packet.Flux);
+	// cfg.Transport selects which one is built.
 	type carrier interface {
 		Run() error
 		Close() error
@@ -123,7 +124,7 @@ func main() {
 	case "raw":
 		switch cfg.Role {
 		case "server":
-			b, err = packet.ListenRaw(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile, cfg.SpoofPeer, cfg.SpoofDst, cfg.Fec, cfg.FecData, cfg.FecParity)
+			b, err = packet.ListenRaw(cfg.Listen, dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher, cfg.RawProfile, cfg.RealPeer, cfg.SpoofDst, cfg.Fec, cfg.FecData, cfg.FecParity)
 			if err == nil {
 				log.Printf("tnl-core: listening (core/raw:%s%s%s) on %s", cfg.RawProfile, obfsTag, fecTag, cfg.Listen)
 			}

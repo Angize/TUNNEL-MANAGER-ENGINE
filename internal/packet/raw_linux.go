@@ -1,9 +1,9 @@
 //go:build linux
 
-// This file implements the "raw" transport: the same bip frames as the UDP
-// carrier (bip.go), but each frame is wrapped in a raw-IP profile header
+// This file implements the "raw" transport: the same core frames as the UDP
+// carrier (udp.go), but each frame is wrapped in a raw-IP profile header
 // (rawEncap) and shipped over a raw IPv4 socket of the profile's protocol
-// number instead of over UDP. It mirrors Bip's structure — ephemeral X25519
+// number instead of over UDP. It mirrors UDP's structure — ephemeral X25519
 // handshake, replay guard, obfs and clear/crypto modes — so only the socket and
 // the per-frame profile wrap differ.
 //
@@ -150,7 +150,7 @@ func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bo
 // ListenRaw (server role) binds a raw socket of the profile's protocol and waits
 // to learn the peer from the first authenticated frame. listenIP may be empty,
 // "0.0.0.0", a plain IPv4, or an "ip:port" (the port is ignored).
-func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofPeer, spoofDst string, fec bool, fecData, fecParity int) (*Raw, error) {
+func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, realPeer, spoofDst string, fec bool, fecData, fecParity int) (*Raw, error) {
 	proto, ok := rawProtoFor(profile)
 	if !ok {
 		return nil, fmt.Errorf("raw: unknown profile %q", profile)
@@ -167,11 +167,11 @@ func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoO
 	}
 	r := newRaw(conn, dev, ka, obfs, cryptoOn, psk, cipher, profile, false)
 	r.proto = proto
-	if spoofPeer != "" { // client forges its source, so we can't learn it — reply to this real IP
-		pip := parseIP4(hostOnly(spoofPeer))
+	if realPeer != "" { // client forges its source, so we can't learn it — reply to this real IP
+		pip := parseIP4(hostOnly(realPeer))
 		if pip == nil {
 			conn.Close()
-			return nil, fmt.Errorf("raw: spoof_peer %q is not an IPv4 address", spoofPeer)
+			return nil, fmt.Errorf("raw: real_peer_ip %q is not an IPv4 address", realPeer)
 		}
 		r.fixedPeer = pip
 		r.peer.Store(&net.IPAddr{IP: pip})
@@ -727,7 +727,7 @@ func (r *Raw) dispatch(typ byte, payload []byte, addr *net.IPAddr) {
 // sessionStale reports that the client has heard nothing authenticated from the server for long
 // enough that the peer most likely restarted with a fresh session, so the client should drop its
 // dead session and re-handshake. Without it a SERVER restart wedges the tunnel: the client keeps
-// pinging under a key the fresh server can't open and never re-initiates. See Bip.sessionStale.
+// pinging under a key the fresh server can't open and never re-initiates. See UDP.sessionStale.
 func (r *Raw) sessionStale() bool {
 	last := r.lastRx.Load()
 	if last == 0 {

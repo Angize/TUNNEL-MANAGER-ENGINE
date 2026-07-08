@@ -1,4 +1,4 @@
-// This file implements the "bip" carrier over TCP. It mirrors bip.go (same
+// This file implements the core carrier over TCP. It mirrors udp.go (same
 // type frame and Sealer contract) but adapts to a byte stream.
 //
 // Legacy framing (obfs off) — length-prefixed so the reader can reframe:
@@ -17,7 +17,7 @@
 //	           [2:]  AEAD-sealed [type][realLen][payload][random-pad]
 //
 // Roles: the "server" listens and accepts; the "client" dials and reconnects
-// automatically with a short backoff. Because a bip tunnel is a single
+// automatically with a short backoff. Because a core tunnel is a single
 // point-to-point link, only one connection is active at a time — a new accepted
 // connection replaces (and closes) the previous one. A single TUN reader feeds
 // whichever connection is currently live via an atomic pointer, so no L3 packet
@@ -68,7 +68,7 @@ const (
 	maxPreAuthConns = 128
 )
 
-var errDesync = errors.New("bip/tcp: stream desync")
+var errDesync = errors.New("core/tcp: stream desync")
 
 // connFramer wraps a stream connection and owns the seal<->frame transform in
 // both directions. A write lock lets the TUN reader and the keepalive loop emit
@@ -243,8 +243,8 @@ func (cf *connFramer) readFrame() (typ byte, session uint64, seq uint64, payload
 	return typ, 0, 0, nil, nil
 }
 
-// BipTCP carries L3 packets between a TUN device and a TCP peer.
-type BipTCP struct {
+// TCP carries L3 packets between a TUN device and a TCP peer.
+type TCP struct {
 	dev       *tun.Device
 	cryptoOn  bool
 	cipher    string
@@ -271,11 +271,11 @@ type BipTCP struct {
 	pool   *wsPool       // client: rotating edge pool (nil = single fixed edge above)
 	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
 
-	// xhttp carrier (transport "ws" with ws_xhttp): the bip stream rides an HTTP request
+	// xhttp carrier (transport "ws" with ws_xhttp): the core stream rides an HTTP request
 	// pair (packet-up: GET-down + seq-POSTs-up) or a single full-duplex request
 	// (stream-one) instead of a WebSocket upgrade, so it passes CDNs that block WebSocket.
 	// Same fronting fields (wsHost/wsTLS/wsECH/wsPath) apply. Because the client carries
-	// bip frames directly over these requests (the HTTP layer replaces the WS upgrade),
+	// core frames directly over these requests (the HTTP layer replaces the WS upgrade),
 	// the server must NOT run wsServerHandshake on an xhttp conn — see handleServerConn.
 	xhttp      bool
 	xhMode     string       // client: "stream" (single full-duplex request) else packet-up
@@ -299,11 +299,11 @@ type BipTCP struct {
 // SetSourceIP pins the client's outbound dials to a specific source IP (the node's own
 // registered IP), so on a multi-IP host the peer/CDN sees that IP instead of the kernel's
 // default primary. No effect on the server side or on raw/flux carriers. Call before Run.
-func (b *BipTCP) SetSourceIP(ip string) { b.bindIP = ip }
+func (b *TCP) SetSourceIP(ip string) { b.bindIP = ip }
 
 // dialer returns a net.Dialer that, when a source IP is pinned, binds the outbound socket to
 // it (LocalAddr). A malformed or non-local IP is ignored (falls back to the kernel default).
-func (b *BipTCP) dialer(timeout time.Duration) *net.Dialer {
+func (b *TCP) dialer(timeout time.Duration) *net.Dialer {
 	d := &net.Dialer{Timeout: timeout}
 	if b.bindIP != "" {
 		if ip := net.ParseIP(b.bindIP); ip != nil {
@@ -324,17 +324,17 @@ func idleFor(keepalive time.Duration) time.Duration {
 // DialTCP (client role) targets peerAddr and reconnects on drop. When cover is
 // set the connection is wrapped in a Chrome-fingerprinted TLS session presenting
 // coverSNI, so it looks like HTTPS on the wire.
-func DialTCP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, cover bool, coverSNI string) (*BipTCP, error) {
-	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+func DialTCP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, cover bool, coverSNI string) (*TCP, error) {
+	return &TCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		cover: cover, coverSNI: coverSNI,
 		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
 }
 
 // DialWS (client role) is DialTCP over a WebSocket carrier: it dials peerAddr (a
 // CDN edge or the origin), optionally wraps it in TLS (wsTLS, ServerName=wsHost),
-// then performs the WebSocket upgrade with Host=wsHost before the bip framing runs.
-func DialWS(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher, wsHost, wsPath string, wsTLS bool, wsECH []byte) (*BipTCP, error) {
-	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+// then performs the WebSocket upgrade with Host=wsHost before the core framing runs.
+func DialWS(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher, wsHost, wsPath string, wsTLS bool, wsECH []byte) (*TCP, error) {
+	return &TCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		ws: true, wsHost: wsHost, wsPath: wsPath, wsTLS: wsTLS, wsECH: wsECH,
 		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
 }
@@ -343,8 +343,8 @@ func DialWS(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cry
 // combinations from the pool (each SNI with its own ECH), moving before any single
 // edge is fingerprinted and burning a blocked one. rotate is the proactive rotation
 // interval (0 = rotate only on failure). wsTLS is always on (the pool is a wss set).
-func DialWSPool(dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, pool *wsPool, rotate time.Duration, xhttp bool, xhMode string) (*BipTCP, error) {
-	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+func DialWSPool(dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, pool *wsPool, rotate time.Duration, xhttp bool, xhMode string) (*TCP, error) {
+	return &TCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		ws: true, wsTLS: true, xhttp: xhttp, xhMode: xhMode, pool: pool, rotate: rotate,
 		idle: idleFor(keepalive), isClient: true, addr: "pool", closeCh: make(chan struct{})}, nil
 }
@@ -361,20 +361,20 @@ func newWSPoolFromCfg(ips []string, snis []wsSNIEntry, autoBurn bool, statusPath
 // DialXHTTP (client role) is DialWS over the xhttp carrier: it reaches the edge with the
 // same wss/ECH/Host, but carries the stream over a GET(down)+POST(up) pair rather than a
 // WebSocket upgrade, so it passes a CDN that blocks WebSocket.
-func DialXHTTP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher, wsHost, wsPath string, wsTLS bool, wsECH []byte, xhMode string) (*BipTCP, error) {
-	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+func DialXHTTP(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher, wsHost, wsPath string, wsTLS bool, wsECH []byte, xhMode string) (*TCP, error) {
+	return &TCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		ws: true, xhttp: true, xhMode: xhMode, wsHost: wsHost, wsPath: wsPath, wsTLS: wsTLS, wsECH: wsECH,
 		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
 }
 
 // ListenXHTTP (server role) serves the xhttp endpoint over plain HTTP (a CDN in front
 // terminates TLS). A non-session request gets a plausible 404.
-func ListenXHTTP(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*BipTCP, error) {
+func ListenXHTTP(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*TCP, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
-	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+	return &TCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		ws: true, xhttp: true, idle: idleFor(keepalive), addr: listenAddr, ln: ln, closeCh: make(chan struct{}),
 		preAuth: make(chan struct{}, maxPreAuthConns), xhSessions: make(map[string]*xhttpSession)}, nil
 }
@@ -382,12 +382,12 @@ func ListenXHTTP(listenAddr string, dev *tun.Device, keepalive time.Duration, ob
 // ListenWS (server role) accepts WebSocket connections (plain HTTP upgrade; a CDN
 // in front terminates TLS and forwards the WebSocket to us). A non-WS request gets
 // a plausible 404 and is dropped, so the port looks like an ordinary web endpoint.
-func ListenWS(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*BipTCP, error) {
+func ListenWS(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string) (*TCP, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
-	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+	return &TCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		ws: true, idle: idleFor(keepalive), addr: listenAddr, ln: ln, closeCh: make(chan struct{}),
 		preAuth: make(chan struct{}, maxPreAuthConns)}, nil
 }
@@ -397,12 +397,12 @@ func ListenWS(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs,
 // their ClientHello and transparently proxies every other connection (probes,
 // scanners, the censor) to the real coverSNI:443, so active probing sees that
 // site's genuine certificate.
-func ListenTCP(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, cover bool, coverSNI string) (*BipTCP, error) {
+func ListenTCP(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, cover bool, coverSNI string) (*TCP, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, err
 	}
-	b := &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+	b := &TCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		cover: cover, coverSNI: coverSNI,
 		idle: idleFor(keepalive), addr: listenAddr, ln: ln, closeCh: make(chan struct{}),
 		preAuth: make(chan struct{}, maxPreAuthConns)}
@@ -420,7 +420,7 @@ func ListenTCP(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs
 
 // Run blocks until Close is called. The TUN reader runs for the whole lifetime;
 // the connection side either accepts (server) or dials-with-retry (client).
-func (b *BipTCP) Run() error {
+func (b *TCP) Run() error {
 	go b.tunLoop()
 	if b.isClient {
 		go b.keepaliveLoop()
@@ -434,7 +434,7 @@ func (b *BipTCP) Run() error {
 }
 
 // Close stops the carrier and unblocks Run.
-func (b *BipTCP) Close() error {
+func (b *TCP) Close() error {
 	if b.closed.Swap(true) {
 		return nil
 	}
@@ -454,13 +454,13 @@ func (b *BipTCP) Close() error {
 // newFramer builds a connFramer with NO sealer yet. In clear mode it stays nil;
 // in crypto mode the ephemeral handshake installs the session sealer before any
 // framed data is read or written.
-func (b *BipTCP) newFramer(conn net.Conn) *connFramer {
+func (b *TCP) newFramer(conn net.Conn) *connFramer {
 	return &connFramer{conn: conn, r: bufio.NewReaderSize(conn, readBufSize), obfs: b.obfs, psk: b.psk}
 }
 
 // clientHandshake (client) sends an init and reads the responder's reply, then
 // installs the ephemeral session sealer. Runs under the caller's read deadline.
-func (b *BipTCP) clientHandshake(cf *connFramer) error {
+func (b *TCP) clientHandshake(cf *connFramer) error {
 	ci, err := crypto.GenerateEphemeral()
 	if err != nil {
 		return err
@@ -486,7 +486,7 @@ func (b *BipTCP) clientHandshake(cf *connFramer) error {
 
 // serverHandshake (server) reads an init, authenticates it, installs the session
 // sealer, and replies. A wrong PSK / probe fails ParseInit and gets no response.
-func (b *BipTCP) serverHandshake(cf *connFramer) error {
+func (b *TCP) serverHandshake(cf *connFramer) error {
 	init := make([]byte, crypto.HandshakeSize)
 	if _, err := io.ReadFull(cf.r, init); err != nil {
 		return err
@@ -511,7 +511,7 @@ func (b *BipTCP) serverHandshake(cf *connFramer) error {
 // acceptLoop (server) hands each new connection to a per-connection goroutine.
 // On a transient Accept error (e.g. EMFILE from an fd flood) it backs off briefly
 // instead of busy-spinning the CPU and flooding the log.
-func (b *BipTCP) acceptLoop() {
+func (b *TCP) acceptLoop() {
 	var backoff time.Duration
 	for {
 		conn, err := b.ln.Accept()
@@ -524,7 +524,7 @@ func (b *BipTCP) acceptLoop() {
 			} else if backoff < time.Second {
 				backoff *= 2
 			}
-			log.Printf("bip/tcp: accept error: %v (backoff %v)", err, backoff)
+			log.Printf("core/tcp: accept error: %v (backoff %v)", err, backoff)
 			if b.sleep(backoff) {
 				return
 			}
@@ -542,7 +542,7 @@ func (b *BipTCP) acceptLoop() {
 // simply connecting. In obfs mode the salt is also withheld until then, so the
 // server stays invisible to an active probe. Only clear mode (no crypto) — which
 // offers no authentication by definition — publishes at once.
-func (b *BipTCP) handleServerConn(conn net.Conn) {
+func (b *TCP) handleServerConn(conn net.Conn) {
 	// Take a pre-auth permit; shed load if too many handshakes are already in
 	// flight. The permit is released the moment the connection becomes live
 	// (authenticated), so it only bounds the UNAUTHENTICATED window, never the
@@ -563,9 +563,9 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 	defer release()
 
 	if b.ws && !b.xhttp { // WebSocket upgrade; a non-WS probe gets a 404 and is dropped
-		// (xhttp is excluded: its conn already carries bip frames — the HTTP GET/POST pair
+		// (xhttp is excluded: its conn already carries core frames — the HTTP GET/POST pair
 		// or the single full-duplex request replaced the WS upgrade — so a ws handshake here
-		// would misread the client's bip handshake as an HTTP request and drop the session.)
+		// would misread the client's core handshake as an HTTP request and drop the session.)
 		r, werr := wsServerHandshake(conn, time.Now().Add(handshakeTimeout))
 		if werr != nil {
 			conn.Close()
@@ -586,7 +586,7 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 	}
 	cf := b.newFramer(conn)
 	if !b.cryptoOn {
-		log.Printf("bip/tcp: peer connected from %s (clear)", conn.RemoteAddr())
+		log.Printf("core/tcp: peer connected from %s (clear)", conn.RemoteAddr())
 		if old := b.cur.Swap(cf); old != nil {
 			old.conn.Close()
 		}
@@ -614,7 +614,7 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 			return
 		}
 	}
-	log.Printf("bip/tcp: peer connected from %s", conn.RemoteAddr())
+	log.Printf("core/tcp: peer connected from %s", conn.RemoteAddr())
 	if old := b.cur.Swap(cf); old != nil {
 		old.conn.Close()
 	}
@@ -629,7 +629,7 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 // edge rejects a stale ECH config it returns a fresh RetryConfigList — we redial
 // once and retry with it, so Cloudflare's periodic ECH-key rotation self-heals
 // without a rebuild. On any failure the passed (or redialed) conn is closed.
-func (b *BipTCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte) (net.Conn, error) {
+func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte) (net.Conn, error) {
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {
 		cfg := &tls.Config{ServerName: host}
@@ -665,7 +665,7 @@ func (b *BipTCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte) (ne
 //	dial timeout / refused → the IP is unreachable/blocked  → burn IP
 //	TLS handshake failure  → the SNI drew a reset (or bad cert) → burn SNI
 //	WS upgrade not 101      → the domain/zone/account blocks WS → burn SNI
-func (b *BipTCP) establishWS() (net.Conn, string, error) {
+func (b *TCP) establishWS() (net.Conn, string, error) {
 	dialAddr, host, ech, path := b.addr, b.wsHost, b.wsECH, b.wsPath
 	if b.pool != nil {
 		ip, sni, ok := b.pool.current()
@@ -712,7 +712,7 @@ func (b *BipTCP) establishWS() (net.Conn, string, error) {
 // ws pool it rotates edges: each attempt uses the pool's current (IP × SNI), a
 // failure burns the offending IP/SNI (establishWS), and a proactive timer tears the
 // connection down after b.rotate so the client moves before the edge is fingerprinted.
-func (b *BipTCP) dialLoop() {
+func (b *TCP) dialLoop() {
 	for {
 		if b.closed.Load() {
 			return
@@ -729,7 +729,7 @@ func (b *BipTCP) dialLoop() {
 				c, edge, err = b.establishWS()
 			}
 			if err != nil {
-				log.Printf("bip/ws: connect via %s failed: %v", edge, err)
+				log.Printf("core/ws: connect via %s failed: %v", edge, err)
 				if b.sleep(1 * time.Second) {
 					return
 				}
@@ -739,7 +739,7 @@ func (b *BipTCP) dialLoop() {
 		} else {
 			c, err := b.dialer(10 * time.Second).Dial("tcp", b.addr)
 			if err != nil {
-				log.Printf("bip/tcp: dial %s failed: %v", b.addr, err)
+				log.Printf("core/tcp: dial %s failed: %v", b.addr, err)
 				if b.sleep(1 * time.Second) {
 					return
 				}
@@ -749,7 +749,7 @@ func (b *BipTCP) dialLoop() {
 				tconn, cerr := tlscover.ClientConn(c, b.coverSNI, b.psk, time.Now().Add(handshakeTimeout))
 				if cerr != nil {
 					c.Close()
-					log.Printf("bip/tcp: tls cover to %s failed: %v", b.addr, cerr)
+					log.Printf("core/tcp: tls cover to %s failed: %v", b.addr, cerr)
 					if b.sleep(1 * time.Second) {
 						return
 					}
@@ -779,7 +779,7 @@ func (b *BipTCP) dialLoop() {
 				continue
 			}
 		}
-		log.Printf("bip/tcp: connected to %s", label)
+		log.Printf("core/tcp: connected to %s", label)
 		b.cur.Store(cf)
 		cc := conn
 		b.curConn.Store(&cc) // expose the live conn so RotateIP/RotateSNI can drop it
@@ -814,10 +814,10 @@ func (b *BipTCP) dialLoop() {
 // a single dimension and drop the current carrier connection, so dialLoop immediately
 // re-dials on the new edge. The TUN device stays up throughout (only the sub-second carrier
 // redial happens) — no rebuild, no interface teardown. No-op unless this is a pooled client.
-func (b *BipTCP) RotateIP()  { b.rotate1(func() { b.pool.advanceIP() }) }
-func (b *BipTCP) RotateSNI() { b.rotate1(func() { b.pool.advanceSNI() }) }
+func (b *TCP) RotateIP()  { b.rotate1(func() { b.pool.advanceIP() }) }
+func (b *TCP) RotateSNI() { b.rotate1(func() { b.pool.advanceSNI() }) }
 
-func (b *BipTCP) rotate1(step func()) {
+func (b *TCP) rotate1(step func()) {
 	if b.pool == nil {
 		return
 	}
@@ -828,7 +828,7 @@ func (b *BipTCP) rotate1(step func()) {
 }
 
 // handleFrame dispatches a single decoded frame.
-func (b *BipTCP) handleFrame(cf *connFramer, typ byte, payload []byte) {
+func (b *TCP) handleFrame(cf *connFramer, typ byte, payload []byte) {
 	switch typ {
 	case typePing:
 		_ = cf.writeFrame(typePong, nil)
@@ -836,7 +836,7 @@ func (b *BipTCP) handleFrame(cf *connFramer, typ byte, payload []byte) {
 		// keepalive ack
 	case typeData:
 		if _, err := b.dev.Write(payload); err != nil {
-			log.Printf("bip/tcp: tun write error: %v", err)
+			log.Printf("core/tcp: tun write error: %v", err)
 		}
 	}
 }
@@ -846,7 +846,7 @@ func (b *BipTCP) handleFrame(cf *connFramer, typ byte, payload []byte) {
 // and the server converge on "no live connection" without extra bookkeeping.
 // The read deadline is refreshed every frame in ALL modes so a peer that dies
 // without a FIN/RST is reaped instead of pinning a goroutine forever.
-func (b *BipTCP) serve(cf *connFramer) {
+func (b *TCP) serve(cf *connFramer) {
 	for {
 		cf.conn.SetReadDeadline(time.Now().Add(b.idle))
 		typ, session, seq, payload, err := cf.readFrame()
@@ -861,24 +861,24 @@ func (b *BipTCP) serve(cf *connFramer) {
 	}
 }
 
-func (b *BipTCP) onConnErr(cf *connFramer, err error) {
+func (b *TCP) onConnErr(cf *connFramer, err error) {
 	cf.conn.Close()
 	b.cur.CompareAndSwap(cf, nil)
 	if !b.closed.Load() {
-		log.Printf("bip/tcp: connection closed: %v", err)
+		log.Printf("core/tcp: connection closed: %v", err)
 	}
 }
 
 // tunLoop reads L3 packets from TUN and writes them to whichever connection is
 // currently live. Packets that arrive while no connection is up are dropped
 // (the peer retransmits at the L4 layer).
-func (b *BipTCP) tunLoop() {
+func (b *TCP) tunLoop() {
 	buf := make([]byte, maxDatagram)
 	for {
 		n, err := b.dev.Read(buf)
 		if err != nil {
 			if !b.closed.Load() {
-				log.Printf("bip/tcp: tun read error: %v", err)
+				log.Printf("core/tcp: tun read error: %v", err)
 			}
 			return
 		}
@@ -895,7 +895,7 @@ func (b *BipTCP) tunLoop() {
 // keepaliveLoop (client) pings the server over the live connection so idle
 // tunnels do not get reaped by stateful middleboxes. In obfs mode the period is
 // jittered so it does not emit on a fixed clock.
-func (b *BipTCP) keepaliveLoop() {
+func (b *TCP) keepaliveLoop() {
 	for {
 		// Jitter in ALL modes: a fixed keepalive clock is a passive timing
 		// fingerprint even without obfs framing.
@@ -913,7 +913,7 @@ func (b *BipTCP) keepaliveLoop() {
 }
 
 // sleep waits d or returns true if Close fired during the wait.
-func (b *BipTCP) sleep(d time.Duration) bool {
+func (b *TCP) sleep(d time.Duration) bool {
 	select {
 	case <-b.closeCh:
 		return true

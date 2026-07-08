@@ -1,5 +1,5 @@
 // Server-side compute-DoS cache for handshake inits, shared by the datagram
-// carriers (bip.go, bip_raw_linux.go, flux_linux.go). Each server re-sends the
+// carriers (udp.go, raw_linux.go, flux_linux.go). Each server re-sends the
 // response it already computed for a recently-seen init instead of re-running a
 // fresh ECDH+HKDF (GenerateEphemeral+SessionSealer) per packet.
 //

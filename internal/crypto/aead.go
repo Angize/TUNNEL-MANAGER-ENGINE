@@ -1,4 +1,4 @@
-// Package crypto provides the AEAD sealing used by the bip carrier.
+// Package crypto provides the AEAD sealing used by the core carrier.
 //
 // Two AEADs are supported and selected by name: AES-256-GCM (stdlib, fastest on
 // AES-NI hosts) and ChaCha20-Poly1305 (constant-time in software, faster on
@@ -97,7 +97,7 @@ func ResolveCipher(name string) string {
 // direction) and the PSK. v2 domain: keys are NOT compatible with the old
 // single-key scheme, which is intentional — both ends upgrade together.
 func deriveKey(psk, label string, n int) []byte {
-	k := sha256.Sum256([]byte("tnl-bip|v2|" + label + "|" + psk))
+	k := sha256.Sum256([]byte("tnl-core|v2|" + label + "|" + psk))
 	return k[:n] // n bytes (16 for AES-128, 32 for the rest)
 }
 

@@ -1,6 +1,6 @@
 //go:build linux
 
-// flux transport: the same sealed bip frames as the other carriers, but the raw
+// flux transport: the same sealed core frames as the other carriers, but the raw
 // IPv4 carrier PROTOCOL rotates every epoch on a schedule both ends derive from
 // the wall clock (see flux.go) — a signal-free moving target. Because the
 // protocol moves, flux cannot bind a fixed-protocol socket the way the raw

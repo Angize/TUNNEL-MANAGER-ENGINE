@@ -1,4 +1,4 @@
-// Package tlscover gives a bip TCP connection a REALITY-style TLS cover so it not
+// Package tlscover gives a core TCP connection a REALITY-style TLS cover so it not
 // only looks like HTTPS to passive DPI but also survives ACTIVE probing (the
 // censor connecting to the server itself and comparing) — the technique Iran's
 // filtering uses.
@@ -8,7 +8,7 @@
 // so invisible). The server reads the ClientHello before answering:
 //
 //   - token valid (our client)  -> the server terminates TLS itself (a throwaway
-//     cert the client does not verify) and the bip/PSK handshake runs inside.
+//     cert the client does not verify) and the core/PSK handshake runs inside.
 //   - token absent/invalid (a probe, a real browser, the censor) -> the server
 //     transparently PROXIES the whole connection to the REAL destination site
 //     (dest:443) and relays bytes. The prober gets that site's genuine
@@ -57,7 +57,7 @@ var (
 )
 
 func authKey(psk string) []byte {
-	k := sha256.Sum256([]byte("tnl-bip|v2|reality-auth|" + psk))
+	k := sha256.Sum256([]byte("tnl-core|v2|reality-auth|" + psk))
 	return k[:]
 }
 

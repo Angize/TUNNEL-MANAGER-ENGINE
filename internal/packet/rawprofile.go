@@ -1,5 +1,5 @@
 // Raw-IP encapsulation profiles for the "raw" transport. Each profile wraps a
-// sealed bip frame in a different IP-layer carrier so the tunnel mimics ordinary
+// sealed core frame in a different IP-layer carrier so the tunnel mimics ordinary
 // IPIP / GRE / ICMP / TCP / UDP traffic — or "bip", our native minimal framing.
 //
 // The sealed frame (the AEAD ciphertext, identical to the UDP/TCP carriers) is

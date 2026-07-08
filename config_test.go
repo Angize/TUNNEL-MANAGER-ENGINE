@@ -76,9 +76,9 @@ func TestSpoofValidation(t *testing.T) {
 		t.Error("spoofing accepted on a non-bip profile")
 	}
 	c = validRaw()
-	c.SpoofPeer = "198.51.100.9"
+	c.RealPeer = "198.51.100.9"
 	if err := c.validate(); err != nil {
-		t.Errorf("valid spoof_peer rejected: %v", err)
+		t.Errorf("valid real_peer_ip rejected: %v", err)
 	}
 
 	// spoof_dst_ip (decoy): valid on a client, rejected when malformed or on a non-bip profile.
@@ -98,18 +98,18 @@ func TestSpoofValidation(t *testing.T) {
 	if err := c.validate(); err == nil {
 		t.Error("spoof_dst_ip accepted on a non-bip profile")
 	}
-	// A decoy server must know the client's real IP to reply to (spoof_peer).
+	// A decoy server must know the client's real IP to reply to (real_peer_ip).
 	c = validRaw()
 	c.Role = "server"
 	c.Listen = "0.0.0.0:9000"
 	c.Peer = ""
 	c.SpoofDst = "185.51.200.10"
 	if err := c.validate(); err == nil {
-		t.Error("spoof_dst_ip on a server without spoof_peer accepted")
+		t.Error("spoof_dst_ip on a server without real_peer_ip accepted")
 	}
-	c.SpoofPeer = "198.51.100.9"
+	c.RealPeer = "198.51.100.9"
 	if err := c.validate(); err != nil {
-		t.Errorf("decoy server with spoof_peer rejected: %v", err)
+		t.Errorf("decoy server with real_peer_ip rejected: %v", err)
 	}
 }
 

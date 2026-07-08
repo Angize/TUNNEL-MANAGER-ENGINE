@@ -1,4 +1,4 @@
-// This file implements anti-replay protection for the bip carriers. Every
+// This file implements anti-replay protection for the core carriers. Every
 // crypto-sealed frame carries an authenticated (session, seq) pair in its nonce
 // (see crypto.Sealer): seq strictly increases within a sender's process and
 // session changes when the sender restarts. A receiver rejects any frame whose
@@ -16,7 +16,7 @@ const replayWindow = 64
 // replayGuard tracks the highest sequence accepted for the current peer session
 // plus a bitmap of the preceding replayWindow-1 sequences. It is safe for
 // concurrent use by a single receive loop (the only caller), but the mutex-free
-// design relies on ok() not being called from two goroutines at once; the bip
+// design relies on ok() not being called from two goroutines at once; the core
 // carriers each drive it from exactly one reader goroutine.
 type replayGuard struct {
 	haveSession bool

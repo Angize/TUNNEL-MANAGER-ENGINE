@@ -27,7 +27,7 @@ type WSPoolSNI struct {
 
 // DialWSPoolCfg decodes the config's clean IP/SNI lists into a pool and returns a ws
 // client that rotates over it. rotate is the proactive-rotation interval.
-func DialWSPoolCfg(dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, ips []string, snis []WSPoolSNI, rotate time.Duration, autoBurn bool, statusPath string, xhttp bool, xhMode string) (*BipTCP, error) {
+func DialWSPoolCfg(dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, ips []string, snis []WSPoolSNI, rotate time.Duration, autoBurn bool, statusPath string, xhttp bool, xhMode string) (*TCP, error) {
 	entries := make([]wsSNIEntry, 0, len(snis))
 	for _, s := range snis {
 		var ech []byte

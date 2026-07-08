@@ -78,7 +78,7 @@ type carrier interface {
 	Close() error
 }
 
-// runTunnel drives a full server<->client bip tunnel over a real socket for the
+// runTunnel drives a full server<->client core tunnel over a real socket for the
 // given transport/obfs, injecting a packet each way and asserting it arrives
 // intact — exercising seal/open, counter nonce, anti-replay, peer learning, and
 // (tcp) handshake, the paths a live node runs.

@@ -1,5 +1,5 @@
 // This file implements the optional "obfs" (anti-DPI) framing shared by both
-// bip carriers. When obfuscation is on the wire carries NO constant bytes:
+// core carriers. When obfuscation is on the wire carries NO constant bytes:
 //
 //   - The frame type (data/ping/pong) is folded into the AEAD-sealed plaintext
 //     instead of riding in a cleartext header, so the old constant magic byte
@@ -46,7 +46,7 @@ const (
 // deriveObfsKey produces the 32-byte ChaCha20 key used to mask TCP length
 // prefixes. It is domain-separated from the AEAD key so the two never collide.
 func deriveObfsKey(psk string) []byte {
-	k := sha256.Sum256([]byte("tnl-bip-obfs|v1|len|" + psk))
+	k := sha256.Sum256([]byte("tnl-core-obfs|v1|len|" + psk))
 	return k[:32]
 }
 

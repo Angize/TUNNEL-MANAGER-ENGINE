@@ -85,7 +85,7 @@ func echoXHTTP() *httptest.Server {
 func TestXHTTPCarrierRoundTrip(t *testing.T) {
 	srv := echoXHTTP()
 	defer srv.Close()
-	b := &BipTCP{addr: srv.Listener.Addr().String(), wsPath: "/", wsTLS: false}
+	b := &TCP{addr: srv.Listener.Addr().String(), wsPath: "/", wsTLS: false}
 	conn, _, err := b.establishXHTTP()
 	if err != nil {
 		t.Fatalf("establishXHTTP: %v", err)
@@ -150,8 +150,8 @@ func xhttpInject(t *testing.T, cliCtrl, srvCtrl *os.File) {
 // TestTunnelXHTTPPacketUp runs a full server<->client xhttp tunnel in packet-up mode over a real
 // (plain HTTP/1.1) socket and asserts a packet traverses each way. It is the regression test for
 // the server-side bug where handleServerConn ran wsServerHandshake on an xhttp conn (b.ws is set
-// for xhttp): the client speaks bip frames directly over the GET/POST pair, so a WS handshake
-// there misreads the bip handshake as an HTTP request and the tunnel connects but passes no data.
+// for xhttp): the client speaks core frames directly over the GET/POST pair, so a WS handshake
+// there misreads the core handshake as an HTTP request and the tunnel connects but passes no data.
 func TestTunnelXHTTPPacketUp(t *testing.T) { testTunnelXHTTP(t, "packet", false) }
 
 // TestTunnelXHTTPPacketUpObfs is the same with the length-mask obfs handshake in play.
@@ -329,7 +329,7 @@ func TestSourceIPBind(t *testing.T) {
 		seen <- c.RemoteAddr().(*net.TCPAddr).IP.String()
 		c.Close()
 	}()
-	b := &BipTCP{bindIP: "127.0.0.2"}
+	b := &TCP{bindIP: "127.0.0.2"}
 	c, err := b.dialer(2 * time.Second).Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatalf("dial with bound source: %v", err)

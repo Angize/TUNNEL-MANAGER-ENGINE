@@ -1,4 +1,4 @@
-// Package packet implements the "bip" carrier: raw L3 IP packets read from a
+// Package packet implements the core carrier: raw L3 IP packets read from a
 // TUN device, framed one-per-datagram, optionally AEAD-sealed, and shipped
 // over UDP to the peer, which writes them into its own TUN.
 //
@@ -42,7 +42,7 @@ const (
 	maxDatagram = 65535
 )
 
-// Sealer is the subset of crypto.Sealer bip needs. Open returns the authenticated
+// Sealer is the subset of crypto.Sealer core needs. Open returns the authenticated
 // (session, seq) pair from the nonce so the carrier can reject replays before
 // acting on a frame. aad carries the cleartext frame header (the type byte in
 // legacy framing) so it is authenticated and cannot be flipped on the wire; obfs
@@ -55,8 +55,8 @@ type Sealer interface {
 // sealerBox lets a *crypto.Sealer live in an atomic.Pointer.
 type sealerBox struct{ s Sealer }
 
-// Bip carries L3 packets between a TUN device and a UDP peer.
-type Bip struct {
+// UDP carries L3 packets between a TUN device and a UDP peer.
+type UDP struct {
 	conn      *net.UDPConn
 	dev       *tun.Device
 	keepalive time.Duration
@@ -89,7 +89,7 @@ type Bip struct {
 // the client keeps pinging under a key the fresh server cannot open and — because it still holds a
 // session — never re-initiates on its own. A false positive (a few lost pings on a healthy link)
 // only costs one harmless re-handshake. Only meaningful with crypto on.
-func (b *Bip) sessionStale() bool {
+func (b *UDP) sessionStale() bool {
 	last := b.lastRx.Load()
 	if last == 0 {
 		return false // no baseline yet
@@ -102,7 +102,7 @@ func (b *Bip) sessionStale() bool {
 }
 
 // Dial (client role) binds an ephemeral UDP socket and targets peerAddr.
-func Dial(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, fec bool, fecData, fecParity int) (*Bip, error) {
+func Dial(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, fec bool, fecData, fecParity int) (*UDP, error) {
 	ra, err := net.ResolveUDPAddr("udp", peerAddr)
 	if err != nil {
 		return nil, err
@@ -111,14 +111,14 @@ func Dial(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, crypt
 	if err != nil {
 		return nil, err
 	}
-	b := &Bip{conn: conn, dev: dev, keepalive: keepalive, obfs: obfs, cryptoOn: cryptoOn, psk: psk, cipher: cipher, isClient: true, closeCh: make(chan struct{})}
+	b := &UDP{conn: conn, dev: dev, keepalive: keepalive, obfs: obfs, cryptoOn: cryptoOn, psk: psk, cipher: cipher, isClient: true, closeCh: make(chan struct{})}
 	b.peer.Store(ra)
 	b.initFec(fec, fecData, fecParity)
 	return b, nil
 }
 
 // Listen (server role) binds listenAddr and waits to learn the peer.
-func Listen(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, fec bool, fecData, fecParity int) (*Bip, error) {
+func Listen(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, fec bool, fecData, fecParity int) (*UDP, error) {
 	la, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		return nil, err
@@ -127,7 +127,7 @@ func Listen(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, c
 	if err != nil {
 		return nil, err
 	}
-	b := &Bip{conn: conn, dev: dev, keepalive: keepalive, obfs: obfs, cryptoOn: cryptoOn, psk: psk, cipher: cipher, closeCh: make(chan struct{})}
+	b := &UDP{conn: conn, dev: dev, keepalive: keepalive, obfs: obfs, cryptoOn: cryptoOn, psk: psk, cipher: cipher, closeCh: make(chan struct{})}
 	b.initFec(fec, fecData, fecParity)
 	return b, nil
 }
@@ -135,8 +135,8 @@ func Listen(listenAddr string, dev *tun.Device, keepalive time.Duration, obfs, c
 // initFec wires the FEC encoder/decoder (no-op when fec is off). Data shards emit to
 // the current peer; recovered frames re-enter the normal receive path with the source
 // of the packet that completed their block.
-func (b *Bip) initFec(fec bool, fecData, fecParity int) {
-	b.fecEnc, b.fecDec = newFecPair(fec, fecData, fecParity, "bip",
+func (b *UDP) initFec(fec bool, fecData, fecParity int) {
+	b.fecEnc, b.fecDec = newFecPair(fec, fecData, fecParity, "udp",
 		func(pkt []byte) {
 			if p := b.peer.Load(); p != nil {
 				_, _ = b.conn.WriteToUDP(pkt, p)
@@ -146,7 +146,7 @@ func (b *Bip) initFec(fec bool, fecData, fecParity int) {
 }
 
 // Run blocks until one of the loops fails (e.g. the socket or device closes).
-func (b *Bip) Run() error {
+func (b *UDP) Run() error {
 	errc := make(chan error, 2)
 	go func() { errc <- b.tunToNet() }()
 	go func() { errc <- b.netToTun() }()
@@ -158,7 +158,7 @@ func (b *Bip) Run() error {
 
 // Close tears down the socket (which unblocks both loops) and stops the client
 // loop. Safe to call more than once.
-func (b *Bip) Close() error {
+func (b *UDP) Close() error {
 	b.closeOnce.Do(func() { close(b.closeCh) })
 	if b.fecEnc != nil {
 		b.fecEnc.Close() // stop the FEC flush timer before the socket goes away
@@ -166,7 +166,7 @@ func (b *Bip) Close() error {
 	return b.conn.Close()
 }
 
-func (b *Bip) sealer() Sealer {
+func (b *UDP) sealer() Sealer {
 	if box := b.session.Load(); box != nil {
 		return box.s
 	}
@@ -175,7 +175,7 @@ func (b *Bip) sealer() Sealer {
 
 // frame builds one datagram for typ/payload using the current session sealer
 // (or clear framing when crypto is off / no session yet).
-func (b *Bip) frame(typ byte, payload []byte) ([]byte, error) {
+func (b *UDP) frame(typ byte, payload []byte) ([]byte, error) {
 	s := b.sealer()
 	if b.obfs {
 		return obfsSeal(s, typ, payload, padMaxFor(typ))
@@ -199,7 +199,7 @@ func (b *Bip) frame(typ byte, payload []byte) ([]byte, error) {
 // tunToNet reads L3 packets from TUN, seals them, and sends to the peer. Packets
 // read before a session exists (crypto on, handshake not yet complete) are
 // dropped; the peer retransmits at L4.
-func (b *Bip) tunToNet() error {
+func (b *UDP) tunToNet() error {
 	buf := make([]byte, maxDatagram)
 	for {
 		n, err := b.dev.Read(buf)
@@ -215,7 +215,7 @@ func (b *Bip) tunToNet() error {
 		}
 		frame, err := b.frame(typeData, buf[:n])
 		if err != nil {
-			log.Printf("bip: seal error: %v", err)
+			log.Printf("core: seal error: %v", err)
 			continue
 		}
 		if b.fecEnc != nil {
@@ -223,7 +223,7 @@ func (b *Bip) tunToNet() error {
 			continue
 		}
 		if _, err := b.conn.WriteToUDP(frame, peer); err != nil {
-			log.Printf("bip: write error: %v", err)
+			log.Printf("core: write error: %v", err)
 		}
 	}
 }
@@ -231,7 +231,7 @@ func (b *Bip) tunToNet() error {
 // netToTun receives datagrams, authenticates them, rejects replays, updates the
 // known peer, and writes data frames into the TUN. Datagrams that do not open
 // under the current session are tried as handshake messages.
-func (b *Bip) netToTun() error {
+func (b *UDP) netToTun() error {
 	buf := make([]byte, maxDatagram)
 	for {
 		n, addr, err := b.conn.ReadFromUDP(buf)
@@ -251,7 +251,7 @@ func (b *Bip) netToTun() error {
 
 // deliver dispatches one received frame (already de-FEC'd): authenticated data in
 // crypto mode, or unauthenticated legacy framing in clear mode.
-func (b *Bip) deliver(pkt []byte, addr *net.UDPAddr) {
+func (b *UDP) deliver(pkt []byte, addr *net.UDPAddr) {
 	if addr == nil {
 		return
 	}
@@ -269,7 +269,7 @@ func (b *Bip) deliver(pkt []byte, addr *net.UDPAddr) {
 // openWith tries to open one datagram under a specific session sealer, returning the
 // authenticated frame. It touches no session/replay state, so a frame can safely be tried
 // against both the live and a pending session.
-func (b *Bip) openWith(s Sealer, pkt []byte) (typ byte, session, seq uint64, payload []byte, oerr error) {
+func (b *UDP) openWith(s Sealer, pkt []byte) (typ byte, session, seq uint64, payload []byte, oerr error) {
 	if b.obfs {
 		return obfsOpen(s, pkt)
 	}
@@ -284,7 +284,7 @@ func (b *Bip) openWith(s Sealer, pkt []byte) (typ byte, session, seq uint64, pay
 // handleCrypto is the crypto-on receive path: try the frame as data under the current
 // session; failing that, under a pending session staged by a recent init (promoting it if
 // it opens); failing that, as a handshake message.
-func (b *Bip) handleCrypto(pkt []byte, addr *net.UDPAddr) {
+func (b *UDP) handleCrypto(pkt []byte, addr *net.UDPAddr) {
 	if s := b.sealer(); s != nil {
 		if typ, session, seq, payload, oerr := b.openWith(s, pkt); oerr == nil && b.rp.ok(session, seq) {
 			// authenticated, fresh frame -> now safe to (re)learn the peer address
@@ -314,7 +314,7 @@ func (b *Bip) handleCrypto(pkt []byte, addr *net.UDPAddr) {
 
 // tryHandshake demuxes a datagram that did not open as data. On the server an
 // init starts a fresh session; on the client a resp completes ours.
-func (b *Bip) tryHandshake(pkt []byte, addr *net.UDPAddr) {
+func (b *UDP) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 	if b.isClient {
 		ci := b.ci.Load()
 		if ci == nil {
@@ -378,14 +378,14 @@ func (b *Bip) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 // writeCtrl sends a control/handshake datagram, tagging it passthrough under FEC so
 // the peer's decoder forwards it straight through (never held in a block or parsed as
 // a shard). to may differ from the learned peer (a server's handshake reply).
-func (b *Bip) writeCtrl(pkt []byte, to *net.UDPAddr) {
+func (b *UDP) writeCtrl(pkt []byte, to *net.UDPAddr) {
 	if to == nil {
 		return
 	}
 	_, _ = b.conn.WriteToUDP(fecTag(b.fecEnc, pkt), to)
 }
 
-func (b *Bip) dispatch(typ byte, payload []byte, addr *net.UDPAddr) {
+func (b *UDP) dispatch(typ byte, payload []byte, addr *net.UDPAddr) {
 	switch typ {
 	case typePing:
 		b.send(typePong, nil, addr)
@@ -393,7 +393,7 @@ func (b *Bip) dispatch(typ byte, payload []byte, addr *net.UDPAddr) {
 		// keepalive ack
 	case typeData:
 		if _, err := b.dev.Write(payload); err != nil {
-			log.Printf("bip: tun write error: %v", err)
+			log.Printf("core: tun write error: %v", err)
 		}
 	}
 }
@@ -401,12 +401,12 @@ func (b *Bip) dispatch(typ byte, payload []byte, addr *net.UDPAddr) {
 // clientLoop (client) drives the handshake and keepalives: it (re)sends an init
 // until a session exists, then pings on a jittered interval. If the session is
 // lost it starts a new handshake.
-func (b *Bip) clientLoop() {
+func (b *UDP) clientLoop() {
 	for {
 		if b.cryptoOn && b.sealer() != nil && b.sessionStale() {
 			b.session.Store(nil) // server likely restarted — drop the dead session so we re-handshake
 			b.ci.Store(nil)
-			log.Print("bip: no reply from the peer's session — re-handshaking (peer likely restarted)")
+			log.Print("core: no reply from the peer's session — re-handshaking (peer likely restarted)")
 		}
 		if b.sealer() == nil && b.cryptoOn {
 			b.sendInit()
@@ -427,7 +427,7 @@ func (b *Bip) clientLoop() {
 	}
 }
 
-func (b *Bip) sendInit() {
+func (b *UDP) sendInit() {
 	peer := b.peer.Load()
 	if peer == nil {
 		return
@@ -448,7 +448,7 @@ func (b *Bip) sendInit() {
 	b.writeCtrl(crypto.InitMsg(b.psk, ci), peer)
 }
 
-func (b *Bip) send(typ byte, payload []byte, to *net.UDPAddr) {
+func (b *UDP) send(typ byte, payload []byte, to *net.UDPAddr) {
 	if to == nil {
 		return
 	}
@@ -469,7 +469,7 @@ func iff(cond bool, a, b []byte) []byte {
 	return b
 }
 
-var errBadFrame = errors.New("bip: bad frame")
+var errBadFrame = errors.New("core: bad frame")
 
 // ErrClosed is returned by Run when the connection was closed intentionally.
-var ErrClosed = errors.New("bip: closed")
+var ErrClosed = errors.New("core: closed")

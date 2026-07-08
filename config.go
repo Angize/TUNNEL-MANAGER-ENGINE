@@ -34,7 +34,7 @@ type Config struct {
 	Mode    string `json:"mode"`    // "packet" (only mode implemented in this slice)
 	Profile string `json:"profile"` // "core" (the core profile identifier)
 
-	// Transport selects the carrier for bip frames: "udp" (default,
+	// Transport selects the carrier for core frames: "udp" (default,
 	// NAT-friendly datagrams), "tcp" (stream, length-prefixed frames), "raw"
 	// (each frame in a raw IPv4 packet of a chosen protocol — see Profile), or
 	// "flux" (a polymorphic raw carrier whose IP protocol rotates every epoch on a
@@ -49,12 +49,12 @@ type Config struct {
 	RawProfile string `json:"raw_profile"`
 
 	// SpoofSrc (client) forges the outer IPv4 source address of raw-transport packets
-	// so per-source/stateful egress filters can't pin the real IP. SpoofPeer (server)
+	// so per-source/stateful egress filters can't pin the real IP. RealPeer (server)
 	// is the client's REAL IP: with a forged source the server cannot learn where to
 	// reply, so it is told here (the AEAD still authenticates every frame). Raw + bip +
 	// crypto only; needs CAP_NET_RAW. Both empty = no spoofing.
 	SpoofSrc  string `json:"spoof_src_ip"`
-	SpoofPeer string `json:"spoof_peer"`
+	RealPeer string `json:"real_peer_ip"`
 
 	// SpoofDst forges the outer IPv4 DESTINATION to a decoy IP (e.g. a reachable,
 	// unfiltered host) so an on-path censor sees traffic to the decoy, not to the real
@@ -62,7 +62,7 @@ type Config struct {
 	// still routing to the real server; the server therefore cannot receive on an ordinary
 	// AF_INET raw socket (the kernel drops packets whose dst isn't local) and instead reads
 	// with AF_PACKET, and replies with the decoy as the source. A server using SpoofDst
-	// must also set SpoofPeer (the forged source hides the client's real IP). Raw + bip +
+	// must also set RealPeer (the forged source hides the client's real IP). Raw + bip +
 	// crypto only; needs CAP_NET_RAW. Empty = no destination spoofing.
 	SpoofDst string `json:"spoof_dst_ip"`
 
@@ -95,11 +95,11 @@ type Config struct {
 	// TLS for us but transparently proxies every OTHER connection (probes, the
 	// censor) to CoverSNI:443, so active probing sees that site's genuine cert.
 	// CoverSNI must therefore be a REAL, reachable, unblocked HTTPS site — it is
-	// the cover the server borrows. TCP only; bip/PSK runs inside the TLS tunnel.
+	// the cover the server borrows. TCP only; core/PSK runs inside the TLS tunnel.
 	Cover    bool   `json:"cover"`
 	CoverSNI string `json:"cover_sni"`
 
-	// WebSocket carrier (Transport=="ws"): the bip stream rides RFC 6455 binary
+	// WebSocket carrier (Transport=="ws"): the core stream rides RFC 6455 binary
 	// frames after an HTTP Upgrade, so it can be fronted through a CDN. WSHost is the
 	// Host header (and TLS SNI) — the fronting/origin domain; WSPath the request path
 	// ("/" default); WSTLS makes the client speak wss:// (standard TLS to the CDN edge)
@@ -292,23 +292,23 @@ func (c *Config) validate() error {
 		if !c.Crypto.Enabled {
 			return errors.New("raw transport requires crypto enabled (the AEAD both encrypts and authenticates each raw packet)")
 		}
-		if (c.SpoofSrc != "" || c.SpoofPeer != "" || c.SpoofDst != "") && c.RawProfile != "" && c.RawProfile != "bip" {
+		if (c.SpoofSrc != "" || c.RealPeer != "" || c.SpoofDst != "") && c.RawProfile != "" && c.RawProfile != "bip" {
 			return errors.New("IP spoofing is only supported on the raw \"bip\" profile for now")
 		}
 		if c.SpoofSrc != "" && net.ParseIP(c.SpoofSrc).To4() == nil {
 			return errors.New("spoof_src_ip must be an IPv4 address")
 		}
-		if c.SpoofPeer != "" && net.ParseIP(c.SpoofPeer).To4() == nil {
-			return errors.New("spoof_peer must be an IPv4 address")
+		if c.RealPeer != "" && net.ParseIP(c.RealPeer).To4() == nil {
+			return errors.New("real_peer_ip must be an IPv4 address")
 		}
 		if c.SpoofDst != "" && net.ParseIP(c.SpoofDst).To4() == nil {
 			return errors.New("spoof_dst_ip must be an IPv4 address")
 		}
 		// A server that expects decoy-destination packets receives them via AF_PACKET and
 		// replies with the decoy as source, so it can never learn the client's real address
-		// from the wire — SpoofPeer must supply it.
-		if c.SpoofDst != "" && c.Role == "server" && c.SpoofPeer == "" {
-			return errors.New("spoof_dst_ip on a server requires spoof_peer (the client's real IP to reply to)")
+		// from the wire — RealPeer must supply it.
+		if c.SpoofDst != "" && c.Role == "server" && c.RealPeer == "" {
+			return errors.New("spoof_dst_ip on a server requires real_peer_ip (the client's real IP to reply to)")
 		}
 	case "flux":
 		// The polymorphic carrier rides raw sockets and rotates its protocol from

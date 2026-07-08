@@ -19,8 +19,8 @@
 // X25519 public value plus a 16-byte PSK-keyed MAC; nothing constant, so it does
 // not add a DPI signature):
 //
-//	msg1 (initiator→responder): e_i(32) || MAC(psk, "bip-hs-i" || e_i)
-//	msg2 (responder→initiator): e_r(32) || MAC(psk, "bip-hs-r" || e_i || e_r)
+//	msg1 (initiator→responder): e_i(32) || MAC(psk, "core-hs-i" || e_i)
+//	msg2 (responder→initiator): e_r(32) || MAC(psk, "core-hs-r" || e_i || e_r)
 //
 // The MAC authenticates the peer as a PSK holder (a prober without the PSK cannot
 // forge it, so the responder answers nothing). Session keys then come from
@@ -44,8 +44,8 @@ const (
 	hsMACLen      = 16
 	HandshakeSize = ephPubLen + hsMACLen // 48 bytes on the wire, both messages
 
-	hsTagInit = "bip-hs-i"
-	hsTagResp = "bip-hs-r"
+	hsTagInit = "core-hs-i"
+	hsTagResp = "core-hs-r"
 )
 
 // Ephemeral is a one-shot X25519 keypair. The private half never leaves the
@@ -70,7 +70,7 @@ func GenerateEphemeral() (*Ephemeral, error) {
 }
 
 func hsMACKey(psk string) []byte {
-	k := sha256.Sum256([]byte("tnl-bip|v2|hs-mac|" + psk))
+	k := sha256.Sum256([]byte("tnl-core|v2|hs-mac|" + psk))
 	return k[:]
 }
 
@@ -145,7 +145,7 @@ func SessionSealer(cipherName, psk string, own *Ephemeral, peerPub, eInit, eResp
 	// secrecy) AND the PSK (authentication). salt = e_i || e_r (fresh per session).
 	ikm := append(append([]byte{}, shared...), []byte(psk)...)
 	salt := append(append([]byte{}, eInit[:]...), eResp[:]...)
-	kdf := hkdf.New(sha256.New, ikm, salt, []byte("tnl-bip|v2|session|"+name))
+	kdf := hkdf.New(sha256.New, ikm, salt, []byte("tnl-core|v2|session|"+name))
 
 	c2sKey := make([]byte, keyLen)
 	s2cKey := make([]byte, keyLen)

@@ -10,15 +10,16 @@ orchestrators; this core only moves packets.
 
 ## وضعیت (این نسخه)
 
-پیاده‌سازیِ برشِ اول — **حالتِ Packet با پروفایلِ `bip`**:
+**حالتِ Packet با پروفایلِ `core`**:
 
 - یک اینترفیسِ **TUN** روی هر نود (بستهٔ خامِ L3).
-- حاملِ **bip**: هر بستهٔ IP در یک datagramِ **UDP** بسته‌بندی می‌شود.
-- رمزنگاریِ اختیاری **AES-256-GCM** (کلید از PSK با SHA-256، nonceِ تصادفی برای هر بسته).
+- چند **ترنسپورت** برای حملِ فریم‌ها: `udp` (پیش‌فرض)، `tcp`، `raw` (پروفایل‌های
+  raw: `bip`=proto-253 نیتیو / `ipip` / `gre` / `icmp` / `udp` / `tcp`)، `flux`
+  (حاملِ چندریختیِ چرخشی: udp/stun/raw) و `ws` (WebSocket/xHTTP روی CDN).
+- رمزنگاریِ **AES-256-GCM** با دست‌دادِ X25519 برای هر نشست (forward secrecy).
+- ضدِ DPIِ اختیاری (`obfs`): حذفِ بایت‌های ثابت + padding + jitter؛ پوششِ TLS به‌سبکِ
+  REALITY (`cover`)؛ تصحیحِ خطا (`fec`)؛ جعلِ IP مبدأ/مقصد روی پروفایلِ raw `bip`.
 - نقش‌ها: `server` (عمومی، listen) و `client` (پشتِ NAT، dial + keepalive) — سازگار با NAT.
-
-بقیهٔ ترنسپورت‌ها (tcp/tcpmux/ws/wss/mux/anytls/…) و پروفایل‌های packet
-(icmp/ipip/udp/tcp/gre) لایه‌لایه بعد از این اضافه می‌شوند.
 
 ## ساخت
 
@@ -47,15 +48,18 @@ sudo ./tnl-core --config examples/client.json
 هسته stdin/stdout تعاملی ندارد؛ نود یک فایلِ `core-<id>.json` می‌نویسد و باینری را با
 `--config <path>` اجرا می‌کند — دقیقاً مثلِ اینکه نود الان `ip`/`iptables` را صدا می‌زند.
 
-## فرمتِ سیم (bip)
+## فرمتِ سیم
 
-هر datagramِ UDP یک فریم است:
+هر datagramِ UDP (یا فریمِ استریمی روی tcp/ws) یک فریم است. فرمتِ legacy:
 
 ```
-[0] magic = 0xB1
+[0] magic = 0xB1              (فقط در framingِ legacy؛ با obfs هیچ بایتِ ثابتی نیست)
 [1] type  = 0 data | 1 ping | 2 pong
-[2:] payload   (data: در صورتِ روشن‌بودنِ رمز، nonce||ciphertext؛ وگرنه بستهٔ خامِ IP)
+[2:] payload   (data: در صورتِ روشن‌بودنِ رمز، sealed؛ وگرنه بستهٔ خامِ IP)
 ```
+
+با روشن‌بودنِ `obfs` هیچ فیلدِ ثابتی روی سیم نیست: کلِ فریم ciphertextِ AEAD به‌علاوهٔ
+padding است و طولِ واقعی داخلِ فریمِ sealed قرار دارد.
 
 ## تست
 
