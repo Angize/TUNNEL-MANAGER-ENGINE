@@ -1,9 +1,12 @@
 package packet
 
 import (
+	"bytes"
+	"crypto/tls"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"sync"
 	"testing"
@@ -111,6 +114,101 @@ func TestXHTTPCarrierRoundTrip(t *testing.T) {
 		t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(got), len(want))
 	}
 	t.Logf("xhttp packet-up round-tripped %d bytes both ways", len(got))
+}
+
+// xhttpInject drives one packet each way through a live xhttp tunnel and asserts it arrives
+// intact — the same end-to-end path a node runs (handshake, seal/open, TUN both directions).
+func xhttpInject(t *testing.T, cliCtrl, srvCtrl *os.File) {
+	t.Helper()
+	pkt1 := bytes.Repeat([]byte{0xC1}, 200)
+	if _, err := cliCtrl.Write(pkt1); err != nil {
+		t.Fatalf("inject client->server: %v", err)
+	}
+	if got := readWithTimeout(t, srvCtrl, "client->server"); !bytes.Equal(got, pkt1) {
+		t.Fatalf("client->server payload mismatch: got %d bytes", len(got))
+	}
+	pkt2 := bytes.Repeat([]byte{0x5A}, 500)
+	if _, err := srvCtrl.Write(pkt2); err != nil {
+		t.Fatalf("inject server->client: %v", err)
+	}
+	if got := readWithTimeout(t, cliCtrl, "server->client"); !bytes.Equal(got, pkt2) {
+		t.Fatalf("server->client payload mismatch: got %d bytes", len(got))
+	}
+	pkt3 := bytes.Repeat([]byte{0x33}, 120)
+	if _, err := cliCtrl.Write(pkt3); err != nil {
+		t.Fatalf("inject client->server #2: %v", err)
+	}
+	if got := readWithTimeout(t, srvCtrl, "client->server #2"); !bytes.Equal(got, pkt3) {
+		t.Fatalf("client->server #2 payload mismatch")
+	}
+}
+
+// TestTunnelXHTTPPacketUp runs a full server<->client xhttp tunnel in packet-up mode over a real
+// (plain HTTP/1.1) socket and asserts a packet traverses each way. It is the regression test for
+// the server-side bug where handleServerConn ran wsServerHandshake on an xhttp conn (b.ws is set
+// for xhttp): the client speaks bip frames directly over the GET/POST pair, so a WS handshake
+// there misreads the bip handshake as an HTTP request and the tunnel connects but passes no data.
+func TestTunnelXHTTPPacketUp(t *testing.T) { testTunnelXHTTP(t, "packet", false) }
+
+// TestTunnelXHTTPPacketUpObfs is the same with the length-mask obfs handshake in play.
+func TestTunnelXHTTPPacketUpObfs(t *testing.T) { testTunnelXHTTP(t, "packet", true) }
+
+func testTunnelXHTTP(t *testing.T, mode string, obfs bool) {
+	const psk = "e2e-shared-pre-shared-key-1234567890"
+	const cipher = "aes-256-gcm"
+	srvDev, srvCtrl := tunPair(t, "xhsrv")
+	cliDev, cliCtrl := tunPair(t, "xhcli")
+	ka := 1 * time.Second
+	addr := freeTCPPort(t)
+
+	srv, err := ListenXHTTP(addr, srvDev, ka, obfs, true, psk, cipher)
+	if err != nil {
+		t.Fatalf("ListenXHTTP: %v", err)
+	}
+	// single-edge packet-up client over plain HTTP; host defaults to the dial addr.
+	cli, err := DialXHTTP(addr, cliDev, ka, obfs, true, psk, cipher, "", "/", false, nil, mode)
+	if err != nil {
+		t.Fatalf("DialXHTTP: %v", err)
+	}
+	go srv.Run()
+	go cli.Run()
+	t.Cleanup(func() { cli.Close(); srv.Close() })
+	time.Sleep(400 * time.Millisecond)
+	xhttpInject(t, cliCtrl, srvCtrl)
+}
+
+// TestTunnelXHTTPStreamOne runs a full tunnel in stream-one mode: a single full-duplex request
+// over an HTTP/2 TLS edge (a stand-in for the CDN). The server's handler is served by an h2
+// httptest server so the client negotiates h2 and upstream frames flush per-write; its own plain
+// listener is idle. Proves stream-one round-trips both ways over one request.
+func TestTunnelXHTTPStreamOne(t *testing.T) {
+	const psk = "e2e-shared-pre-shared-key-1234567890"
+	const cipher = "aes-256-gcm"
+	srvDev, srvCtrl := tunPair(t, "xhssrv")
+	cliDev, cliCtrl := tunPair(t, "xhscli")
+	ka := 1 * time.Second
+
+	srv, err := ListenXHTTP("127.0.0.1:0", srvDev, ka, false, true, psk, cipher)
+	if err != nil {
+		t.Fatalf("ListenXHTTP: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", srv.xhttpHandler)
+	ts := httptest.NewUnstartedServer(mux)
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	go srv.Run() // starts tunLoop so the server reads its TUN; its own plain listener stays idle
+	t.Cleanup(func() { ts.Close(); srv.Close() })
+
+	cli, err := DialXHTTP(ts.Listener.Addr().String(), cliDev, ka, false, true, psk, cipher, "", "/", true, nil, "stream")
+	if err != nil {
+		t.Fatalf("DialXHTTP: %v", err)
+	}
+	cli.xhTLS = &tls.Config{InsecureSkipVerify: true} // trust the httptest cert (test only)
+	go cli.Run()
+	t.Cleanup(func() { cli.Close() })
+	time.Sleep(600 * time.Millisecond)
+	xhttpInject(t, cliCtrl, srvCtrl)
 }
 
 func TestXHTTPConnReadDeadline(t *testing.T) {

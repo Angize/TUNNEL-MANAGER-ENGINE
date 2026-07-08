@@ -218,18 +218,17 @@ func (u *xhUp) post(sc seqChunk) error {
 	return nil
 }
 
-// establishXHTTP (client) opens the downstream GET and starts the packet-up upstream for a fresh
-// session, returning a net.Conn over the pair. TLS+ECH to the edge mirror wss. When an edge pool
-// is configured it rotates like establishWS: each attempt uses the pool's current (IP × SNI),
-// and a failure burns the offending IP or SNI.
-func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
-	dialAddr, host, ech, path := b.addr, b.wsHost, b.wsECH, b.wsPath
+// xhttpEdge resolves the (dialAddr, host, ech, path) for this attempt. With an edge pool it uses
+// the pool's current (IP × SNI), resetting burns if every combination is burned so the client
+// never dead-ends. A single fixed edge uses the plain WSHost/WSECH/WSPath.
+func (b *BipTCP) xhttpEdge() (dialAddr, host string, ech []byte, path string, err error) {
+	dialAddr, host, ech, path = b.addr, b.wsHost, b.wsECH, b.wsPath
 	if b.pool != nil {
 		ip, sni, ok := b.pool.current()
 		if !ok {
 			b.pool.resetBurns() // every combo burned — fresh cycle so we never dead-end
 			if ip, sni, ok = b.pool.current(); !ok {
-				return nil, "", fmt.Errorf("xhttp: edge pool is empty")
+				return "", "", nil, "", fmt.Errorf("xhttp: edge pool is empty")
 			}
 		}
 		dialAddr, host, ech, path = ip, sni.host, sni.ech, sni.path
@@ -237,13 +236,46 @@ func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
 	if host == "" {
 		host = dialAddr
 	}
+	return dialAddr, host, ech, path, nil
+}
+
+// xhttpClientTLS builds the client TLS config for the edge: SNI = the fronting host, with ECH
+// when configured. xhTLS (test-only) overrides it wholesale.
+func (b *BipTCP) xhttpClientTLS(host string, ech []byte) *tls.Config {
+	if b.xhTLS != nil {
+		return b.xhTLS
+	}
+	cfg := &tls.Config{ServerName: host}
+	if len(ech) > 0 {
+		cfg.EncryptedClientHelloConfigList = ech
+	}
+	return cfg
+}
+
+// establishXHTTP (client) opens a fresh xhttp session to the edge and returns a net.Conn over it.
+// Two upstream styles share the same fronting (TLS+ECH mirror wss) and the same pool rotation
+// (each attempt uses the pool's current IP × SNI; a failure burns the offending IP or SNI):
+//
+//	packet-up (default): a long-lived downstream GET plus short seq-tagged POSTs — most
+//	                     CDN-compatible, since a CDN that buffers request bodies still forwards
+//	                     short complete POSTs at once.
+//	stream-one (b.xhMode=="stream"): one full-duplex request (body up, response down) — needs
+//	                     HTTP/2 to the edge (ws_tls) so upstream frames flush per-write.
+func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
+	dialAddr, host, ech, path, err := b.xhttpEdge()
+	if err != nil {
+		return nil, "", err
+	}
+	stream := b.xhMode == "stream"
 	tr := &http.Transport{
 		// Always dial the fixed edge, regardless of the request URL host, so the Host/SNI stays
 		// the fronting domain while we connect to a specific (clean) CDN IP.
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", dialAddr)
 		},
-		ForceAttemptHTTP2:   false,
+		// packet-up rides HTTP/1.1 (each POST is a complete request); stream-one is full-duplex
+		// and needs HTTP/2 to the edge so upstream frames flush per-write instead of buffering.
+		ForceAttemptHTTP2:   stream && b.wsTLS,
 		MaxIdleConns:        16,
 		MaxIdleConnsPerHost: 8, // the streaming GET holds one conn; the packet-up POSTs reuse the rest
 		IdleConnTimeout:     90 * time.Second,
@@ -252,23 +284,68 @@ func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
 	scheme := "http"
 	if b.wsTLS {
 		scheme = "https"
-		cfg := &tls.Config{ServerName: host}
-		if len(ech) > 0 {
-			cfg.EncryptedClientHelloConfigList = ech
-		}
-		tr.TLSClientConfig = cfg
+		tr.TLSClientConfig = b.xhttpClientTLS(host, ech)
 	}
 	sid := randSID()
 	base := scheme + "://" + host + xhttpPath(path)
 	hc := &http.Client{Transport: tr}
 	ctx, cancel := context.WithCancel(context.Background())
-
 	setHdr := func(r *http.Request) {
 		r.Header.Set("User-Agent", xhttpUA)
 		r.Header.Set("Accept", "*/*")
 		r.Header.Set("Accept-Language", "en-US,en;q=0.9")
 		r.Header.Set("Cache-Control", "no-store")
 	}
+	if stream {
+		return b.dialXHTTPStream(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
+	}
+	return b.dialXHTTPPacket(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
+}
+
+// dialXHTTPStream (stream-one) opens ONE full-duplex request: the request body — a pipe we feed
+// on Write — carries the upstream, and the response body carries the downstream, concurrently.
+// The server sends its response head immediately (before the body completes), so hc.Do returns
+// and both directions flow at once. Needs HTTP/2 end-to-end so per-frame writes are flushed.
+func (b *BipTCP) dialXHTTPStream(hc *http.Client, tr *http.Transport, ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
+	pr, pw := io.Pipe()
+	req, err := http.NewRequestWithContext(ctx, "POST", base+"?s="+sid, pr)
+	if err != nil {
+		cancel()
+		pw.Close()
+		return nil, dialAddr, err
+	}
+	setHdr(req)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = -1 // unknown length: stream the body (h2 DATA / chunked), never buffer it whole
+	resp, err := hc.Do(req)
+	if err != nil {
+		cancel()
+		pw.Close()
+		if b.pool != nil { // a transport failure (dial/TLS) points at the IP
+			b.pool.burnIP(dialAddr)
+		}
+		return nil, dialAddr, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		cancel()
+		pw.Close()
+		if b.pool != nil { // the edge answered but rejected this domain/path — burn the SNI
+			b.pool.burnSNI(host)
+		}
+		return nil, dialAddr, fmt.Errorf("xhttp: stream got HTTP %d (want 200)", resp.StatusCode)
+	}
+	conn := &xhttpConn{
+		r: resp.Body, w: pw, // Write -> pipe -> request body (upstream); Read <- response body (downstream)
+		ra: strAddr(dialAddr), la: strAddr("xhttp-client"),
+	}
+	conn.closeFn = func() { cancel(); pw.Close(); resp.Body.Close(); tr.CloseIdleConnections() }
+	return conn, dialAddr, nil
+}
+
+// dialXHTTPPacket (packet-up) opens the long-lived downstream GET and starts the packet-up
+// upstream sender for a fresh session, returning a net.Conn over the pair.
+func (b *BipTCP) dialXHTTPPacket(hc *http.Client, tr *http.Transport, ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
 	greq, _ := http.NewRequestWithContext(ctx, "GET", base+"?s="+sid, nil)
 	setHdr(greq)
 	gresp, err := hc.Do(greq)
@@ -373,12 +450,43 @@ func (s *xhttpSession) close(b *BipTCP, sid string) {
 	})
 }
 
-// xhttpHandler routes a session's requests: the GET carries the downstream body (and drives
-// handleServerConn once), each POST carries one packet-up chunk (?seq=N) fed into the upstream.
+// serveXHTTPStream handles a stream-one request: the single full-duplex request IS the session —
+// the request body is the upstream and the response body is the downstream. No session map, seq,
+// or reassembly is needed; handleServerConn runs the bip session directly on the pair, and the
+// request is held open until that session ends.
+func (b *BipTCP) serveXHTTPStream(w http.ResponseWriter, r *http.Request) {
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no") // ask any nginx/CDN in front not to buffer
+	w.WriteHeader(http.StatusOK)
+	fl.Flush() // send the response head now so the client's request returns and the duplex opens
+	conn := &xhttpConn{
+		r: r.Body, w: w, flush: fl.Flush,
+		ra: strAddr(r.RemoteAddr), la: strAddr("xhttp-server"),
+	}
+	defer conn.Close()
+	b.handleServerConn(conn) // the request lifetime IS the session; blocks until it ends
+}
+
+// xhttpHandler routes a session's requests. stream-one is a single full-duplex POST (no seq).
+// packet-up uses a GET (downstream body, drives handleServerConn once) plus seq-tagged POSTs
+// (?seq=N) fed into the upstream. The server auto-detects the style per request, so a stream
+// client and a packet client both work against one endpoint regardless of its own mode setting.
 func (b *BipTCP) xhttpHandler(w http.ResponseWriter, r *http.Request) {
 	sid := r.URL.Query().Get("s")
 	if len(sid) != 32 || strings.Trim(sid, "0123456789abcdef") != "" {
 		http.Error(w, "Not Found", http.StatusNotFound) // a probe/scanner sees a plain 404
+		return
+	}
+	// stream-one: a single full-duplex POST with no seq. Route it before touching the packet-up
+	// session map (which only the GET-down + seq-POST style uses).
+	if r.Method == http.MethodPost && r.URL.Query().Get("seq") == "" {
+		b.serveXHTTPStream(w, r)
 		return
 	}
 	s := b.xhttpGetOrCreate(sid)
