@@ -1,20 +1,24 @@
-// xhttp carrier: the bip stream rides two plain HTTP requests instead of a WebSocket
-// upgrade, so it passes through CDNs that block or don't proxy WebSocket (e.g. a
-// Cloudflare account with WebSocket disabled) while still looking like ordinary HTTPS.
+// xhttp carrier: the bip stream rides plain HTTP requests instead of a WebSocket upgrade, so
+// it passes through CDNs that block or don't proxy WebSocket (e.g. a Cloudflare account with
+// WebSocket disabled) while still looking like ordinary HTTPS.
 //
-//	downstream (server -> client): one long-lived GET whose streaming response body
-//	                               carries the sealed frames.
-//	upstream   (client -> server): one long-lived POST whose streaming request body
-//	                               carries the sealed frames.
-//	correlation: a random session id in the query ties the GET and POST together.
+//	downstream (server -> client): one long-lived GET whose streaming response body carries
+//	                               the sealed frames.
+//	upstream   (client -> server): PACKET-UP — each write is a short, discrete POST carrying one
+//	                               chunk plus a monotonic seq. A CDN like Cloudflare buffers a
+//	                               single long streaming request body (which stalled the
+//	                               handshake), but forwards short complete POSTs immediately; the
+//	                               server reassembles them by seq into the upstream byte stream.
+//	correlation: a random session id in the query ties the GET and the POSTs together.
 //
-// Both directions present a byte stream, so xhttpConn is a net.Conn and the existing
-// connFramer (length-prefix + AEAD + obfs + keepalive) rides on top unchanged — exactly
-// as it does over a raw TCP, a TLS-cover, or a WebSocket conn. The same fronting fields
-// as ws apply (host/edge/ECH/path); the server stays plain (the CDN terminates TLS).
+// Both directions present a byte stream, so xhttpConn is a net.Conn and the existing connFramer
+// (length-prefix + AEAD + obfs + keepalive) rides on top unchanged — exactly as over raw TCP, a
+// TLS-cover, or a WebSocket conn. The same fronting fields as ws apply (host/edge/ECH/path); the
+// server stays plain (the CDN terminates TLS).
 package packet
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -24,12 +28,17 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const xhttpUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+// maxXhChunk caps a single upstream POST body so a hostile client can't force a huge alloc.
+const maxXhChunk = 1 << 20
 
 // strAddr is a net.Addr for an xhttp conn (there is no single socket behind it).
 type strAddr string
@@ -37,13 +46,15 @@ type strAddr string
 func (a strAddr) Network() string { return "xhttp" }
 func (a strAddr) String() string  { return string(a) }
 
-// xhttpConn presents the GET(down)+POST(up) pair (or, on the server, the upstream
-// pipe + downstream ResponseWriter) as a single net.Conn. Read deadlines are honoured
-// by an idle timer that closes the conn when it fires, so a dead session is reaped.
+// xhttpConn presents the GET(down) + packet-up(POSTs) pair (client) or the reassembled upstream
+// pipe + downstream ResponseWriter (server) as a single net.Conn. On the client, Write goes to
+// the packet-up sender (up); on the server, Write goes to the GET response writer (w). Read
+// deadlines are honoured by an idle timer that closes the conn when it fires.
 type xhttpConn struct {
 	r     io.Reader
 	w     io.Writer
 	flush func()
+	up    *xhUp // client only: packet-up upstream sender (nil on the server)
 
 	wmu     sync.Mutex
 	mu      sync.Mutex
@@ -56,6 +67,9 @@ type xhttpConn struct {
 func (c *xhttpConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 func (c *xhttpConn) Write(p []byte) (int, error) {
+	if c.up != nil { // client: each write becomes a short POST with a seq
+		return c.up.write(p)
+	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	n, err := c.w.Write(p)
@@ -77,11 +91,9 @@ func (c *xhttpConn) Close() error {
 	}
 	fn := c.closeFn
 	c.mu.Unlock()
-	// Closing the reader is what actually unblocks a Read that is parked in
-	// c.r.Read — closeFn tears the session down but does not interrupt an
-	// in-flight pipe/body read. Both our readers (http body, io.PipeReader)
-	// implement io.Closer and return an error to the blocked reader on close,
-	// so an idle-timer deadline reliably reaps a stuck Read.
+	// Closing the reader is what actually unblocks a Read parked in c.r.Read — closeFn tears the
+	// session down but does not interrupt an in-flight body/pipe read. Both readers (http body,
+	// io.PipeReader) implement io.Closer and return an error to the blocked reader on close.
 	if rc, ok := c.r.(io.Closer); ok {
 		rc.Close()
 	}
@@ -130,10 +142,86 @@ func xhttpPath(p string) string {
 	return p
 }
 
-// establishXHTTP (client) opens the downstream GET and the upstream POST for a fresh
-// session and returns a net.Conn over the pair. TLS+ECH to the edge mirror wss. When an
-// edge pool is configured it rotates like establishWS: each attempt uses the pool's
-// current (IP × SNI), and a failure burns the offending IP or SNI.
+// --- client: packet-up upstream --------------------------------------------------------------
+
+type seqChunk struct {
+	seq  uint64
+	data []byte
+}
+
+// xhUp is the client's packet-up upstream. Each Write is copied, tagged with a monotonic seq,
+// and handed to a small pool of workers that POST it as a short, complete request; the server
+// reassembles by seq. A single long streaming POST is what a CDN buffers — short discrete POSTs
+// are forwarded at once, so the handshake and data flow through Cloudflare. Any POST failure
+// fails the whole conn (once) so dialLoop re-dials a fresh session.
+type xhUp struct {
+	hc     *http.Client
+	ctx    context.Context
+	urlFor func(seq uint64) string
+	setHdr func(*http.Request)
+	seq    uint64
+	ch     chan seqChunk
+	fail   func()
+	once   sync.Once
+}
+
+func newXhUp(ctx context.Context, hc *http.Client, urlFor func(uint64) string, setHdr func(*http.Request), fail func()) *xhUp {
+	u := &xhUp{hc: hc, ctx: ctx, urlFor: urlFor, setHdr: setHdr, fail: fail, ch: make(chan seqChunk, 256)}
+	for i := 0; i < 4; i++ {
+		go u.worker()
+	}
+	return u
+}
+
+func (u *xhUp) write(p []byte) (int, error) {
+	b := make([]byte, len(p))
+	copy(b, p)
+	seq := atomic.AddUint64(&u.seq, 1) - 1
+	select {
+	case u.ch <- seqChunk{seq, b}:
+		return len(p), nil
+	case <-u.ctx.Done():
+		return 0, io.ErrClosedPipe
+	}
+}
+
+func (u *xhUp) worker() {
+	for {
+		select {
+		case <-u.ctx.Done():
+			return
+		case sc := <-u.ch:
+			if err := u.post(sc); err != nil {
+				u.once.Do(u.fail) // kill the conn once; dialLoop re-dials a fresh session
+				return
+			}
+		}
+	}
+}
+
+func (u *xhUp) post(sc seqChunk) error {
+	req, err := http.NewRequestWithContext(u.ctx, "POST", u.urlFor(sc.seq), bytes.NewReader(sc.data))
+	if err != nil {
+		return err
+	}
+	u.setHdr(req)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := u.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("xhttp: up seq %d got HTTP %d", sc.seq, resp.StatusCode)
+	}
+	return nil
+}
+
+// establishXHTTP (client) opens the downstream GET and starts the packet-up upstream for a fresh
+// session, returning a net.Conn over the pair. TLS+ECH to the edge mirror wss. When an edge pool
+// is configured it rotates like establishWS: each attempt uses the pool's current (IP × SNI),
+// and a failure burns the offending IP or SNI.
 func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
 	dialAddr, host, ech, path := b.addr, b.wsHost, b.wsECH, b.wsPath
 	if b.pool != nil {
@@ -150,13 +238,14 @@ func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
 		host = dialAddr
 	}
 	tr := &http.Transport{
-		// Always dial the fixed edge, regardless of the request URL host, so the Host/SNI
-		// stays the fronting domain while we connect to a specific (clean) CDN IP.
+		// Always dial the fixed edge, regardless of the request URL host, so the Host/SNI stays
+		// the fronting domain while we connect to a specific (clean) CDN IP.
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, "tcp", dialAddr)
 		},
 		ForceAttemptHTTP2:   false,
-		MaxIdleConns:        4,
+		MaxIdleConns:        16,
+		MaxIdleConnsPerHost: 8, // the streaming GET holds one conn; the packet-up POSTs reuse the rest
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: handshakeTimeout,
 	}
@@ -198,25 +287,19 @@ func (b *BipTCP) establishXHTTP() (net.Conn, string, error) {
 		}
 		return nil, dialAddr, fmt.Errorf("xhttp: down got HTTP %d (want 200)", gresp.StatusCode)
 	}
-	pr, pw := io.Pipe()
-	preq, _ := http.NewRequestWithContext(ctx, "POST", base+"?s="+sid, pr)
-	setHdr(preq)
-	preq.Header.Set("Content-Type", "application/octet-stream")
-	go func() { // the POST runs for the whole session; its body streams our upstream
-		if resp, e := hc.Do(preq); e == nil {
-			resp.Body.Close()
-		}
-		cancel()
-	}()
-	conn := &xhttpConn{
-		r: gresp.Body, w: pw,
-		ra: strAddr(dialAddr), la: strAddr("xhttp-client"),
-		closeFn: func() { cancel(); gresp.Body.Close(); pw.Close(); tr.CloseIdleConnections() },
+	urlFor := func(seq uint64) string {
+		return base + "?s=" + sid + "&seq=" + strconv.FormatUint(seq, 10)
 	}
+	conn := &xhttpConn{
+		r:  gresp.Body,
+		ra: strAddr(dialAddr), la: strAddr("xhttp-client"),
+	}
+	conn.closeFn = func() { cancel(); gresp.Body.Close(); tr.CloseIdleConnections() }
+	conn.up = newXhUp(ctx, hc, urlFor, setHdr, func() { conn.Close() })
 	return conn, dialAddr, nil
 }
 
-// --- server ---------------------------------------------------------------------
+// --- server ----------------------------------------------------------------------------------
 
 type xhttpSession struct {
 	upR   *io.PipeReader
@@ -224,10 +307,14 @@ type xhttpSession struct {
 	done  chan struct{}
 	start sync.Once
 	end   sync.Once
+
+	upMu    sync.Mutex        // orders packet-up POSTs by seq before writing to the upstream pipe
+	nextSeq uint64            // next seq we expect to hand to upW
+	pend    map[uint64][]byte // out-of-order chunks waiting for the gap to fill
 }
 
-// xhttpGetOrCreate returns the session for sid, creating it (with a fresh upstream pipe
-// and a watchdog that reaps a session whose GET never arrives) on first sight.
+// xhttpGetOrCreate returns the session for sid, creating it (with a fresh upstream pipe and a
+// watchdog that reaps a session whose GET never arrives) on first sight.
 func (b *BipTCP) xhttpGetOrCreate(sid string) *xhttpSession {
 	b.xhMu.Lock()
 	defer b.xhMu.Unlock()
@@ -235,7 +322,7 @@ func (b *BipTCP) xhttpGetOrCreate(sid string) *xhttpSession {
 		return s
 	}
 	pr, pw := io.Pipe()
-	s := &xhttpSession{upR: pr, upW: pw, done: make(chan struct{})}
+	s := &xhttpSession{upR: pr, upW: pw, done: make(chan struct{}), pend: map[uint64][]byte{}}
 	b.xhSessions[sid] = s
 	time.AfterFunc(handshakeTimeout, func() { // no serve started in time -> reap
 		select {
@@ -245,6 +332,34 @@ func (b *BipTCP) xhttpGetOrCreate(sid string) *xhttpSession {
 		}
 	})
 	return s
+}
+
+// deliver feeds one packet-up chunk into the ordered upstream. Out-of-order chunks are buffered
+// until the gap fills; already-delivered seqs are dropped. Writes happen under upMu so the byte
+// stream stays correctly ordered even with several POSTs in flight.
+func (s *xhttpSession) deliver(seq uint64, data []byte) {
+	s.upMu.Lock()
+	defer s.upMu.Unlock()
+	if seq < s.nextSeq {
+		return // already delivered / duplicate
+	}
+	if len(s.pend) > 1024 { // runaway gap (a lost POST) — let the client fail + re-dial
+		return
+	}
+	s.pend[seq] = data
+	for {
+		d, ok := s.pend[s.nextSeq]
+		if !ok {
+			break
+		}
+		delete(s.pend, s.nextSeq)
+		s.nextSeq++
+		if len(d) > 0 {
+			if _, err := s.upW.Write(d); err != nil {
+				return // session gone
+			}
+		}
+	}
 }
 
 func (s *xhttpSession) close(b *BipTCP, sid string) {
@@ -258,8 +373,8 @@ func (s *xhttpSession) close(b *BipTCP, sid string) {
 	})
 }
 
-// xhttpHandler routes the two requests of a session: GET carries the downstream body
-// (and drives handleServerConn once), POST feeds the upstream body into the pipe.
+// xhttpHandler routes a session's requests: the GET carries the downstream body (and drives
+// handleServerConn once), each POST carries one packet-up chunk (?seq=N) fed into the upstream.
 func (b *BipTCP) xhttpHandler(w http.ResponseWriter, r *http.Request) {
 	sid := r.URL.Query().Get("s")
 	if len(sid) != 32 || strings.Trim(sid, "0123456789abcdef") != "" {
@@ -268,8 +383,14 @@ func (b *BipTCP) xhttpHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	s := b.xhttpGetOrCreate(sid)
 	if r.Method == http.MethodPost {
-		_, _ = io.Copy(s.upW, r.Body) // stream client upstream until it closes the POST
-		s.close(b, sid)
+		seq, err := strconv.ParseUint(r.URL.Query().Get("seq"), 10, 64)
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		data, _ := io.ReadAll(io.LimitReader(r.Body, maxXhChunk))
+		s.deliver(seq, data)
+		w.WriteHeader(http.StatusNoContent) // 204: chunk accepted, session stays open
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -296,8 +417,8 @@ func (b *BipTCP) xhttpHandler(w http.ResponseWriter, r *http.Request) {
 	<-s.done // hold the GET open (streaming downstream) until the session ends
 }
 
-// runXHTTPServer serves the xhttp endpoint until Close. A non-matching path/probe gets
-// a plain 404 from the handler, so the port looks like an ordinary idle web endpoint.
+// runXHTTPServer serves the xhttp endpoint until Close. A non-matching path/probe gets a plain
+// 404 from the handler, so the port looks like an ordinary idle web endpoint.
 func (b *BipTCP) runXHTTPServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", b.xhttpHandler)
