@@ -267,6 +267,9 @@ type BipTCP struct {
 	wsTLS  bool   // client: TLS to the edge before the WebSocket upgrade
 	wsECH  []byte // client: ECHConfigList — when set, the SNI is encrypted (hidden)
 
+	pool   *wsPool       // client: rotating edge pool (nil = single fixed edge above)
+	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
+
 	isClient bool
 	addr     string // server: listen addr; client: peer addr
 
@@ -301,6 +304,25 @@ func DialWS(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, cry
 	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
 		ws: true, wsHost: wsHost, wsPath: wsPath, wsTLS: wsTLS, wsECH: wsECH,
 		idle: idleFor(keepalive), isClient: true, addr: peerAddr, closeCh: make(chan struct{})}, nil
+}
+
+// DialWSPool is DialWS over a rotating edge POOL: the client cycles (edge-IP × SNI)
+// combinations from the pool (each SNI with its own ECH), moving before any single
+// edge is fingerprinted and burning a blocked one. rotate is the proactive rotation
+// interval (0 = rotate only on failure). wsTLS is always on (the pool is a wss set).
+func DialWSPool(dev *tun.Device, keepalive time.Duration, obfs, cryptoOn bool, psk, cipher string, pool *wsPool, rotate time.Duration) (*BipTCP, error) {
+	return &BipTCP{dev: dev, cryptoOn: cryptoOn, cipher: cipher, keepalive: keepalive, obfs: obfs, psk: psk,
+		ws: true, wsTLS: true, pool: pool, rotate: rotate,
+		idle: idleFor(keepalive), isClient: true, addr: "pool", closeCh: make(chan struct{})}, nil
+}
+
+// newWSPoolFromCfg builds a pool from the config's clean IP/SNI lists (decoding each
+// SNI's base64 ECH), or returns nil when no pool is configured.
+func newWSPoolFromCfg(ips []string, snis []wsSNIEntry, autoBurn bool, statusPath string) *wsPool {
+	if len(ips) == 0 || len(snis) == 0 {
+		return nil
+	}
+	return newWSPool(ips, snis, autoBurn, statusPath)
 }
 
 // ListenWS (server role) accepts WebSocket connections (plain HTTP upgrade; a CDN
@@ -545,11 +567,10 @@ func (b *BipTCP) handleServerConn(conn net.Conn) {
 // edge rejects a stale ECH config it returns a fresh RetryConfigList — we redial
 // once and retry with it, so Cloudflare's periodic ECH-key rotation self-heals
 // without a rebuild. On any failure the passed (or redialed) conn is closed.
-func (b *BipTCP) tlsToEdge(conn net.Conn) (net.Conn, error) {
-	ech := b.wsECH
+func (b *BipTCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte) (net.Conn, error) {
 	var err error
 	for attempt := 0; attempt < 2; attempt++ {
-		cfg := &tls.Config{ServerName: b.wsHost}
+		cfg := &tls.Config{ServerName: host}
 		if len(ech) > 0 {
 			cfg.EncryptedClientHelloConfigList = ech
 		}
@@ -564,7 +585,7 @@ func (b *BipTCP) tlsToEdge(conn net.Conn) (net.Conn, error) {
 		var echErr *tls.ECHRejectionError
 		if attempt == 0 && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
 			ech = echErr.RetryConfigList // stale ECH key: redial and retry with the fresh one
-			if conn, err = net.DialTimeout("tcp", b.addr, 10*time.Second); err != nil {
+			if conn, err = net.DialTimeout("tcp", dialAddr, 10*time.Second); err != nil {
 				return nil, err
 			}
 			continue
@@ -574,57 +595,100 @@ func (b *BipTCP) tlsToEdge(conn net.Conn) (net.Conn, error) {
 	return nil, err
 }
 
-// dialLoop (client) keeps a connection to the server alive, retrying on drop.
+// establishWS opens one WebSocket connection: it picks the current pool edge (or the
+// single configured edge), dials it, does the wss TLS+ECH, and performs the upgrade.
+// In pool mode a failure is classified and the offending IP or SNI is burned before
+// the error is returned, so dialLoop advances to the next edge on retry:
+//
+//	dial timeout / refused → the IP is unreachable/blocked  → burn IP
+//	TLS handshake failure  → the SNI drew a reset (or bad cert) → burn SNI
+//	WS upgrade not 101      → the domain/zone/account blocks WS → burn SNI
+func (b *BipTCP) establishWS() (net.Conn, string, error) {
+	dialAddr, host, ech, path := b.addr, b.wsHost, b.wsECH, b.wsPath
+	if b.pool != nil {
+		ip, sni, ok := b.pool.current()
+		if !ok {
+			b.pool.resetBurns() // every combo burned — fresh cycle so we never dead-end
+			if ip, sni, ok = b.pool.current(); !ok {
+				return nil, "", errors.New("ws: edge pool is empty")
+			}
+		}
+		dialAddr, host, ech, path = ip, sni.host, sni.ech, sni.path
+	}
+	if host == "" {
+		host = dialAddr
+	}
+	conn, err := net.DialTimeout("tcp", dialAddr, 10*time.Second)
+	if err != nil {
+		if b.pool != nil {
+			b.pool.burnIP(dialAddr)
+		}
+		return nil, dialAddr, err
+	}
+	if b.wsTLS {
+		tc, terr := b.tlsToEdge(conn, dialAddr, host, ech)
+		if terr != nil {
+			if b.pool != nil {
+				b.pool.burnSNI(host)
+			}
+			return nil, dialAddr, terr
+		}
+		conn = tc
+	}
+	r, werr := wsClientHandshake(conn, host, path, time.Now().Add(handshakeTimeout))
+	if werr != nil {
+		conn.Close()
+		if b.pool != nil {
+			b.pool.burnSNI(host)
+		}
+		return nil, dialAddr, werr
+	}
+	return &wsConn{Conn: conn, r: r, client: true}, dialAddr, nil
+}
+
+// dialLoop (client) keeps a connection to the server alive, retrying on drop. For a
+// ws pool it rotates edges: each attempt uses the pool's current (IP × SNI), a
+// failure burns the offending IP/SNI (establishWS), and a proactive timer tears the
+// connection down after b.rotate so the client moves before the edge is fingerprinted.
 func (b *BipTCP) dialLoop() {
 	for {
 		if b.closed.Load() {
 			return
 		}
-		conn, err := net.DialTimeout("tcp", b.addr, 10*time.Second)
-		if err != nil {
-			log.Printf("bip/tcp: dial %s failed: %v", b.addr, err)
-			if b.sleep(1 * time.Second) {
-				return
+		var conn net.Conn
+		label := b.addr
+		if b.ws { // pool or single edge: dial + wss(+ECH) + upgrade, burning on failure
+			c, edge, err := b.establishWS()
+			if err != nil {
+				log.Printf("bip/ws: connect via %s failed: %v", edge, err)
+				if b.sleep(1 * time.Second) {
+					return
+				}
+				continue
 			}
-			continue
-		}
-		if b.ws { // optional TLS to the edge, then the WebSocket upgrade
-			if b.wsTLS {
-				tc, terr := b.tlsToEdge(conn)
-				if terr != nil {
-					log.Printf("bip/ws: tls to %s failed: %v", b.addr, terr)
+			conn, label = c, edge
+		} else {
+			c, err := net.DialTimeout("tcp", b.addr, 10*time.Second)
+			if err != nil {
+				log.Printf("bip/tcp: dial %s failed: %v", b.addr, err)
+				if b.sleep(1 * time.Second) {
+					return
+				}
+				continue
+			}
+			if b.cover { // wrap in a Chrome-fingerprinted TLS session carrying the auth token
+				tconn, cerr := tlscover.ClientConn(c, b.coverSNI, b.psk, time.Now().Add(handshakeTimeout))
+				if cerr != nil {
+					c.Close()
+					log.Printf("bip/tcp: tls cover to %s failed: %v", b.addr, cerr)
 					if b.sleep(1 * time.Second) {
 						return
 					}
 					continue
 				}
-				conn = tc
+				c = tconn
 			}
-			host := b.wsHost
-			if host == "" {
-				host = b.addr
-			}
-			r, werr := wsClientHandshake(conn, host, b.wsPath, time.Now().Add(handshakeTimeout))
-			if werr != nil {
-				conn.Close()
-				log.Printf("bip/ws: upgrade to %s failed: %v", b.addr, werr)
-				if b.sleep(1 * time.Second) {
-					return
-				}
-				continue
-			}
-			conn = &wsConn{Conn: conn, r: r, client: true}
-		} else if b.cover { // wrap in a Chrome-fingerprinted TLS session carrying the auth token
-			tconn, cerr := tlscover.ClientConn(conn, b.coverSNI, b.psk, time.Now().Add(handshakeTimeout))
-			if cerr != nil {
-				conn.Close()
-				log.Printf("bip/tcp: tls cover to %s failed: %v", b.addr, cerr)
-				if b.sleep(1 * time.Second) {
-					return
-				}
-				continue
-			}
-			conn = tconn
+			conn = c
 		}
 		cf := b.newFramer(conn)
 		conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
@@ -646,10 +710,21 @@ func (b *BipTCP) dialLoop() {
 				continue
 			}
 		}
-		log.Printf("bip/tcp: connected to %s", b.addr)
+		log.Printf("bip/tcp: connected to %s", label)
 		b.cur.Store(cf)
 		_ = cf.writeFrame(typePing, nil) // prime + authenticate us to the server
-		b.serve(cf)                      // blocks until this connection dies
+		// Proactive rotation: after b.rotate, advance the pool and drop this connection
+		// so dialLoop reconnects on the next edge. A connection that dies on its own
+		// keeps the same edge — the timer is stopped before that path runs.
+		var rot *time.Timer
+		if b.pool != nil && b.rotate > 0 {
+			c := conn
+			rot = time.AfterFunc(b.rotate, func() { b.pool.advance(); c.Close() })
+		}
+		b.serve(cf) // blocks until this connection dies
+		if rot != nil {
+			rot.Stop()
+		}
 		b.cur.CompareAndSwap(cf, nil)
 		if b.sleep(1 * time.Second) {
 			return

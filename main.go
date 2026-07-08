@@ -155,6 +155,19 @@ func main() {
 				log.Printf("tnl-core: listening (core/ws%s) on %s", obfsTag, cfg.Listen)
 			}
 		case "client":
+			if len(cfg.WSEdgeIPs) > 0 { // rotating edge pool overrides the single edge
+				snis := make([]packet.WSPoolSNI, len(cfg.WSEdgeSNIs))
+				for i, s := range cfg.WSEdgeSNIs {
+					snis[i] = packet.WSPoolSNI{Host: s.Host, ECH: s.ECH, Path: s.Path}
+				}
+				b, err = packet.DialWSPoolCfg(dev, ka, cfg.Obfs, cryptoOn, cfg.Crypto.PSK, cfg.Crypto.Cipher,
+					cfg.WSEdgeIPs, snis, time.Duration(cfg.WSRotateSecs)*time.Second, cfg.WSAutoBurn, cfg.WSStatusPath)
+				if err == nil {
+					log.Printf("tnl-core: dialing (core/ws%s wss ech pool: %dIP×%dSNI rotate=%ds auto_burn=%v)",
+						obfsTag, len(cfg.WSEdgeIPs), len(cfg.WSEdgeSNIs), cfg.WSRotateSecs, cfg.WSAutoBurn)
+				}
+				break
+			}
 			var echList []byte
 			if cfg.WSECH != "" { // validated as base64 in Config.Validate
 				echList, _ = base64.StdEncoding.DecodeString(cfg.WSECH)

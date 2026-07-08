@@ -21,6 +21,14 @@ type CryptoCfg struct {
 // Config is the full contract between the Python node agent and this core.
 // The node writes it to core-<id>.json and launches the binary with
 // --config <path>. Nothing here is invented at runtime; the node owns it.
+// WSSNI is one fronting domain in the ws edge pool, with its own base64 ECHConfigList
+// (empty = no ECH for this domain) and request path (empty = "/").
+type WSSNI struct {
+	Host string `json:"host"`
+	ECH  string `json:"ech"`
+	Path string `json:"path"`
+}
+
 type Config struct {
 	Role    string `json:"role"`    // "server" (public, listens) | "client" (behind NAT, dials)
 	Mode    string `json:"mode"`    // "packet" (only mode implemented in this slice)
@@ -102,6 +110,21 @@ type Config struct {
 	// (collateral cost) to stop it. The node fetches this from the domain's HTTPS DNS
 	// record over DoH (ordinary DNS is often poisoned). Empty = no ECH.
 	WSECH string `json:"ws_ech"`
+
+	// WSEdgeIPs / WSEdgeSNIs form a rotation POOL for the ws client: the core cycles
+	// (edge-IP × SNI) combinations so no single IP or domain stays exposed long enough
+	// to be fingerprinted, and drops a blocked one from rotation. Each SNI carries its
+	// own ECH + path. When WSEdgeIPs is non-empty the pool overrides the single
+	// WSHost/WSECH/peer. WSRotateSecs is the proactive rotation interval in seconds
+	// (0 = rotate only on failure). WSAutoBurn drops a failing IP/SNI from rotation
+	// (dial-timeout ⇒ IP, TLS-reset/403 ⇒ SNI) and records it to the status file.
+	WSEdgeIPs    []string `json:"ws_edge_ips"`
+	WSEdgeSNIs   []WSSNI  `json:"ws_edge_snis"`
+	WSRotateSecs int      `json:"ws_rotate_secs"`
+	WSAutoBurn   bool     `json:"ws_auto_burn"`
+	// WSStatusPath is where the pool writes its live status (active edge + burned
+	// IP/SNI lists) so the node/panel can surface and persist auto-burns. Set by main.
+	WSStatusPath string `json:"ws_status_path"`
 
 	// FluxCarrier selects how "flux" frames ride the wire: "udp" (default) sends
 	// real UDP datagrams on protocol 17 whose ports rotate each epoch among common
@@ -299,6 +322,25 @@ func (c *Config) validate() error {
 			}
 			if _, err := base64.StdEncoding.DecodeString(c.WSECH); err != nil {
 				return errors.New("ws_ech is not valid base64")
+			}
+		}
+		// Edge pool: a client+wss rotation set; every SNI's ECH must decode.
+		if len(c.WSEdgeIPs) > 0 || len(c.WSEdgeSNIs) > 0 {
+			if c.Role != "client" || !c.WSTLS {
+				return errors.New("ws edge pool requires ws_tls on a client")
+			}
+			if len(c.WSEdgeIPs) == 0 || len(c.WSEdgeSNIs) == 0 {
+				return errors.New("ws edge pool needs at least one edge IP and one SNI")
+			}
+			for _, s := range c.WSEdgeSNIs {
+				if s.Host == "" {
+					return errors.New("ws edge pool: an SNI entry has no host")
+				}
+				if s.ECH != "" {
+					if _, err := base64.StdEncoding.DecodeString(s.ECH); err != nil {
+						return errors.New("ws edge pool: an SNI has invalid base64 ech")
+					}
+				}
 			}
 		}
 	default:
