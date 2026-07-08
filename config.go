@@ -146,6 +146,13 @@ type Config struct {
 	// IP/SNI lists) so the node/panel can surface and persist auto-burns. Set by main.
 	WSStatusPath string `json:"ws_status_path"`
 
+	// WSWarmStandby keeps a SECOND, fully-handshaked carrier connection to another pool edge
+	// warm in the background (make-before-break). On the active carrier's failure or a proactive
+	// rotation the standby is promoted instantly instead of dialing fresh, so the TUN never sees a
+	// gap. Client + ws edge pool only (ignored otherwise); default false. The server side (no
+	// connect-time eviction + downstream-follows-data) is always on and single-connection-safe.
+	WSWarmStandby bool `json:"ws_warm_standby"`
+
 	// FluxCarrier selects how "flux" frames ride the wire: "udp" (default) sends
 	// real UDP datagrams on protocol 17 whose ports rotate each epoch among common
 	// QUIC/STUN/WebRTC ports — internet-safe, since transit forwards UDP; "stun"
