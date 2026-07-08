@@ -231,6 +231,25 @@ func TestAltHealthyLookups(t *testing.T) {
 	}
 }
 
+// selectEntry pins a specific edge: it moves the index onto that entry and clears any
+// suspect/dead mark so current() picks it, even if it was blocked a moment ago.
+func TestSelectEntryPinsAndClears(t *testing.T) {
+	p := newWSPool([]string{"a", "b"}, snis("x"), true, "")
+	p.markSuspect("ip", "b") // b was blocked
+	if !p.selectEntry("ip", "b") {
+		t.Fatal("selectEntry should find b")
+	}
+	if p.ipHealth["b"] != nil {
+		t.Fatal("selecting b must clear its suspect mark")
+	}
+	if ip, _, ok := p.current(); !ok || ip != "b" {
+		t.Fatalf("current() should now return the selected b, got %q ok=%v", ip, ok)
+	}
+	if p.selectEntry("ip", "does-not-exist") {
+		t.Fatal("selectEntry must return false for an unknown key")
+	}
+}
+
 func TestAutoBurnOffNoTracking(t *testing.T) {
 	p := newWSPool([]string{"a", "b"}, snis("x"), false, "") // manual-only
 	p.markSuspect("ip", "a")                                 // must NOT track

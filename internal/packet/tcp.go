@@ -819,6 +819,10 @@ func (b *TCP) retestLoop() {
 		case <-b.closeCh:
 			return
 		case <-t.C:
+			if kind, key, ok := b.pool.readSelectCmd(); ok { // panel "pin this edge" request
+				log.Printf("core/ws: select edge %s=%s (panel pin)", kind, key)
+				b.SelectEdge(kind, key)
+			}
 			for _, spec := range b.pool.dueRetests() {
 				if b.closed.Load() {
 					return
@@ -955,6 +959,17 @@ func (b *TCP) ProbeAllNow() {
 	if b.pool != nil {
 		b.pool.probeAllNow()
 	}
+}
+
+// SelectEdge pins a specific pool edge (kind "ip"|"sni", key its value) as the active one and
+// drops the live carrier so dialLoop immediately re-dials onto it — the TUN stays up. This is
+// the exact-jump behind the panel's per-edge pin button (delivered via the node's cmd file,
+// since a signal can't carry the key). No-op unless pooled.
+func (b *TCP) SelectEdge(kind, key string) {
+	if b.pool == nil {
+		return
+	}
+	b.rotate1(func() { b.pool.selectEntry(kind, key) })
 }
 
 func (b *TCP) rotate1(step func()) {
