@@ -1,8 +1,10 @@
 // Edge pool for the ws client: a moving-target rotation over separate clean IP and
 // SNI lists. The core cycles (edge-IP × SNI) combinations so no single IP or domain
-// stays exposed long enough to be fingerprinted, drops a blocked one from rotation
-// (classified by how it failed), and writes its live state to a status file the node
-// and panel read to surface and persist the auto-burns.
+// stays exposed long enough to be fingerprinted, and tracks per-entry HEALTH with a
+// three-state FSM (healthy → suspect → dead) instead of a one-shot burn: a failing
+// entry is pulled from rotation and retested on an exponential backoff, so a merely
+// TEMPORARY block heals itself without a rebuild. The live state is written to a status
+// file the node and panel read to surface and drive the pool.
 package packet
 
 import (
@@ -50,56 +52,124 @@ type wsSNIEntry struct {
 	path string
 }
 
-// burnEvidence is how many distinct partners on the OTHER axis an entry must fail a
-// handshake with before an (ambiguous) TLS/WS failure burns it. A single failed combo
-// can't tell whether the IP or the SNI is at fault — a throttled edge IP resets the TLS
-// handshake exactly like a blocked SNI does — so we wait for corroboration: an IP that
-// fails across several SNIs is the culprit; an SNI that fails across several IPs is.
-const burnEvidence = 2
+// Health FSM states for a pool entry (an IP, or an SNI host). A HEALTHY entry has NO record
+// in the health map at all (absence == healthy); only suspect/dead entries are tracked.
+const (
+	stateSuspect = "suspect" // a probe found it guilty; pulled from rotation; retested on backoff
+	stateDead    = "dead"    // failed enough retests; retested only on the slow interval
+)
 
-// wsPool holds the clean IP/SNI lists, runtime burn tracking, and the active index.
-// Auto-burn (when enabled) removes a failing IP or SNI from selection; the burn set
-// is snapshotted to statusPath after every change. ipFails/sniFails accumulate the
-// per-axis evidence used to attribute an ambiguous handshake failure (see burnEvidence).
+// suspectBackoff is the retest schedule (seconds) for a SUSPECT entry: it enters suspect
+// scheduled +30s out, and each FAILED retest walks one step further down the list. Running
+// off the end (the 5th failed retest) drops the entry to DEAD.
+var suspectBackoff = []int64{30, 60, 120, 300, 600}
+
+// deadRetest is the slow interval (seconds) a DEAD entry is retested on.
+const deadRetest int64 = 1800
+
+// healthRec tracks one non-healthy pool entry. fails counts failed retests since it entered
+// suspect; nextRetest is the unix time the scheduler may probe it again.
+type healthRec struct {
+	state      string
+	fails      int
+	nextRetest int64
+}
+
+// wsPool holds the clean IP/SNI lists, the per-entry health FSM, and the active index.
+// ipHealth/sniHealth track only the non-healthy entries (absent == healthy). Every change
+// is snapshotted to statusPath. The pool is network-free (unit-testable): the prober and the
+// retest scheduler live in tcp.go and drive the FSM through these pure methods.
 type wsPool struct {
 	mu         sync.Mutex
 	ips        []string
 	snis       []wsSNIEntry
-	burnedIP   map[string]bool
-	burnedSNI  map[string]bool
-	ipFails    map[string]map[string]bool // ip  -> distinct SNIs it failed a handshake with
-	sniFails   map[string]map[string]bool // sni -> distinct IPs it failed a handshake with
-	i, j       int                        // current ip / sni index
+	ipHealth   map[string]*healthRec // absent == healthy
+	sniHealth  map[string]*healthRec // absent == healthy
+	i, j       int                   // current ip / sni index
 	autoBurn   bool
 	statusPath string
 	active     string
+	now        func() int64 // injectable clock (unix seconds); overridden in tests
 }
 
 func newWSPool(ips []string, snis []wsSNIEntry, autoBurn bool, statusPath string) *wsPool {
-	p := &wsPool{ips: ips, snis: snis, burnedIP: map[string]bool{}, burnedSNI: map[string]bool{},
-		ipFails: map[string]map[string]bool{}, sniFails: map[string]map[string]bool{},
-		autoBurn: autoBurn, statusPath: statusPath}
+	p := &wsPool{ips: ips, snis: snis, ipHealth: map[string]*healthRec{}, sniHealth: map[string]*healthRec{},
+		autoBurn: autoBurn, statusPath: statusPath, now: func() int64 { return time.Now().Unix() }}
 	p.writeStatus()
 	return p
 }
 
-// current returns the active (ip, sni), skipping any burned IP or SNI. ok=false when
-// every combination is unusable — the caller then resets the burns for a fresh cycle
-// so the tunnel is never permanently dead-ended.
+// healthMap returns the record map for the given axis ("ip" or "sni"). Caller holds the lock.
+func (p *wsPool) healthMap(kind string) map[string]*healthRec {
+	if kind == "sni" {
+		return p.sniHealth
+	}
+	return p.ipHealth
+}
+
+// current returns the active (ip, sni). It prefers a FULLY-HEALTHY combo, scanning forward
+// from the current index so consecutive dials rotate for variety. When no combo is fully
+// healthy it never dead-ends: it falls back to the least-bad ip and sni (soonest nextRetest,
+// suspect preferred over dead) so the tunnel keeps trying while the retest scheduler works
+// the blocked entries back to health. ok=false only if the pool has no IPs or no SNIs.
 func (p *wsPool) current() (string, wsSNIEntry, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if len(p.ips) == 0 || len(p.snis) == 0 {
+		return "", wsSNIEntry{}, false
+	}
 	n := len(p.ips) * len(p.snis)
 	for k := 0; k < n; k++ {
 		ip := p.ips[p.i%len(p.ips)]
 		sni := p.snis[p.j%len(p.snis)]
-		if !p.burnedIP[ip] && !p.burnedSNI[sni.host] {
+		if p.ipHealth[ip] == nil && p.sniHealth[sni.host] == nil {
 			p.active = ip + " · " + sni.host
 			return ip, sni, true
 		}
 		p.stepLocked()
 	}
-	return "", wsSNIEntry{}, false
+	ip := p.bestIPLocked()
+	sni := p.bestSNILocked()
+	p.active = ip + " · " + sni.host
+	return ip, sni, true
+}
+
+// bestIPLocked / bestSNILocked return the least-bad entry for the current() fallback: a
+// healthy one if any, else the tracked entry with the soonest nextRetest, preferring suspect
+// over dead. Caller holds the lock; the underlying slice is non-empty.
+func (p *wsPool) bestIPLocked() string {
+	best := p.ips[0]
+	bt, bn := p.tierLocked("ip", best)
+	for _, ip := range p.ips[1:] {
+		if t, n := p.tierLocked("ip", ip); t < bt || (t == bt && n < bn) {
+			best, bt, bn = ip, t, n
+		}
+	}
+	return best
+}
+
+func (p *wsPool) bestSNILocked() wsSNIEntry {
+	best := p.snis[0]
+	bt, bn := p.tierLocked("sni", best.host)
+	for _, s := range p.snis[1:] {
+		if t, n := p.tierLocked("sni", s.host); t < bt || (t == bt && n < bn) {
+			best, bt, bn = s, t, n
+		}
+	}
+	return best
+}
+
+// tierLocked ranks an entry for the current() fallback: 0 healthy, 1 suspect, 2 dead, with
+// its nextRetest as the tiebreak within a tier. Caller holds the lock.
+func (p *wsPool) tierLocked(kind, key string) (tier int, next int64) {
+	r := p.healthMap(kind)[key]
+	if r == nil {
+		return 0, 0
+	}
+	if r.state == stateDead {
+		return 2, r.nextRetest
+	}
+	return 1, r.nextRetest
 }
 
 // stepLocked advances to the next (ip, sni) combination (caller holds the lock).
@@ -114,7 +184,7 @@ func (p *wsPool) stepLocked() {
 	}
 }
 
-// advance rotates to the next combination (proactive rotation timer).
+// advance rotates to the next combination (proactive rotation timer / post-failure retry).
 func (p *wsPool) advance() {
 	p.mu.Lock()
 	p.stepLocked()
@@ -122,8 +192,8 @@ func (p *wsPool) advance() {
 }
 
 // advanceIP / advanceSNI rotate a single dimension (manual "rotate now, IP only" /
-// "rotate now, SNI only" from the panel). current() still skips burned entries, so a
-// bump that lands on a burned one is passed over on the next dial.
+// "rotate now, SNI only" from the panel). current() still skips unhealthy entries, so a
+// bump that lands on a suspect/dead one is passed over on the next dial.
 func (p *wsPool) advanceIP() {
 	p.mu.Lock()
 	if len(p.ips) > 0 {
@@ -140,120 +210,220 @@ func (p *wsPool) advanceSNI() {
 	p.mu.Unlock()
 }
 
-// burnIP/burnSNI drop a failing entry from rotation (when autoBurn is on) and step
-// past it. A no-op on autoBurn=off except for advancing, so a manual-only pool still
-// rotates away from a dead edge for this attempt without persisting the burn. These are
-// the UNAMBIGUOUS burns — burnIP for a TCP-dial failure (the SNI never went on the wire,
-// so the IP alone is at fault). Ambiguous TLS/WS failures go through handshakeFailed.
-func (p *wsPool) burnIP(ip string) {
-	p.mu.Lock()
-	if p.autoBurn {
-		p.burnIPLocked(ip)
+// markSuspect moves a HEALTHY entry into suspect (out of active rotation, scheduled for a
+// +30s retest). A no-op when autoBurn is off (a manual-only pool never auto-sidelines an
+// entry) or when the entry is already tracked — a fresh live failure must not reset an
+// in-progress backoff; the retest scheduler owns the entry's cadence from here.
+func (p *wsPool) markSuspect(kind, key string) {
+	if !p.autoBurn {
+		return
 	}
-	p.stepLocked()
+	p.mu.Lock()
+	m := p.healthMap(kind)
+	if m[key] == nil {
+		m[key] = &healthRec{state: stateSuspect, nextRetest: p.now() + suspectBackoff[0]}
+	}
 	p.mu.Unlock()
 	p.writeStatus()
 }
 
-func (p *wsPool) burnSNI(host string) {
+// succeeded clears the health records for a combo that just connected: a live success proves
+// both its IP and its SNI healthy right now. Only writes the status file if something changed.
+func (p *wsPool) succeeded(ip, host string) {
 	p.mu.Lock()
-	if p.autoBurn {
-		p.burnSNILocked(host)
+	changed := p.ipHealth[ip] != nil || p.sniHealth[host] != nil
+	delete(p.ipHealth, ip)
+	delete(p.sniHealth, host)
+	p.mu.Unlock()
+	if changed {
+		p.writeStatus()
 	}
-	p.stepLocked()
+}
+
+// retestResult feeds a probe outcome for a tracked entry into the FSM: ANY success clears it
+// back to healthy; a failure walks the suspect backoff and eventually drops it to dead.
+func (p *wsPool) retestResult(kind, key string, success bool) {
+	p.mu.Lock()
+	m := p.healthMap(kind)
+	r := m[key]
+	if r == nil { // cleared from under us (e.g. a concurrent live success) — nothing to do
+		p.mu.Unlock()
+		return
+	}
+	if success {
+		delete(m, key)
+	} else {
+		p.failRetestLocked(r)
+	}
 	p.mu.Unlock()
 	p.writeStatus()
 }
 
-// burnIPLocked marks an IP burned and drops its blame votes against SNIs: now that the
-// IP is known bad, its past handshake failures are no evidence against those domains, so
-// they must not push a healthy SNI over the threshold. Caller holds the lock.
-func (p *wsPool) burnIPLocked(ip string) {
-	p.burnedIP[ip] = true
-	for sni := range p.ipFails[ip] {
-		if s := p.sniFails[sni]; s != nil {
-			delete(s, ip)
-		}
+// failRetestLocked reschedules a tracked entry after a FAILED retest. A suspect walks the
+// backoff list; running off its end (fails == len) drops it to dead. A dead entry stays dead
+// on the slow interval. Caller holds the lock.
+func (p *wsPool) failRetestLocked(r *healthRec) {
+	now := p.now()
+	if r.state == stateDead {
+		r.nextRetest = now + deadRetest
+		return
 	}
-	delete(p.ipFails, ip)
+	r.fails++
+	if r.fails >= len(suspectBackoff) {
+		r.state = stateDead
+		r.nextRetest = now + deadRetest
+		return
+	}
+	r.nextRetest = now + suspectBackoff[r.fails]
 }
 
-func (p *wsPool) burnSNILocked(host string) {
-	p.burnedSNI[host] = true
-	for ip := range p.sniFails[host] {
-		if m := p.ipFails[ip]; m != nil {
-			delete(m, host)
-		}
-	}
-	delete(p.sniFails, host)
+// retestSpec is one entry the scheduler should probe now, paired with a partner on the OTHER
+// axis to probe it against (a known-healthy partner when one exists, else the current active
+// partner) so the probe changes only the entry under test.
+type retestSpec struct {
+	kind string // "ip" or "sni": which axis the entry belongs to
+	key  string
+	ip   string     // the IP to dial
+	sni  wsSNIEntry // the SNI to present
 }
 
-// handshakeFailed records a TLS/WS-upgrade failure of a specific (ip, sni) combo. Which
-// axis is at fault is ambiguous, so nothing is burned on the first data point: the IP is
-// burned only once it has failed across burnEvidence distinct SNIs, the SNI only once it
-// has failed across burnEvidence distinct IPs. Until then we rotate on and let the next
-// combo corroborate — this is what stops one dead edge IP from burning healthy SNIs.
-func (p *wsPool) handshakeFailed(ip, sni string) {
+// dueRetests returns the tracked entries whose nextRetest has arrived, each paired with a
+// partner to probe against. The scheduler runs one probe per spec and feeds the boolean back
+// through retestResult.
+func (p *wsPool) dueRetests() []retestSpec {
 	p.mu.Lock()
-	if p.autoBurn {
-		if p.ipFails[ip] == nil {
-			p.ipFails[ip] = map[string]bool{}
-		}
-		p.ipFails[ip][sni] = true
-		if p.sniFails[sni] == nil {
-			p.sniFails[sni] = map[string]bool{}
-		}
-		p.sniFails[sni][ip] = true
-		switch {
-		case len(p.ipFails[ip]) >= burnEvidence:
-			p.burnIPLocked(ip)
-		case len(p.sniFails[sni]) >= burnEvidence:
-			p.burnSNILocked(sni)
+	defer p.mu.Unlock()
+	now := p.now()
+	var out []retestSpec
+	for _, ip := range p.ips {
+		if r := p.ipHealth[ip]; r != nil && r.nextRetest <= now {
+			out = append(out, retestSpec{kind: "ip", key: ip, ip: ip, sni: p.partnerSNILocked()})
 		}
 	}
-	p.stepLocked()
-	p.mu.Unlock()
-	p.writeStatus()
+	for _, s := range p.snis {
+		if r := p.sniHealth[s.host]; r != nil && r.nextRetest <= now {
+			out = append(out, retestSpec{kind: "sni", key: s.host, ip: p.partnerIPLocked(), sni: s})
+		}
+	}
+	return out
 }
 
-// succeeded clears the accumulated blame for a combo that just connected, so a stale
-// transient failure never adds up to a false burn later.
-func (p *wsPool) succeeded(ip, sni string) {
+// partnerSNILocked / partnerIPLocked pick a KNOWN-HEALTHY partner to retest an entry against,
+// falling back to the currently-selected one when none is healthy. Caller holds the lock.
+func (p *wsPool) partnerSNILocked() wsSNIEntry {
+	for _, s := range p.snis {
+		if p.sniHealth[s.host] == nil {
+			return s
+		}
+	}
+	return p.snis[p.j%len(p.snis)]
+}
+
+func (p *wsPool) partnerIPLocked() string {
+	for _, ip := range p.ips {
+		if p.ipHealth[ip] == nil {
+			return ip
+		}
+	}
+	return p.ips[p.i%len(p.ips)]
+}
+
+// altHealthySNI returns a healthy SNI other than exclude (the differential probe's
+// "same IP, different SNI" arm); ok=false when none exists.
+func (p *wsPool) altHealthySNI(exclude string) (wsSNIEntry, bool) {
 	p.mu.Lock()
-	if m := p.ipFails[ip]; m != nil {
-		delete(m, sni)
+	defer p.mu.Unlock()
+	for _, s := range p.snis {
+		if s.host != exclude && p.sniHealth[s.host] == nil {
+			return s, true
+		}
 	}
-	if s := p.sniFails[sni]; s != nil {
-		delete(s, ip)
-	}
-	p.mu.Unlock()
+	return wsSNIEntry{}, false
 }
 
-// resetBurns clears the burn sets — called when the pool is exhausted so a link never
-// dead-ends (a temporarily-blocked IP/SNI gets another chance on the next cycle).
-func (p *wsPool) resetBurns() {
+// altHealthyIP returns a healthy IP other than exclude (the differential probe's
+// "different IP, same SNI" arm); ok=false when none exists.
+func (p *wsPool) altHealthyIP(exclude string) (string, bool) {
 	p.mu.Lock()
-	p.burnedIP = map[string]bool{}
-	p.burnedSNI = map[string]bool{}
-	p.ipFails = map[string]map[string]bool{}
-	p.sniFails = map[string]map[string]bool{}
-	p.mu.Unlock()
-	p.writeStatus()
+	defer p.mu.Unlock()
+	for _, ip := range p.ips {
+		if ip != exclude && p.ipHealth[ip] == nil {
+			return ip, true
+		}
+	}
+	return "", false
 }
 
-// writeStatus snapshots {active, burned_ips, burned_snis} to statusPath (best effort)
-// so the node/panel can show the live edge and persist auto-burns to the config.
+// probeNow forces an entry to be retested on the scheduler's next tick (backs a panel/node
+// "probe now" control). A no-op for an untracked (healthy) entry.
+func (p *wsPool) probeNow(kind, key string) {
+	p.mu.Lock()
+	if r := p.healthMap(kind)[key]; r != nil {
+		r.nextRetest = p.now()
+	}
+	p.mu.Unlock()
+}
+
+// probeAllNow pulls EVERY suspect/dead entry's retest forward to now, so the scheduler
+// probes them all on its next tick. Backs the panel's "probe now" control (a signal can't
+// carry a specific key, so this sweeps them all — cheap TLS-only probes).
+func (p *wsPool) probeAllNow() {
+	p.mu.Lock()
+	now := p.now()
+	for _, r := range p.ipHealth {
+		r.nextRetest = now
+	}
+	for _, r := range p.sniHealth {
+		r.nextRetest = now
+	}
+	p.mu.Unlock()
+}
+
+// healthStatus is one entry's health as published to the status file.
+type healthStatus struct {
+	Key        string `json:"key"`
+	Kind       string `json:"kind"`  // "ip" | "sni"
+	State      string `json:"state"` // "healthy" | "suspect" | "dead"
+	Fails      int    `json:"fails"`
+	NextRetest int64  `json:"next_retest_unix"`
+}
+
+// writeStatus snapshots {active, burned_ips, burned_snis, health, ts} to statusPath (best
+// effort) so the node/panel can show the live edge and drive the pool. health carries the
+// full per-entry FSM state; burned_ips/burned_snis keep the old arrays alive (every
+// suspect-or-dead key) so existing readers keep working.
 func (p *wsPool) writeStatus() {
 	if p.statusPath == "" {
 		return
 	}
 	p.mu.Lock()
+	health := make([]healthStatus, 0, len(p.ips)+len(p.snis))
+	burnedIPs, burnedSNIs := []string{}, []string{}
+	for _, ip := range p.ips {
+		hs := healthStatus{Key: ip, Kind: "ip", State: "healthy"}
+		if r := p.ipHealth[ip]; r != nil {
+			hs.State, hs.Fails, hs.NextRetest = r.state, r.fails, r.nextRetest
+			burnedIPs = append(burnedIPs, ip)
+		}
+		health = append(health, hs)
+	}
+	for _, s := range p.snis {
+		hs := healthStatus{Key: s.host, Kind: "sni", State: "healthy"}
+		if r := p.sniHealth[s.host]; r != nil {
+			hs.State, hs.Fails, hs.NextRetest = r.state, r.fails, r.nextRetest
+			burnedSNIs = append(burnedSNIs, s.host)
+		}
+		health = append(health, hs)
+	}
+	sort.Strings(burnedIPs)
+	sort.Strings(burnedSNIs)
 	st := struct {
-		Active     string   `json:"active"`
-		BurnedIPs  []string `json:"burned_ips"`
-		BurnedSNIs []string `json:"burned_snis"`
-		TS         int64    `json:"ts"`
-	}{Active: p.active, BurnedIPs: keysOf(p.burnedIP), BurnedSNIs: keysOf(p.burnedSNI), TS: time.Now().Unix()}
+		Active     string         `json:"active"`
+		BurnedIPs  []string       `json:"burned_ips"`
+		BurnedSNIs []string       `json:"burned_snis"`
+		Health     []healthStatus `json:"health"`
+		TS         int64          `json:"ts"`
+	}{Active: p.active, BurnedIPs: burnedIPs, BurnedSNIs: burnedSNIs, Health: health, TS: time.Now().Unix()}
 	p.mu.Unlock()
 	if data, err := json.Marshal(st); err == nil {
 		tmp := p.statusPath + ".tmp"
@@ -261,13 +431,4 @@ func (p *wsPool) writeStatus() {
 			_ = os.Rename(tmp, p.statusPath) // atomic replace so a reader never sees a half file
 		}
 	}
-}
-
-func keysOf(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

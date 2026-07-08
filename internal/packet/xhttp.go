@@ -223,17 +223,14 @@ func (u *xhUp) post(sc seqChunk) error {
 }
 
 // xhttpEdge resolves the (dialAddr, host, ech, path) for this attempt. With an edge pool it uses
-// the pool's current (IP × SNI), resetting burns if every combination is burned so the client
-// never dead-ends. A single fixed edge uses the plain WSHost/WSECH/WSPath.
+// the pool's current (IP × SNI); current() never dead-ends (it falls back to the least-bad combo).
+// A single fixed edge uses the plain WSHost/WSECH/WSPath.
 func (b *TCP) xhttpEdge() (dialAddr, host string, ech []byte, path string, err error) {
 	dialAddr, host, ech, path = b.addr, b.wsHost, b.wsECH, b.wsPath
 	if b.pool != nil {
 		ip, sni, ok := b.pool.current()
 		if !ok {
-			b.pool.resetBurns() // every combo burned — fresh cycle so we never dead-end
-			if ip, sni, ok = b.pool.current(); !ok {
-				return "", "", nil, "", fmt.Errorf("xhttp: edge pool is empty")
-			}
+			return "", "", nil, "", fmt.Errorf("xhttp: edge pool is empty")
 		}
 		dialAddr, host, ech, path = ip, sni.host, sni.ech, sni.path
 	}
@@ -302,12 +299,23 @@ func (b *TCP) establishXHTTP() (net.Conn, string, error) {
 	}
 	// "stream" is a legacy alias for grpc: plain stream-one (octet-stream) was removed because it
 	// stalled through CDNs that buffer the origin leg; grpc is the full-duplex mode that streams.
+	var conn net.Conn
 	switch b.xhMode {
 	case "grpc", "stream":
-		return b.dialXHTTPGrpc(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
+		conn, _, err = b.dialXHTTPGrpc(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
 	default:
-		return b.dialXHTTPPacket(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
+		conn, _, err = b.dialXHTTPPacket(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
 	}
+	// Attribute the outcome to the health FSM here (one place for both modes): a failure runs
+	// the differential probe to decide IP vs SNI vs transient; a success clears both axes.
+	if b.pool != nil {
+		if err != nil {
+			b.attributeFailure(dialAddr, wsSNIEntry{host: host, ech: ech, path: path})
+		} else {
+			b.pool.succeeded(dialAddr, host)
+		}
+	}
+	return conn, dialAddr, err
 }
 
 // --- gRPC framing (mode "grpc") ---------------------------------------------------------------
@@ -416,22 +424,13 @@ func (b *TCP) dialXHTTPGrpc(hc *http.Client, tr *http.Transport, ctx context.Con
 	if err != nil {
 		cancel()
 		pw.Close()
-		if b.pool != nil { // dial+TLS are bundled here, so which axis failed is ambiguous
-			b.pool.handshakeFailed(dialAddr, host)
-		}
 		return nil, dialAddr, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		cancel()
 		pw.Close()
-		if b.pool != nil { // the edge answered but rejected this combo — attribute by evidence
-			b.pool.handshakeFailed(dialAddr, host)
-		}
 		return nil, dialAddr, fmt.Errorf("xhttp/grpc: got HTTP %d (want 200)", resp.StatusCode)
-	}
-	if b.pool != nil {
-		b.pool.succeeded(dialAddr, host)
 	}
 	conn := &xhttpConn{
 		r:  &grpcDeframingReader{r: resp.Body}, // Read <- deframed downstream
@@ -450,21 +449,12 @@ func (b *TCP) dialXHTTPPacket(hc *http.Client, tr *http.Transport, ctx context.C
 	gresp, err := hc.Do(greq)
 	if err != nil {
 		cancel()
-		if b.pool != nil { // dial+TLS are bundled here, so which axis failed is ambiguous
-			b.pool.handshakeFailed(dialAddr, host)
-		}
 		return nil, dialAddr, err
 	}
 	if gresp.StatusCode != http.StatusOK {
 		gresp.Body.Close()
 		cancel()
-		if b.pool != nil { // the edge answered but rejected this combo — attribute by evidence
-			b.pool.handshakeFailed(dialAddr, host)
-		}
 		return nil, dialAddr, fmt.Errorf("xhttp: down got HTTP %d (want 200)", gresp.StatusCode)
-	}
-	if b.pool != nil {
-		b.pool.succeeded(dialAddr, host)
 	}
 	urlFor := func(seq uint64) string {
 		return base + "?s=" + sid + "&seq=" + strconv.FormatUint(seq, 10)

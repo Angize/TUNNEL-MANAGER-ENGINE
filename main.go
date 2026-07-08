@@ -252,17 +252,22 @@ func main() {
 	if r, ok := b.(interface {
 		RotateIP()
 		RotateSNI()
+		ProbeAllNow()
 	}); ok {
-		rsig := make(chan os.Signal, 2)
-		signal.Notify(rsig, syscall.SIGUSR1, syscall.SIGUSR2)
+		rsig := make(chan os.Signal, 3)
+		signal.Notify(rsig, syscall.SIGUSR1, syscall.SIGUSR2, syscall.SIGHUP)
 		go func() {
 			for s := range rsig {
-				if s == syscall.SIGUSR1 {
+				switch s {
+				case syscall.SIGUSR1:
 					log.Print("tnl-core: rotate-now (edge IP)")
 					r.RotateIP()
-				} else {
+				case syscall.SIGUSR2:
 					log.Print("tnl-core: rotate-now (SNI)")
 					r.RotateSNI()
+				case syscall.SIGHUP:
+					log.Print("tnl-core: probe-now (retest all suspect/dead edges)")
+					r.ProbeAllNow()
 				}
 			}
 		}()

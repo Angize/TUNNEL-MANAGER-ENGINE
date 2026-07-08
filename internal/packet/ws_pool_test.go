@@ -15,6 +15,15 @@ func snis(hosts ...string) []wsSNIEntry {
 	return out
 }
 
+// clockPool builds a pool with an injectable clock so the FSM's scheduling is deterministic.
+// The returned pointer is the "now" value; bump it to advance time.
+func clockPool(ips []string, snis []wsSNIEntry, autoBurn bool, statusPath string) (*wsPool, *int64) {
+	p := newWSPool(ips, snis, autoBurn, statusPath)
+	var now int64 = 1000
+	p.now = func() int64 { return now }
+	return p, &now
+}
+
 func TestPoolRotatesAllCombos(t *testing.T) {
 	p := newWSPool([]string{"a", "b"}, snis("x", "y"), true, "")
 	seen := map[string]bool{}
@@ -33,113 +42,201 @@ func TestPoolRotatesAllCombos(t *testing.T) {
 	}
 }
 
-func TestBurnIPExcludesIt(t *testing.T) {
+// A verdict of IP_GUILTY (applied via markSuspect) moves a healthy IP into suspect, and
+// current() then skips it while a healthy alternative remains.
+func TestMarkSuspectPullsFromRotation(t *testing.T) {
 	p := newWSPool([]string{"a", "b"}, snis("x"), true, "")
-	p.burnIP("a") // a is dead; only b remains
+	p.markSuspect("ip", "a")
+	if r := p.ipHealth["a"]; r == nil || r.state != stateSuspect || r.fails != 0 {
+		t.Fatalf("a should be suspect with fails=0, got %#v", r)
+	}
 	for i := 0; i < 5; i++ {
 		ip, _, ok := p.current()
 		if !ok || ip != "b" {
-			t.Fatalf("expected only b after burning a, got ip=%q ok=%v", ip, ok)
+			t.Fatalf("suspect a must be skipped while b is healthy; got ip=%q ok=%v", ip, ok)
 		}
 		p.advance()
 	}
 }
 
-func TestBurnSNIExcludesIt(t *testing.T) {
-	p := newWSPool([]string{"a"}, snis("x", "y"), true, "")
-	p.burnSNI("x")
-	for i := 0; i < 4; i++ {
-		_, sni, ok := p.current()
-		if !ok || sni.host != "y" {
-			t.Fatalf("expected only y after burning x, got %q ok=%v", sni.host, ok)
+// The suspect backoff walks 30,60,120,300,600 (as nextRetest deltas) over five failed retests,
+// then the entry drops to dead on the sixth failure (the initial markSuspect is failure #1).
+func TestSuspectBackoffThenDead(t *testing.T) {
+	p, now := clockPool([]string{"a", "b"}, snis("x"), true, "")
+	p.markSuspect("ip", "a")
+	if got := p.ipHealth["a"].nextRetest; got != *now+30 {
+		t.Fatalf("entry retest should be now+30, got %d (now=%d)", got, *now)
+	}
+	wantNext := []int64{60, 120, 300, 600} // deltas after failed retests 1..4
+	for i, w := range wantNext {
+		p.retestResult("ip", "a", false)
+		r := p.ipHealth["a"]
+		if r.state != stateSuspect {
+			t.Fatalf("retest %d: still suspect expected, got %q", i+1, r.state)
 		}
-		p.advance()
+		if r.fails != i+1 {
+			t.Fatalf("retest %d: fails=%d, want %d", i+1, r.fails, i+1)
+		}
+		if r.nextRetest != *now+w {
+			t.Fatalf("retest %d: nextRetest=%d, want %d", i+1, r.nextRetest, *now+w)
+		}
+	}
+	// Fifth failed retest (sixth failure overall) -> dead on the slow interval.
+	p.retestResult("ip", "a", false)
+	r := p.ipHealth["a"]
+	if r.state != stateDead || r.nextRetest != *now+deadRetest {
+		t.Fatalf("expected dead at now+%d, got state=%q next=%d", deadRetest, r.state, r.nextRetest)
+	}
+	// A dead entry's failed retest stays dead and reschedules on the slow interval from now.
+	*now = 5000
+	p.retestResult("ip", "a", false)
+	if r := p.ipHealth["a"]; r.state != stateDead || r.nextRetest != 5000+deadRetest {
+		t.Fatalf("dead entry should stay dead at 5000+%d, got state=%q next=%d", deadRetest, r.state, r.nextRetest)
 	}
 }
 
-// A single ambiguous (TLS/WS) failure attributes to nothing — we can't yet tell whether
-// the IP or the SNI is at fault, so neither is burned.
-func TestHandshakeFailSingleBurnsNothing(t *testing.T) {
+// ANY successful retest clears the record back to healthy (in rotation again).
+func TestSuccessfulRetestHealsToHealthy(t *testing.T) {
+	p, _ := clockPool([]string{"a", "b"}, snis("x"), true, "")
+	p.markSuspect("ip", "a")
+	p.retestResult("ip", "a", false) // suspect, fails=1
+	p.retestResult("ip", "a", true)  // heals
+	if p.ipHealth["a"] != nil {
+		t.Fatalf("a should be healthy again, got %#v", p.ipHealth["a"])
+	}
+	// Also proven healthy via a live success on a dead entry.
+	p.markSuspect("sni", "x")
+	p.ipHealth["a"] = &healthRec{state: stateDead, nextRetest: 9999}
+	p.succeeded("a", "x")
+	if p.ipHealth["a"] != nil || p.sniHealth["x"] != nil {
+		t.Fatalf("succeeded must clear both axes; ip=%#v sni=%#v", p.ipHealth["a"], p.sniHealth["x"])
+	}
+}
+
+// current() never dead-ends: with nothing fully healthy it returns the least-bad combo —
+// suspect preferred over dead, then soonest nextRetest.
+func TestCurrentFallbackLeastBad(t *testing.T) {
+	p, _ := clockPool([]string{"a", "b"}, snis("x", "y"), true, "")
+	// a dead (sooner) vs b suspect (later); x suspect (later) vs y dead (sooner).
+	p.ipHealth["a"] = &healthRec{state: stateDead, nextRetest: 1005}
+	p.ipHealth["b"] = &healthRec{state: stateSuspect, nextRetest: 1100}
+	p.sniHealth["x"] = &healthRec{state: stateSuspect, nextRetest: 1050}
+	p.sniHealth["y"] = &healthRec{state: stateDead, nextRetest: 1010}
+	ip, sni, ok := p.current()
+	if !ok {
+		t.Fatal("fallback must still return a combo")
+	}
+	if ip != "b" || sni.host != "x" {
+		t.Fatalf("least-bad should prefer suspect over dead: want b/x, got %s/%s", ip, sni.host)
+	}
+	// Within the same tier, the soonest nextRetest wins.
+	p.ipHealth["a"] = &healthRec{state: stateSuspect, nextRetest: 1005}
+	p.ipHealth["b"] = &healthRec{state: stateSuspect, nextRetest: 1100}
+	if ip, _, _ := p.current(); ip != "a" {
+		t.Fatalf("same-tier tiebreak should pick soonest retest a, got %s", ip)
+	}
+}
+
+// The status snapshot carries the full per-entry FSM state, and keeps the legacy burned arrays
+// populated with the suspect-or-dead keys.
+func TestStatusSnapshotStates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "st.json")
+	p, now := clockPool([]string{"a", "b"}, snis("x"), true, path)
+	p.current() // sets active
+	p.markSuspect("ip", "a")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("status file not written: %v", err)
+	}
+	var st struct {
+		Active     string `json:"active"`
+		BurnedIPs  []string `json:"burned_ips"`
+		BurnedSNIs []string `json:"burned_snis"`
+		Health     []struct {
+			Key        string `json:"key"`
+			Kind       string `json:"kind"`
+			State      string `json:"state"`
+			Fails      int    `json:"fails"`
+			NextRetest int64  `json:"next_retest_unix"`
+		} `json:"health"`
+	}
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatalf("bad status json: %v", err)
+	}
+	got := map[string]string{} // key -> state
+	var aNext int64
+	for _, h := range st.Health {
+		got[h.Kind+":"+h.Key] = h.State
+		if h.Kind == "ip" && h.Key == "a" {
+			aNext = h.NextRetest
+		}
+	}
+	if got["ip:a"] != stateSuspect || got["ip:b"] != "healthy" || got["sni:x"] != "healthy" {
+		t.Fatalf("health states wrong: %v", got)
+	}
+	if aNext != *now+30 {
+		t.Fatalf("suspect a next_retest_unix=%d, want %d", aNext, *now+30)
+	}
+	if len(st.BurnedIPs) != 1 || st.BurnedIPs[0] != "a" {
+		t.Fatalf("expected burned_ips=[a], got %v", st.BurnedIPs)
+	}
+	if len(st.BurnedSNIs) != 0 {
+		t.Fatalf("expected no burned_snis, got %v", st.BurnedSNIs)
+	}
+}
+
+// dueRetests reports only entries whose backoff has elapsed; probeNow pulls one forward so the
+// scheduler picks it up on the next tick, paired with a healthy partner on the other axis.
+func TestDueRetestsAndProbeNow(t *testing.T) {
+	p, now := clockPool([]string{"a", "b"}, snis("x", "y"), true, "")
+	p.markSuspect("ip", "a") // due at now+30
+	if due := p.dueRetests(); len(due) != 0 {
+		t.Fatalf("nothing should be due yet, got %v", due)
+	}
+	p.probeNow("ip", "a")
+	due := p.dueRetests()
+	if len(due) != 1 || due[0].kind != "ip" || due[0].key != "a" {
+		t.Fatalf("probeNow should make a due, got %v", due)
+	}
+	if due[0].ip != "a" {
+		t.Fatalf("retest spec should dial the entry itself, got %q", due[0].ip)
+	}
+	if p.sniHealth[due[0].sni.host] != nil {
+		t.Fatalf("retest partner SNI must be healthy, got %q", due[0].sni.host)
+	}
+	// After the backoff elapses on the clock, it is due without probeNow too.
+	p2, now2 := clockPool([]string{"a"}, snis("x"), true, "")
+	p2.markSuspect("ip", "a")
+	*now2 = *now + 31
+	if due := p2.dueRetests(); len(due) != 1 {
+		t.Fatalf("entry should be due once its backoff elapses, got %v", due)
+	}
+}
+
+// altHealthy* feed the differential probe: they return a healthy partner on the other axis,
+// excluding the failed one, and report false when none exists.
+func TestAltHealthyLookups(t *testing.T) {
 	p := newWSPool([]string{"a", "b"}, snis("x", "y"), true, "")
-	p.handshakeFailed("a", "x")
-	if p.burnedIP["a"] || p.burnedSNI["x"] {
-		t.Fatalf("a single ambiguous failure must burn nothing; burnedIP=%v burnedSNI=%v", p.burnedIP, p.burnedSNI)
+	if s, ok := p.altHealthySNI("x"); !ok || s.host != "y" {
+		t.Fatalf("altHealthySNI(x) = %q ok=%v, want y", s.host, ok)
+	}
+	if ip, ok := p.altHealthyIP("a"); !ok || ip != "b" {
+		t.Fatalf("altHealthyIP(a) = %q ok=%v, want b", ip, ok)
+	}
+	p.markSuspect("sni", "y") // now y is not healthy
+	if _, ok := p.altHealthySNI("x"); ok {
+		t.Fatal("no healthy SNI other than x should remain")
 	}
 }
 
-// A dead edge IP (TCP connects, then resets TLS) fails across several SNIs → the IP is
-// burned and the healthy SNIs it dragged down are NOT. This is the reported bug.
-func TestHandshakeFailBurnsIPNotHealthySNI(t *testing.T) {
-	p := newWSPool([]string{"a", "b"}, snis("x", "y"), true, "")
-	p.handshakeFailed("a", "x")
-	p.handshakeFailed("a", "y") // a has now failed 2 distinct SNIs → a is the culprit
-	if !p.burnedIP["a"] {
-		t.Fatal("IP a should burn after failing across 2 distinct SNIs")
-	}
-	if p.burnedSNI["x"] || p.burnedSNI["y"] {
-		t.Fatalf("healthy SNIs must survive a bad IP; burnedSNI=%v", p.burnedSNI)
-	}
-}
-
-// A genuinely blocked domain fails across several IPs → the SNI is burned, the IPs are not.
-func TestHandshakeFailBurnsSNINotHealthyIP(t *testing.T) {
-	p := newWSPool([]string{"a", "b"}, snis("x", "y"), true, "")
-	p.handshakeFailed("a", "x")
-	p.handshakeFailed("b", "x") // x has now failed on 2 distinct IPs → x is the culprit
-	if !p.burnedSNI["x"] {
-		t.Fatal("SNI x should burn after failing across 2 distinct IPs")
-	}
-	if p.burnedIP["a"] || p.burnedIP["b"] {
-		t.Fatalf("healthy IPs must survive a bad SNI; burnedIP=%v", p.burnedIP)
-	}
-}
-
-// Two dead IPs sharing the same healthy SNI must not add up to burn that SNI: once an IP
-// is burned its blame votes are dropped, so they can't push a good domain over the line.
-func TestBurnedIPVotesDoNotBurnSharedSNI(t *testing.T) {
-	p := newWSPool([]string{"a", "b", "c"}, snis("x", "y"), true, "")
-	p.handshakeFailed("a", "x")
-	p.handshakeFailed("a", "y") // a burned; its votes against x,y are dropped
-	p.handshakeFailed("b", "x") // only b's vote against x remains
-	if p.burnedSNI["x"] {
-		t.Fatal("x wrongly burned: a burned IP's vote must not count against the SNI")
-	}
-	p.handshakeFailed("b", "y") // b burned
-	if !p.burnedIP["a"] || !p.burnedIP["b"] {
-		t.Fatal("both dead IPs should be burned")
-	}
-	if p.burnedSNI["x"] || p.burnedSNI["y"] {
-		t.Fatalf("healthy SNIs survive two dead IPs; burnedSNI=%v", p.burnedSNI)
-	}
-}
-
-// A success clears the accumulated blame, so an earlier transient failure never adds up.
-func TestSuccessClearsBlame(t *testing.T) {
-	p := newWSPool([]string{"a", "b"}, snis("x", "y"), true, "")
-	p.handshakeFailed("a", "x") // transient blip on (a,x)
-	p.succeeded("a", "x")       // (a,x) later works
-	p.handshakeFailed("a", "y") // fresh, unrelated failure
-	if p.burnedIP["a"] {
-		t.Fatal("a must not burn: the earlier (a,x) failure was cleared by its success")
-	}
-}
-
-func TestExhaustionThenReset(t *testing.T) {
-	p := newWSPool([]string{"a"}, snis("x"), true, "")
-	p.burnIP("a")
-	if _, _, ok := p.current(); ok {
-		t.Fatal("expected exhausted pool")
-	}
-	p.resetBurns()
-	if _, _, ok := p.current(); !ok {
-		t.Fatal("expected pool usable after reset")
-	}
-}
-
-func TestAutoBurnOffDoesNotPersist(t *testing.T) {
+func TestAutoBurnOffNoTracking(t *testing.T) {
 	p := newWSPool([]string{"a", "b"}, snis("x"), false, "") // manual-only
-	p.burnIP("a")                                            // should NOT persist the burn, only step
-	// both a and b must still be reachable across a full cycle
+	p.markSuspect("ip", "a")                                 // must NOT track
+	if p.ipHealth["a"] != nil {
+		t.Fatalf("autoBurn=off must not sideline an entry, got %#v", p.ipHealth["a"])
+	}
 	got := map[string]bool{}
 	for i := 0; i < 4; i++ {
 		ip, _, ok := p.current()
@@ -151,29 +248,6 @@ func TestAutoBurnOffDoesNotPersist(t *testing.T) {
 	}
 	if !got["a"] || !got["b"] {
 		t.Fatalf("autoBurn=off should keep all IPs; got %v", got)
-	}
-}
-
-func TestStatusFileWritten(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "st.json")
-	p := newWSPool([]string{"a", "b"}, snis("x"), true, path)
-	p.current() // sets active
-	p.burnIP("a")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("status file not written: %v", err)
-	}
-	var st struct {
-		Active     string   `json:"active"`
-		BurnedIPs  []string `json:"burned_ips"`
-		BurnedSNIs []string `json:"burned_snis"`
-	}
-	if err := json.Unmarshal(data, &st); err != nil {
-		t.Fatalf("bad status json: %v", err)
-	}
-	if len(st.BurnedIPs) != 1 || st.BurnedIPs[0] != "a" {
-		t.Fatalf("expected burned_ips=[a], got %v", st.BurnedIPs)
 	}
 }
 
@@ -195,7 +269,6 @@ func TestAdvanceIPAndSNIIndependently(t *testing.T) {
 	if ip2 != "b" || sni2.host != "y" {
 		t.Fatalf("after advanceSNI = %s/%s, want b/y (IP unchanged)", ip2, sni2.host)
 	}
-	// IP wraps a,b,c -> back to a after three advances.
 	p.advanceIP()
 	p.advanceIP()
 	ip3, _, _ := p.current()
