@@ -1,75 +1,74 @@
 # TUNNEL-MANAGER-CORE
 
-هستهٔ دیتاپلینِ اختصاصی برای پنلِ مدیریتِ ناوگانِ تونل — یک باینریِ Go (static، بدونِ
-وابستگی). پنلِ مرکزی و نودِ agent (Python) همچنان ارکستریتور می‌مانند؛ این هسته فقط
-دادهٔ خام را جابه‌جا می‌کند.
+هستهٔ دیتاپلینِ رمزنگاری‌شده — یک باینریِ Go استاتیک و بدونِ وابستگی. پنلِ مرکزی و
+نودِ Python ارکستریت می‌کنند؛ این هسته فقط بسته‌ها را جابه‌جا می‌کند و ورودی/خروجیِ
+تعاملی ندارد.
 
-Custom data-plane core for the tunnel fleet manager. A single static Go
-binary with no external dependencies. The Python panel and node agent stay the
-orchestrators; this core only moves packets.
+> در استقرارِ واقعی هسته را **دستی نمی‌سازی**: پنل نسخهٔ ریلیز را دانلود و به نودها
+> push می‌کند. مراحلِ زیر فقط برای توسعه/ساختِ دستی است.
 
-## وضعیت (این نسخه)
+## پیش‌نیاز
 
-**حالتِ Packet با پروفایلِ `core`**:
+| ابزار | نسخه | برای چه |
+|---|---|---|
+| `go` | 1.25+ | ساختِ باینری (فقط دستی) |
+| `git` | — | دریافتِ کد |
+| Linux | kernel با TUN | اجرا |
 
-- یک اینترفیسِ **TUN** روی هر نود (بستهٔ خامِ L3).
-- چند **ترنسپورت** برای حملِ فریم‌ها: `udp` (پیش‌فرض)، `tcp`، `raw` (پروفایل‌های
-  raw: `bip`=proto-253 نیتیو / `ipip` / `gre` / `icmp` / `udp` / `tcp`)، `flux`
-  (حاملِ چندریختیِ چرخشی: udp/stun/raw) و `ws` (WebSocket/xHTTP روی CDN).
-- رمزنگاریِ **AES-256-GCM** با دست‌دادِ X25519 برای هر نشست (forward secrecy).
-- ضدِ DPIِ اختیاری (`obfs`): حذفِ بایت‌های ثابت + padding + jitter؛ پوششِ TLS به‌سبکِ
-  REALITY (`cover`)؛ تصحیحِ خطا (`fec`)؛ جعلِ IP مبدأ/مقصد روی پروفایلِ raw `bip`.
-- نقش‌ها: `server` (عمومی، listen) و `client` (پشتِ NAT، dial + keepalive) — سازگار با NAT.
-
-## ساخت
+## راه‌اندازی از صفر
 
 ```sh
-CGO_ENABLED=0 go build -o tnl-core .
+# ۱) پیش‌نیازها (Debian/Ubuntu) — یا Go رسمیِ 1.25+
+sudo apt update && sudo apt install -y golang git
+
+# ۲) کلون
+git clone https://github.com/Angize/TUNNEL-MANAGER-CORE.git
+cd TUNNEL-MANAGER-CORE
+
+# ۳) ساخت (استاتیک، بدونِ CGO)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -trimpath -ldflags "-s -w" -o tnl-core .
+
+# ۴) تست
+go test ./...
+
+# ۵) اجرا (معمولاً نود این کار را می‌کند)
+sudo ./tnl-core --config core-<id>.json
 ```
 
-## اجرا
+نود فایلِ `core-<id>.json` را می‌نویسد و باینری را با `--config <path>` اجرا می‌کند.
 
-روی نودِ عمومی (server):
+## ترنسپورت‌ها
 
-```sh
-sudo ./tnl-core --config examples/server.json
-```
+| `transport` | کاربرد |
+|---|---|
+| `udp` | پیش‌فرض، سبک |
+| `tcp` | استریمی، پایدار پشتِ فایروال |
+| `raw` | proto خام — `bip` (253 نیتیو) / `ipip` / `gre` / `icmp` / `udp` / `tcp` |
+| `flux` | چندریختیِ چرخشی (حامل‌های udp/stun/raw، چرخشِ ساعتی) |
+| `ws` | WebSocket/xHTTP روی CDN (دامنه‌فرونتینگ) |
 
-روی نودِ پشتِ NAT (client) — فیلدِ `peer` را به آی‌پیِ عمومیِ server بگذار:
+## قابلیت‌ها
 
-```sh
-sudo ./tnl-core --config examples/client.json
-```
-
-سپس ترافیکِ `10.200.0.0/24` از تونل عبور می‌کند (مثلاً `ping 10.200.0.2`).
-
-## قراردادِ کنترل
-
-هسته stdin/stdout تعاملی ندارد؛ نود یک فایلِ `core-<id>.json` می‌نویسد و باینری را با
-`--config <path>` اجرا می‌کند — دقیقاً مثلِ اینکه نود الان `ip`/`iptables` را صدا می‌زند.
+| کلید | کار |
+|---|---|
+| `crypto` | AES-256-GCM با دست‌دادِ X25519 برای هر نشست (forward secrecy) |
+| `obfs` | حذفِ بایتِ ثابت + padding + jitter (ضدِ DPI) |
+| `cover` | پوششِ TLS به‌سبکِ REALITY (فقط tcp) |
+| `fec` | تصحیحِ خطای Reed-Solomon روی خطِ پرتلفات (udp/raw/flux) |
+| `spoof_src_ip` / `spoof_dst_ip` | جعلِ IP مبدأ/مقصد (روی پروفایلِ raw `bip`) |
 
 ## فرمتِ سیم
 
-هر datagramِ UDP (یا فریمِ استریمی روی tcp/ws) یک فریم است. فرمتِ legacy:
+با `obfs` روشن، هیچ فیلدِ ثابتی روی سیم نیست: کل فریم ciphertextِ AEAD به‌علاوهٔ
+padding است و طولِ واقعی داخلِ فریمِ sealed قرار دارد. فرمتِ legacy (obfs خاموش):
 
 ```
-[0] magic = 0xB1              (فقط در framingِ legacy؛ با obfs هیچ بایتِ ثابتی نیست)
+[0] magic = 0xB1
 [1] type  = 0 data | 1 ping | 2 pong
-[2:] payload   (data: در صورتِ روشن‌بودنِ رمز، sealed؛ وگرنه بستهٔ خامِ IP)
+[2:] payload   (رمز روشن: sealed؛ خاموش: بستهٔ خامِ IP)
 ```
 
-با روشن‌بودنِ `obfs` هیچ فیلدِ ثابتی روی سیم نیست: کلِ فریم ciphertextِ AEAD به‌علاوهٔ
-padding است و طولِ واقعی داخلِ فریمِ sealed قرار دارد.
+---
 
-## تست
-
-```sh
-go test ./...
-```
-
-تستِ end-to-end (دو namespace، ping + انتقالِ TCP روی تونلِ رمزشده) در تاریخچهٔ توسعه
-اجرا و تأیید شده است.
-
-## امنیت
-
-`psk` هرگز به مرورگر یا خروجیِ عمومیِ نود بازتاب داده نمی‌شود.
+ارکستریت با 👉 [tnl-central](https://github.com/Angize/TUNNEL-MANAGER) + [tnl-node](https://github.com/Angize/TUNNEL-MANAGER-NODE) • مجوز 👉 [LICENSE](./LICENSE)
