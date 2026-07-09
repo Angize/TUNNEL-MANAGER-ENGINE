@@ -250,40 +250,40 @@ func TestSelectEntryPinsAndClears(t *testing.T) {
 	}
 }
 
-// TestPinIsAbsolute locks down the reported bug: a pin must select EXACTLY the chosen edge and
-// never drift onto a neighbour — not when the paired axis is suspect, not across advance()/proactive
-// rotation, and not through the current() health scan. (The old code only nudged an index that the
-// scan could step off, so "pin #3" could surface #2.)
-func TestPinIsAbsolute(t *testing.T) {
-	p := newWSPool([]string{"a", "b", "c"}, snis("x", "y"), true, "")
-	// Pin IP "c" while its only-known-good partner is messy: mark some SNIs/ips suspect.
-	p.markSuspect("sni", "x", "test") // the current SNI is unhealthy
+// TestPinOneShot locks down the fix: a pin is a ONE-SHOT exact jump. Within its short window it
+// FORCES exactly the chosen edge (no drift onto a neighbour — the reported "pin #3 -> #2" bug —
+// even across advance()/a suspect partner/a fresh burn); after the window it clears and normal
+// rotation resumes (it does NOT lock forever).
+func TestPinOneShot(t *testing.T) {
+	p, now := clockPool([]string{"a", "b", "c"}, snis("x", "y"), true, "")
+	p.markSuspect("sni", "x", "test") // messy partner axis
 	p.markSuspect("ip", "a", "test")
 	if !p.selectEntry("ip", "c") {
 		t.Fatal("selectEntry should find c")
 	}
 	if !p.isPinned() {
-		t.Fatal("pool should report pinned after selectEntry")
+		t.Fatal("pool should report pinned right after selectEntry")
 	}
-	// current() must return c every time, regardless of index or a suspect partner axis, and must
-	// survive rotation attempts (advance / advanceIP) — a pin freezes the pinned axis.
+	// Within the window: current() forces c every time, across rotation attempts and a fresh burn.
 	for i := 0; i < 6; i++ {
-		ip, _, ok := p.current()
-		if !ok || ip != "c" {
+		if ip, _, ok := p.current(); !ok || ip != "c" {
 			t.Fatalf("pin must force ip=c on dial %d, got %q ok=%v", i, ip, ok)
 		}
 		p.advance()
 		p.advanceIP()
 	}
-	// A fresh burn on the pinned IP must NOT move current() off it (operator override is absolute).
 	p.markSuspect("ip", "c", "test")
 	if ip, _, _ := p.current(); ip != "c" {
-		t.Fatalf("a suspect mark must not override an operator pin, got %q", ip)
+		t.Fatalf("within the pin window a suspect mark must not override the pin, got %q", ip)
 	}
-	// Pinning a different IP switches the pin exactly to it.
-	p.selectEntry("ip", "b")
-	if ip, _, _ := p.current(); ip != "b" {
-		t.Fatalf("re-pin should move exactly to b, got %q", ip)
+	// After the window the pin expires and rotation resumes: c is suspect, so current() must move
+	// off it to a healthy edge (proving it is no longer forced / not sticky-forever).
+	*now += pinTTL + 1
+	if p.isPinned() {
+		t.Fatal("pin must expire after pinTTL")
+	}
+	if ip, _, _ := p.current(); ip == "c" {
+		t.Fatalf("after the pin expires a suspect edge must not be forced; got %q", ip)
 	}
 }
 
