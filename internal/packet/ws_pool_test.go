@@ -46,7 +46,7 @@ func TestPoolRotatesAllCombos(t *testing.T) {
 // current() then skips it while a healthy alternative remains.
 func TestMarkSuspectPullsFromRotation(t *testing.T) {
 	p := newWSPool([]string{"a", "b"}, snis("x"), true, "")
-	p.markSuspect("ip", "a")
+	p.markSuspect("ip", "a", "test")
 	if r := p.ipHealth["a"]; r == nil || r.state != stateSuspect || r.fails != 0 {
 		t.Fatalf("a should be suspect with fails=0, got %#v", r)
 	}
@@ -63,7 +63,7 @@ func TestMarkSuspectPullsFromRotation(t *testing.T) {
 // then the entry drops to dead on the sixth failure (the initial markSuspect is failure #1).
 func TestSuspectBackoffThenDead(t *testing.T) {
 	p, now := clockPool([]string{"a", "b"}, snis("x"), true, "")
-	p.markSuspect("ip", "a")
+	p.markSuspect("ip", "a", "test")
 	if got := p.ipHealth["a"].nextRetest; got != *now+30 {
 		t.Fatalf("entry retest should be now+30, got %d (now=%d)", got, *now)
 	}
@@ -98,14 +98,14 @@ func TestSuspectBackoffThenDead(t *testing.T) {
 // ANY successful retest clears the record back to healthy (in rotation again).
 func TestSuccessfulRetestHealsToHealthy(t *testing.T) {
 	p, _ := clockPool([]string{"a", "b"}, snis("x"), true, "")
-	p.markSuspect("ip", "a")
+	p.markSuspect("ip", "a", "test")
 	p.retestResult("ip", "a", false) // suspect, fails=1
 	p.retestResult("ip", "a", true)  // heals
 	if p.ipHealth["a"] != nil {
 		t.Fatalf("a should be healthy again, got %#v", p.ipHealth["a"])
 	}
 	// Also proven healthy via a live success on a dead entry.
-	p.markSuspect("sni", "x")
+	p.markSuspect("sni", "x", "test")
 	p.ipHealth["a"] = &healthRec{state: stateDead, nextRetest: 9999}
 	p.succeeded("a", "x")
 	if p.ipHealth["a"] != nil || p.sniHealth["x"] != nil {
@@ -144,7 +144,7 @@ func TestStatusSnapshotStates(t *testing.T) {
 	path := filepath.Join(dir, "st.json")
 	p, now := clockPool([]string{"a", "b"}, snis("x"), true, path)
 	p.current() // sets active
-	p.markSuspect("ip", "a")
+	p.markSuspect("ip", "a", "test")
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -191,7 +191,7 @@ func TestStatusSnapshotStates(t *testing.T) {
 // scheduler picks it up on the next tick, paired with a healthy partner on the other axis.
 func TestDueRetestsAndProbeNow(t *testing.T) {
 	p, now := clockPool([]string{"a", "b"}, snis("x", "y"), true, "")
-	p.markSuspect("ip", "a") // due at now+30
+	p.markSuspect("ip", "a", "test") // due at now+30
 	if due := p.dueRetests(); len(due) != 0 {
 		t.Fatalf("nothing should be due yet, got %v", due)
 	}
@@ -208,7 +208,7 @@ func TestDueRetestsAndProbeNow(t *testing.T) {
 	}
 	// After the backoff elapses on the clock, it is due without probeNow too.
 	p2, now2 := clockPool([]string{"a"}, snis("x"), true, "")
-	p2.markSuspect("ip", "a")
+	p2.markSuspect("ip", "a", "test")
 	*now2 = *now + 31
 	if due := p2.dueRetests(); len(due) != 1 {
 		t.Fatalf("entry should be due once its backoff elapses, got %v", due)
@@ -225,7 +225,7 @@ func TestAltHealthyLookups(t *testing.T) {
 	if ip, ok := p.altHealthyIP("a"); !ok || ip != "b" {
 		t.Fatalf("altHealthyIP(a) = %q ok=%v, want b", ip, ok)
 	}
-	p.markSuspect("sni", "y") // now y is not healthy
+	p.markSuspect("sni", "y", "test") // now y is not healthy
 	if _, ok := p.altHealthySNI("x"); ok {
 		t.Fatal("no healthy SNI other than x should remain")
 	}
@@ -235,7 +235,7 @@ func TestAltHealthyLookups(t *testing.T) {
 // suspect/dead mark so current() picks it, even if it was blocked a moment ago.
 func TestSelectEntryPinsAndClears(t *testing.T) {
 	p := newWSPool([]string{"a", "b"}, snis("x"), true, "")
-	p.markSuspect("ip", "b") // b was blocked
+	p.markSuspect("ip", "b", "test") // b was blocked
 	if !p.selectEntry("ip", "b") {
 		t.Fatal("selectEntry should find b")
 	}
@@ -252,7 +252,7 @@ func TestSelectEntryPinsAndClears(t *testing.T) {
 
 func TestAutoBurnOffNoTracking(t *testing.T) {
 	p := newWSPool([]string{"a", "b"}, snis("x"), false, "") // manual-only
-	p.markSuspect("ip", "a")                                 // must NOT track
+	p.markSuspect("ip", "a", "test")                                 // must NOT track
 	if p.ipHealth["a"] != nil {
 		t.Fatalf("autoBurn=off must not sideline an entry, got %#v", p.ipHealth["a"])
 	}
