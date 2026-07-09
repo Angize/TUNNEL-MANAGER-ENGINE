@@ -305,6 +305,12 @@ type TCP struct {
 	// does a real TCP+TLS dial). nil in production -> the differential prober uses probeEdge.
 	probeFn func(ip string, sni wsSNIEntry) bool
 
+	// manualSwitch marks the NEXT carrier drop as operator-initiated (a pin / manual rotate via
+	// rotate1), so the dial loops (a) don't record it as a data-plane fault, and (b) in warm mode
+	// re-dial the ACTIVE from current() (which honors the just-set edge) instead of promoting the
+	// pre-built warm standby — which is on a different edge and would ignore the operator's choice.
+	manualSwitch atomic.Bool
+
 	// warmStandby (client + pool) keeps a SECOND, fully-handshaked carrier connection to another
 	// pool edge warm in the background. On the active carrier's failure OR a proactive rotation
 	// the standby is promoted instantly (an atomic b.cur swap) instead of dialing fresh, so the
@@ -1028,9 +1034,12 @@ func (b *TCP) dialLoop() {
 		// Data-plane health (pool only): a carrier that connected but died fast is the throttle /
 		// blackhole-after-handshake signature the TLS/upgrade prober can't see. Feed it to the FSM
 		// (short session -> fault + move off the edge; sustained session -> confirm it healthy) so a
-		// throttled edge is finally pulled from rotation instead of being redialed forever.
+		// throttled edge is finally pulled from rotation instead of being redialed forever. A drop we
+		// caused ourselves (operator pin / manual rotate) is NOT a fault — skip accounting for it.
 		if b.pool != nil && !b.closed.Load() {
-			if time.Since(connectedAt) < minLiveness {
+			if b.manualSwitch.Swap(false) {
+				// operator-initiated switch: no fault, and current() already points at the chosen edge
+			} else if time.Since(connectedAt) < minLiveness {
 				b.pool.dataFailure(label)
 				b.pool.advance() // don't re-stick on the bad edge
 			} else {
@@ -1273,10 +1282,13 @@ func (b *TCP) dialLoopWarm() {
 		case ex := <-exits:
 			switch ex {
 			case active:
-				// Active died: attribute its data-plane health (short-lived -> throttle fault on
-				// its edge; sustained -> confirm healthy), then promote the warm standby, else fall
-				// back to a fresh dial.
-				if activeLabel != "" {
+				// Was this drop an operator pin / manual rotate (rotate1)? If so it is NOT a fault,
+				// and we must NOT promote the pre-built standby — that standby is on a DIFFERENT edge
+				// and would ignore the operator's choice (the reported "pick #3, #2 goes active" bug).
+				manual := b.manualSwitch.Swap(false)
+				if !manual && activeLabel != "" {
+					// Genuine failure: attribute data-plane health (short-lived -> throttle fault;
+					// sustained -> confirm healthy).
 					if time.Since(activeSince) < minLiveness {
 						b.pool.dataFailure(activeLabel)
 					} else {
@@ -1286,7 +1298,23 @@ func (b *TCP) dialLoopWarm() {
 				b.cur.CompareAndSwap(active, nil)
 				b.curConn.Store(nil)
 				active = nil
-				if promote() {
+				if manual {
+					// Re-dial the ACTIVE from current() so it lands on the exact edge the operator
+					// selected. Drop the stale standby (wrong edge) so it is rebuilt off the new one.
+					if standby != nil {
+						standby.conn.Close()
+						standby = nil
+						standbyLabel = ""
+						b.standby.Store(nil)
+						b.standbyConn.Store(nil)
+						standbyBuilding = false
+					}
+					log.Printf("core/tcp: manual pin/rotate — re-dialing active on the selected edge")
+					if !dialActiveBlocking() { // warmEstablish(false) -> current() -> the pinned edge
+						return
+					}
+					requestStandby()
+				} else if promote() {
 					log.Printf("core/tcp: active carrier failed — promoted warm standby")
 					requestStandby()
 				} else {
@@ -1369,8 +1397,9 @@ func (b *TCP) rotate1(step func()) {
 		return
 	}
 	step()
+	b.manualSwitch.Store(true) // operator-initiated: skip fault accounting; warm loop re-dials via current()
 	if c := b.curConn.Load(); c != nil {
-		(*c).Close() // unblocks serve(); dialLoop re-dials on the advanced edge
+		(*c).Close() // unblocks serve(); dialLoop re-dials on the advanced/pinned edge
 	}
 }
 
