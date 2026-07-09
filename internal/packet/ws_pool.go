@@ -103,6 +103,8 @@ type wsPool struct {
 	lastGood   int64          // unix time of the last SUSTAINED session on any edge (outage guard)
 	events     []coreEvent    // rolling ring of core-observed events (down/burn) for the panel log
 	evSeq      int64          // monotonic sequence so the panel can consume each event exactly once
+	pinIP      string         // operator-pinned IP: current() forces it (absolute), no auto-rotation
+	pinSNI     string         // operator-pinned SNI: current() forces it (absolute)
 	now        func() int64   // injectable clock (unix seconds); overridden in tests
 }
 
@@ -205,6 +207,16 @@ func (p *wsPool) current() (string, wsSNIEntry, bool) {
 	if len(p.ips) == 0 || len(p.snis) == 0 {
 		return "", wsSNIEntry{}, false
 	}
+	// An operator PIN is ABSOLUTE: the chosen axis is forced (even if it is suspect/dead) so the
+	// EXACT edge the operator selected is what runs — never a neighbour, and it never drifts on a
+	// rotation/failover. Only the UNPINNED axis is free to pick a healthy value. This is what makes
+	// "pin edge X" atomic: every dial (active OR a promoted warm standby) resolves to X.
+	if p.pinIP != "" || p.pinSNI != "" {
+		ip := p.resolvePinIPLocked()
+		sni := p.resolvePinSNILocked()
+		p.active = ip + " · " + sni.host
+		return ip, sni, true
+	}
 	n := len(p.ips) * len(p.snis)
 	for k := 0; k < n; k++ {
 		ip := p.ips[p.i%len(p.ips)]
@@ -219,6 +231,59 @@ func (p *wsPool) current() (string, wsSNIEntry, bool) {
 	sni := p.bestSNILocked()
 	p.active = ip + " · " + sni.host
 	return ip, sni, true
+}
+
+// resolvePinIPLocked returns the IP current() should use: the pinned one (absolute) if it still
+// exists, else a healthy-preferred choice for the free axis (and the stale pin is dropped). Caller
+// holds the lock.
+func (p *wsPool) resolvePinIPLocked() string {
+	if p.pinIP != "" {
+		for _, ip := range p.ips {
+			if ip == p.pinIP {
+				return ip
+			}
+		}
+		p.pinIP = "" // pinned IP was removed from the pool -> forget it
+	}
+	return p.healthyOrBestIPLocked()
+}
+
+func (p *wsPool) resolvePinSNILocked() wsSNIEntry {
+	if p.pinSNI != "" {
+		for _, s := range p.snis {
+			if s.host == p.pinSNI {
+				return s
+			}
+		}
+		p.pinSNI = ""
+	}
+	return p.healthyOrBestSNILocked()
+}
+
+// healthyOrBestIPLocked returns the first healthy IP, else the least-bad one. Caller holds the lock.
+func (p *wsPool) healthyOrBestIPLocked() string {
+	for _, ip := range p.ips {
+		if p.ipHealth[ip] == nil {
+			return ip
+		}
+	}
+	return p.bestIPLocked()
+}
+
+func (p *wsPool) healthyOrBestSNILocked() wsSNIEntry {
+	for _, s := range p.snis {
+		if p.sniHealth[s.host] == nil {
+			return s
+		}
+	}
+	return p.bestSNILocked()
+}
+
+// isPinned reports whether the operator has pinned either axis (proactive rotation is then off).
+func (p *wsPool) isPinned() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pinIP != "" || p.pinSNI != ""
 }
 
 // bestIPLocked / bestSNILocked return the least-bad entry for the current() fallback: a
@@ -470,9 +535,10 @@ func (p *wsPool) probeAllNow() {
 	p.mu.Unlock()
 }
 
-// selectEntry pins a SPECIFIC edge as the active one: it moves the rotation index onto that
-// entry and clears any suspect/dead mark on it — the operator explicitly chose it, so give it a
-// clean shot (the FSM re-suspects it if it fails again). Returns false if the key is unknown.
+// selectEntry PINS a specific edge as the active one on its axis: an absolute operator override
+// that current() forces from then on (no drift, no auto-rotation off it) until the operator pins
+// a different edge on that axis or the tunnel is rebuilt. It also clears any suspect/dead mark on
+// the chosen entry so it gets a clean shot. Returns false if the key is unknown.
 func (p *wsPool) selectEntry(kind, key string) bool {
 	p.mu.Lock()
 	ok := false
@@ -480,6 +546,7 @@ func (p *wsPool) selectEntry(kind, key string) bool {
 		for idx, s := range p.snis {
 			if s.host == key {
 				p.j = idx
+				p.pinSNI = key
 				delete(p.sniHealth, key)
 				ok = true
 				break
@@ -489,6 +556,7 @@ func (p *wsPool) selectEntry(kind, key string) bool {
 		for idx, ip := range p.ips {
 			if ip == key {
 				p.i = idx
+				p.pinIP = key
 				delete(p.ipHealth, key)
 				ok = true
 				break
@@ -582,8 +650,10 @@ func (p *wsPool) writeStatus() {
 		BurnedSNIs []string       `json:"burned_snis"`
 		Health     []healthStatus `json:"health"`
 		Events     []coreEvent    `json:"events"`
+		PinIP      string         `json:"pin_ip"`
+		PinSNI     string         `json:"pin_sni"`
 		TS         int64          `json:"ts"`
-	}{Active: p.active, BurnedIPs: burnedIPs, BurnedSNIs: burnedSNIs, Health: health, Events: evs, TS: time.Now().Unix()}
+	}{Active: p.active, BurnedIPs: burnedIPs, BurnedSNIs: burnedSNIs, Health: health, Events: evs, PinIP: p.pinIP, PinSNI: p.pinSNI, TS: time.Now().Unix()}
 	p.mu.Unlock()
 	if data, err := json.Marshal(st); err == nil {
 		tmp := p.statusPath + ".tmp"

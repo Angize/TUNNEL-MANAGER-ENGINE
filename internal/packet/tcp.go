@@ -1075,7 +1075,7 @@ func (b *TCP) dialLoop() {
 		// keeps the same edge — the timer is stopped before that path runs.
 		var rot *time.Timer
 		var rotated atomic.Bool
-		if b.pool != nil && b.rotate > 0 {
+		if b.pool != nil && b.rotate > 0 && !b.pool.isPinned() { // a pin freezes the edge: no auto-rotation
 			c := conn
 			rot = time.AfterFunc(b.rotate, func() { rotated.Store(true); b.pool.advance(); c.Close() })
 		}
@@ -1408,7 +1408,11 @@ func (b *TCP) dialLoopWarm() {
 		case <-rotateC:
 			// Proactive make-before-break rotation: promote the warm standby and retire the old
 			// active, then build a fresh standby. If none is ready yet, skip this tick — the next
-			// one rotates once the standby has warmed (never drop the only live carrier).
+			// one rotates once the standby has warmed (never drop the only live carrier). An operator
+			// pin freezes the edge, so proactive rotation is skipped entirely while pinned.
+			if b.pool != nil && b.pool.isPinned() {
+				continue
+			}
 			if promote() {
 				log.Printf("core/tcp: proactive rotation — promoted warm standby")
 				requestStandby()
