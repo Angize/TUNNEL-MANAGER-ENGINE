@@ -34,6 +34,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -310,6 +311,11 @@ type TCP struct {
 	// re-dial the ACTIVE from current() (which honors the just-set edge) instead of promoting the
 	// pre-built warm standby — which is on a different edge and would ignore the operator's choice.
 	manualSwitch atomic.Bool
+
+	// lastErr holds the most recent CAUSE of a client carrier death (as a string), so the pool can
+	// record a precise "down" reason for the panel log instead of a guess. "use of closed network
+	// connection" is a consequence (we closed it) and is deliberately never stored.
+	lastErr atomic.Value // string
 
 	// warmStandby (client + pool) keeps a SECOND, fully-handshaked carrier connection to another
 	// pool edge warm in the background. On the active carrier's failure OR a proactive rotation
@@ -944,11 +950,58 @@ func (b *TCP) attributeFailure(ip string, sni wsSNIEntry) {
 	}
 	switch b.differentialProbe(ip, sni) {
 	case verdictIPGuilty:
-		b.pool.markSuspect("ip", ip)
+		b.pool.markSuspect("ip", ip, "ip_blocked") // IP unreachable while a healthy SNI worked elsewhere
 	case verdictSNIGuilty:
-		b.pool.markSuspect("sni", sni.host)
+		b.pool.markSuspect("sni", sni.host, "sni_blocked") // SNI failed even on a healthy IP (DPI on ClientHello)
 	}
 	// transient / unknown: mark nothing
+}
+
+// setLastErr records the CAUSE of a client carrier death for the pool's "down" event. It ignores
+// "use of closed network connection" (that is us closing it, a consequence not a cause) and never
+// downgrades a real cause already stored for this death to that placeholder.
+func (b *TCP) setLastErr(err error) {
+	if err == nil {
+		return
+	}
+	s := err.Error()
+	if strings.Contains(s, "use of closed network connection") {
+		return
+	}
+	b.lastErr.Store(s)
+}
+
+// takeLastErr returns and clears the last recorded death cause.
+func (b *TCP) takeLastErr() string {
+	s, _ := b.lastErr.Load().(string)
+	b.lastErr.Store("")
+	return s
+}
+
+// classifyErr maps a raw carrier death cause to a stable reason CODE the panel renders into text.
+// The point is a PRECISE, core-observed reason (it saw the actual error) rather than a panel guess.
+func classifyErr(s string) string {
+	l := strings.ToLower(s)
+	switch {
+	case s == "":
+		return "closed"
+	case strings.Contains(l, "keepalive") || strings.Contains(l, "ping"):
+		return "ping_timeout" // no keepalive answer: throttled/blackholed, or the peer went away
+	case strings.Contains(l, "connection reset") || strings.Contains(l, "reset by peer"):
+		return "reset" // RST — often a stateful-DPI kill of an established flow
+	case strings.Contains(l, "refused"):
+		return "refused"
+	case strings.Contains(l, "timeout") || strings.Contains(l, "deadline") || strings.Contains(l, "no route") || strings.Contains(l, "unreachable"):
+		return "timeout"
+	case strings.Contains(l, "eof"):
+		return "eof"
+	case strings.Contains(l, "tls") || strings.Contains(l, "handshake") || strings.Contains(l, "certificate"):
+		return "tls" // TLS failed — a blocked SNI is often killed at the ClientHello
+	case strings.Contains(l, "websocket") || strings.Contains(l, "ws ") || strings.Contains(l, "101") || strings.Contains(l, "upgrade"):
+		return "ws_upgrade" // reached TLS but the CDN/origin refused the upgrade
+	default:
+		return "dropped"
+	}
 }
 
 // retestLoop (pooled client) periodically retests suspect/dead pool entries whose backoff has
@@ -1021,9 +1074,10 @@ func (b *TCP) dialLoop() {
 		// so dialLoop reconnects on the next edge. A connection that dies on its own
 		// keeps the same edge — the timer is stopped before that path runs.
 		var rot *time.Timer
+		var rotated atomic.Bool
 		if b.pool != nil && b.rotate > 0 {
 			c := conn
-			rot = time.AfterFunc(b.rotate, func() { b.pool.advance(); c.Close() })
+			rot = time.AfterFunc(b.rotate, func() { rotated.Store(true); b.pool.advance(); c.Close() })
 		}
 		b.serve(cf) // blocks until this connection dies
 		if rot != nil {
@@ -1031,19 +1085,22 @@ func (b *TCP) dialLoop() {
 		}
 		b.curConn.CompareAndSwap(&cc, nil)
 		b.cur.CompareAndSwap(cf, nil)
-		// Data-plane health (pool only): a carrier that connected but died fast is the throttle /
-		// blackhole-after-handshake signature the TLS/upgrade prober can't see. Feed it to the FSM
-		// (short session -> fault + move off the edge; sustained session -> confirm it healthy) so a
-		// throttled edge is finally pulled from rotation instead of being redialed forever. A drop we
-		// caused ourselves (operator pin / manual rotate) is NOT a fault — skip accounting for it.
+		// Classify why this carrier died and feed the pool's health + event log. A drop we caused
+		// ourselves — an operator pin/rotate, or a scheduled proactive rotation — is NOT a failure
+		// and is not logged as "down". A genuine death records a precise core-observed "down" reason
+		// and updates data-plane health (short session -> throttle fault + move off; sustained -> ok).
 		if b.pool != nil && !b.closed.Load() {
-			if b.manualSwitch.Swap(false) {
-				// operator-initiated switch: no fault, and current() already points at the chosen edge
-			} else if time.Since(connectedAt) < minLiveness {
-				b.pool.dataFailure(label)
-				b.pool.advance() // don't re-stick on the bad edge
+			cause := b.takeLastErr()
+			if b.manualSwitch.Swap(false) || rotated.Load() {
+				b.pool.dataSuccess(label) // deliberate, healthy switch — confirm the edge was fine
 			} else {
-				b.pool.dataSuccess(label)
+				b.pool.event("down", classifyErr(cause), label)
+				if time.Since(connectedAt) < minLiveness {
+					b.pool.dataFailure(label)
+					b.pool.advance() // don't re-stick on the bad edge
+				} else {
+					b.pool.dataSuccess(label)
+				}
 			}
 		}
 		if b.sleep(1 * time.Second) {
@@ -1167,7 +1224,7 @@ func (b *TCP) dialLoopWarm() {
 	// can react (promote / rebuild). The report is abandoned if Close fired.
 	startReader := func(cf *connFramer) {
 		go func() {
-			_ = b.readLoop(cf)
+			b.setLastErr(b.readLoop(cf)) // capture the death cause for a precise pool "down" reason
 			cf.conn.Close()
 			select {
 			case exits <- cf:
@@ -1286,9 +1343,11 @@ func (b *TCP) dialLoopWarm() {
 				// and we must NOT promote the pre-built standby — that standby is on a DIFFERENT edge
 				// and would ignore the operator's choice (the reported "pick #3, #2 goes active" bug).
 				manual := b.manualSwitch.Swap(false)
+				cause := b.takeLastErr()
 				if !manual && activeLabel != "" {
-					// Genuine failure: attribute data-plane health (short-lived -> throttle fault;
-					// sustained -> confirm healthy).
+					// Genuine failure: log a precise core-observed "down" reason and attribute
+					// data-plane health (short-lived -> throttle fault; sustained -> confirm healthy).
+					b.pool.event("down", classifyErr(cause), activeLabel)
 					if time.Since(activeSince) < minLiveness {
 						b.pool.dataFailure(activeLabel)
 					} else {
@@ -1455,6 +1514,9 @@ func (b *TCP) readLoop(cf *connFramer) error {
 }
 
 func (b *TCP) onConnErr(cf *connFramer, err error) {
+	if b.isClient {
+		b.setLastErr(err) // remember the cause so dialLoop can log a precise pool "down" reason
+	}
 	cf.conn.Close()
 	b.cur.CompareAndSwap(cf, nil) // only clear downstream if THIS conn was the target
 	b.removeAuthConn(cf)          // server: drop from the authenticated set (no-op on the client)
@@ -1502,6 +1564,7 @@ func (b *TCP) keepaliveLoop() {
 					if b.warmStandby {
 						// Let the warm-standby manager react to the reader's exit (promote a
 						// standby) rather than tearing down b.cur out from under it here.
+						b.setLastErr(err) // record the cause before we close (startReader would only see "closed")
 						cf.conn.Close()
 					} else {
 						if err == errPingTimeout {

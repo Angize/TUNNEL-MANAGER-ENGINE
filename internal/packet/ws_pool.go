@@ -101,7 +101,35 @@ type wsPool struct {
 	active     string
 	dataFail   map[string]int // per-IP count of consecutive short-lived (data-plane-fault) sessions
 	lastGood   int64          // unix time of the last SUSTAINED session on any edge (outage guard)
+	events     []coreEvent    // rolling ring of core-observed events (down/burn) for the panel log
+	evSeq      int64          // monotonic sequence so the panel can consume each event exactly once
 	now        func() int64   // injectable clock (unix seconds); overridden in tests
+}
+
+// coreEvent is one core-observed occurrence surfaced to the panel's system log: the CORE knows the
+// real reason a carrier dropped or an edge was burned (it saw the actual error), so instead of the
+// panel guessing, it records a stable machine `code` (+ optional detail) the panel maps to text.
+type coreEvent struct {
+	Seq    int64  `json:"seq"`
+	TS     int64  `json:"ts"`
+	Kind   string `json:"kind"`   // "down" (carrier dropped) | "burn" (edge sidelined)
+	Code   string `json:"code"`   // stable reason category, e.g. ping_timeout / reset / tls / ws_upgrade / throttle
+	Detail string `json:"detail"` // optional extra: the edge key, or a short raw-error snippet
+}
+
+const coreEventRing = 48 // keep the most recent N events in the status file
+
+// event appends a core-observed event to the ring (newest kept) and flushes the status file so the
+// node/panel can surface it. Safe to call from the client loops.
+func (p *wsPool) event(kind, code, detail string) {
+	p.mu.Lock()
+	p.evSeq++
+	p.events = append(p.events, coreEvent{Seq: p.evSeq, TS: time.Now().Unix(), Kind: kind, Code: code, Detail: detail})
+	if len(p.events) > coreEventRing {
+		p.events = p.events[len(p.events)-coreEventRing:]
+	}
+	p.mu.Unlock()
+	p.writeStatus()
 }
 
 func newWSPool(ips []string, snis []wsSNIEntry, autoBurn bool, statusPath string) *wsPool {
@@ -154,7 +182,7 @@ func (p *wsPool) dataFailure(ip string) {
 	}
 	p.mu.Unlock()
 	if burned {
-		p.writeStatus()
+		p.event("burn", "throttle", "ip:"+ip) // handshake-OK-but-data-dead: throttled/blackholed
 	}
 }
 
@@ -273,16 +301,20 @@ func (p *wsPool) advanceSNI() {
 // +30s retest). A no-op when autoBurn is off (a manual-only pool never auto-sidelines an
 // entry) or when the entry is already tracked — a fresh live failure must not reset an
 // in-progress backoff; the retest scheduler owns the entry's cadence from here.
-func (p *wsPool) markSuspect(kind, key string) {
+func (p *wsPool) markSuspect(kind, key, reason string) {
 	if !p.autoBurn {
 		return
 	}
 	p.mu.Lock()
 	m := p.healthMap(kind)
-	if m[key] == nil {
+	fresh := m[key] == nil
+	if fresh {
 		m[key] = &healthRec{state: stateSuspect, nextRetest: p.now() + suspectBackoff[0]}
 	}
 	p.mu.Unlock()
+	if fresh {
+		p.event("burn", reason, kind+":"+key) // only log the transition into suspect, not repeats
+	}
 	p.writeStatus()
 }
 
@@ -543,13 +575,15 @@ func (p *wsPool) writeStatus() {
 	}
 	sort.Strings(burnedIPs)
 	sort.Strings(burnedSNIs)
+	evs := append([]coreEvent(nil), p.events...) // copy so the marshal runs outside the lock
 	st := struct {
 		Active     string         `json:"active"`
 		BurnedIPs  []string       `json:"burned_ips"`
 		BurnedSNIs []string       `json:"burned_snis"`
 		Health     []healthStatus `json:"health"`
+		Events     []coreEvent    `json:"events"`
 		TS         int64          `json:"ts"`
-	}{Active: p.active, BurnedIPs: burnedIPs, BurnedSNIs: burnedSNIs, Health: health, TS: time.Now().Unix()}
+	}{Active: p.active, BurnedIPs: burnedIPs, BurnedSNIs: burnedSNIs, Health: health, Events: evs, TS: time.Now().Unix()}
 	p.mu.Unlock()
 	if data, err := json.Marshal(st); err == nil {
 		tmp := p.statusPath + ".tmp"
