@@ -336,7 +336,7 @@ type TCP struct {
 	xhttp      bool
 	xhMode     string       // client: "stream" (single full-duplex request) else packet-up
 	xhTLS      *tls.Config  // test-only: overrides the client edge TLS config (nil in production)
-	httpSrv    *http.Server // server: the xhttp endpoint (nil otherwise)
+	httpSrv    atomic.Pointer[http.Server] // server: the xhttp endpoint (nil otherwise); atomic — written by runXHTTPServer's goroutine, read by Close
 	xhMu       sync.Mutex
 	xhSessions map[string]*xhttpSession
 
@@ -509,8 +509,8 @@ func (b *TCP) Close() error {
 		return nil
 	}
 	close(b.closeCh)
-	if b.httpSrv != nil {
-		b.httpSrv.Close()
+	if s := b.httpSrv.Load(); s != nil {
+		s.Close()
 	}
 	if b.ln != nil {
 		b.ln.Close()
@@ -1218,6 +1218,20 @@ func (b *TCP) dialLoopWarm() {
 	exits := make(chan *connFramer, 8)    // a per-conn reader finished (its conn died)
 	ready := make(chan warmConn, 2)       // a background standby dial completed
 	activeReady := make(chan warmConn, 2) // a background ACTIVE (re)dial completed (outage/failover path)
+	// On exit, close any carrier that a dial worker managed to buffer just as Close fired (its own
+	// select preferred the send over closeCh) — otherwise that conn's fd would leak until process exit.
+	defer func() {
+		for {
+			select {
+			case wc := <-ready:
+				wc.conn.Close()
+			case wc := <-activeReady:
+				wc.conn.Close()
+			default:
+				return
+			}
+		}
+	}()
 	var active, standby *connFramer
 	// Track the active carrier's edge + when it started carrying data, so a promoted-then-quickly-
 	// dead edge is attributed to the right IP for data-plane throttle detection (C1).
@@ -1441,7 +1455,20 @@ func (b *TCP) dialLoopWarm() {
 			}
 		case wc := <-ready:
 			standbyBuilding = false
-			if standby != nil || active == nil || b.closed.Load() {
+			if b.closed.Load() {
+				wc.conn.Close()
+				continue
+			}
+			if active == nil {
+				// Mid-outage this standby is already up while the async active dial is still retrying —
+				// adopt it as the ACTIVE now instead of discarding it and waiting; the in-flight async
+				// dial is harmlessly dropped when it lands (activeReady guards on active!=nil).
+				log.Printf("core/tcp: adopting ready standby as active during outage")
+				setActive(wc.cf, wc.conn, wc.label, wc.combo)
+				requestStandby()
+				continue
+			}
+			if standby != nil {
 				wc.conn.Close() // no longer needed (promoted/replaced meanwhile)
 				continue
 			}
@@ -1454,12 +1481,17 @@ func (b *TCP) dialLoopWarm() {
 			startReader(wc.cf)
 		case wc := <-activeReady:
 			// A background outage/failover active dial finished. Adopt it as the live active (unless we
-			// somehow already have one, or we're closing) and start warming a standby again.
+			// somehow already have one — e.g. a ready standby was adopted meanwhile — or we're closing)
+			// and start warming a standby again.
 			activeBuilding = false
 			if active != nil || b.closed.Load() {
 				wc.conn.Close()
 				continue
 			}
+			// Consume any stale manual-switch flag: a pin placed mid-outage (while active==nil) set it
+			// with no exit to consume it; the fresh active already honored that pin via current(), so
+			// clear it now or the NEXT genuine death would be mis-read as a manual switch.
+			b.manualSwitch.Store(false)
 			log.Printf("core/tcp: connected to %s", wc.label)
 			setActive(wc.cf, wc.conn, wc.label, wc.combo)
 			requestStandby()

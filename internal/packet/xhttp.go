@@ -632,8 +632,9 @@ func (b *TCP) runXHTTPServer() {
 	// the origin with h2c when gRPC is enabled — that is the leg that STREAMS a full-duplex call
 	// instead of buffering the request body (which stalls stream-one over a plain HTTP/1.1 origin).
 	// h2c falls through to HTTP/1.1 for packet-up, so every mode shares this one plaintext listener.
-	b.httpSrv = &http.Server{Handler: h2c.NewHandler(mux, &http2.Server{})}
-	if err := b.httpSrv.Serve(b.ln); err != nil && !b.closed.Load() {
+	srv := &http.Server{Handler: h2c.NewHandler(mux, &http2.Server{})}
+	b.httpSrv.Store(srv) // publish atomically so Close (another goroutine) sees it without a data race
+	if err := srv.Serve(b.ln); err != nil && !b.closed.Load() {
 		log.Printf("core/xhttp: server: %v", err)
 	}
 }

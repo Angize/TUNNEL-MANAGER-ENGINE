@@ -231,10 +231,10 @@ func loadConfig(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
-	if c.MTU == 0 {
+	if c.MTU <= 0 { // <=0 (not just ==0): a negative MTU would reach `ip link set … mtu N` and fail
 		c.MTU = 1400
 	}
-	if c.Keepalive == 0 {
+	if c.Keepalive <= 0 { // <=0: a negative keepalive makes jitter() fire immediately -> ping busy-loop
 		c.Keepalive = 15
 	}
 	if c.Crypto.Cipher == "" {

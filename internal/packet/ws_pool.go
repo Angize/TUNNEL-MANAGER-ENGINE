@@ -568,10 +568,12 @@ func (p *wsPool) probeAllNow() {
 	p.mu.Unlock()
 }
 
-// selectEntry PINS a specific edge as the active one on its axis: an absolute operator override
-// that current() forces from then on (no drift, no auto-rotation off it) until the operator pins
-// a different edge on that axis or the tunnel is rebuilt. It also clears any suspect/dead mark on
-// the chosen entry so it gets a clean shot. Returns false if the key is unknown.
+// selectEntry PINS a specific edge as the active one on its axis: current() forces the chosen edge
+// until the carrier actually lands on it (pinApplied clears the pin) or pinTTL elapses with no
+// land — whichever comes first. So it is a "jump exactly here now and keep trying until connected"
+// override that survives a transient outage but self-releases on success (auto-rotation may then
+// drift off it) and on a dead edge. It also clears any suspect/dead mark on the chosen entry so it
+// gets a clean shot. Returns false if the key is unknown.
 func (p *wsPool) selectEntry(kind, key string) bool {
 	p.mu.Lock()
 	ok := false
