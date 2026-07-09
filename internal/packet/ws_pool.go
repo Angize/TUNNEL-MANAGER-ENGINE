@@ -222,7 +222,6 @@ func (p *wsPool) current() (string, wsSNIEntry, bool) {
 		if p.now() < p.pinUntil {
 			ip := p.resolvePinIPLocked()
 			sni := p.resolvePinSNILocked()
-			p.active = ip + " · " + sni.host
 			return ip, sni, true
 		}
 		p.pinIP, p.pinSNI, p.pinUntil = "", "", 0 // expired -> resume normal rotation
@@ -232,15 +231,35 @@ func (p *wsPool) current() (string, wsSNIEntry, bool) {
 		ip := p.ips[p.i%len(p.ips)]
 		sni := p.snis[p.j%len(p.snis)]
 		if p.ipHealth[ip] == nil && p.sniHealth[sni.host] == nil {
-			p.active = ip + " · " + sni.host
 			return ip, sni, true
 		}
 		p.stepLocked()
 	}
 	ip := p.bestIPLocked()
 	sni := p.bestSNILocked()
-	p.active = ip + " · " + sni.host
 	return ip, sni, true
+}
+
+// activeLabel builds the status-file "active edge" string for an (ip, sni) combo.
+func activeLabel(ip, host string) string { return ip + " · " + host }
+
+// setActive records the edge the client is ACTUALLY carrying data on right now, for the status
+// file's live "active edge" (and the panel's auto-switch log). current() is intentionally NOT the
+// place for this: it is also called to pick a warm STANDBY's edge, so letting it set p.active would
+// make the file show the standby instead of the live carrier. Only the real active/promoted carrier
+// calls this (from the one dial loop goroutine); an empty combo is ignored so a not-yet-connected
+// state never blanks a good active. Flushes the status file so the node/panel see the switch.
+func (p *wsPool) setActive(combo string) {
+	if combo == "" {
+		return
+	}
+	p.mu.Lock()
+	changed := p.active != combo
+	p.active = combo
+	p.mu.Unlock()
+	if changed {
+		p.writeStatus()
+	}
 }
 
 // resolvePinIPLocked returns the IP current() should use: the pinned one (absolute) if it still

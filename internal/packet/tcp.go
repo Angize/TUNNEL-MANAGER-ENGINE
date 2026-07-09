@@ -777,12 +777,12 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte) (net.C
 // In pool mode ANY failure is handed to attributeFailure, which runs a differential probe
 // to decide by TRUTH — not a guess — whether the IP, the SNI, or neither is at fault, and
 // pulls the guilty axis into the health FSM. A successful connect clears both axes.
-func (b *TCP) establishWS() (net.Conn, string, error) {
+func (b *TCP) establishWS() (net.Conn, string, string, error) {
 	dialAddr, host, ech, path := b.addr, b.wsHost, b.wsECH, b.wsPath
 	if b.pool != nil {
 		ip, sni, ok := b.pool.current()
 		if !ok {
-			return nil, "", errors.New("ws: edge pool is empty")
+			return nil, "", "", errors.New("ws: edge pool is empty")
 		}
 		dialAddr, host, ech, path = ip, sni.host, sni.ech, sni.path
 	}
@@ -793,13 +793,13 @@ func (b *TCP) establishWS() (net.Conn, string, error) {
 	conn, err := b.dialer(10 * time.Second).Dial("tcp", dialAddr)
 	if err != nil {
 		b.attributeFailure(dialAddr, sniEnt) // differential probe: IP vs SNI vs transient
-		return nil, dialAddr, err
+		return nil, dialAddr, "", err
 	}
 	if b.wsTLS {
 		tc, terr := b.tlsToEdge(conn, dialAddr, host, ech)
 		if terr != nil {
 			b.attributeFailure(dialAddr, sniEnt)
-			return nil, dialAddr, terr
+			return nil, dialAddr, "", terr
 		}
 		conn = tc
 	}
@@ -807,12 +807,12 @@ func (b *TCP) establishWS() (net.Conn, string, error) {
 	if werr != nil {
 		conn.Close()
 		b.attributeFailure(dialAddr, sniEnt)
-		return nil, dialAddr, werr
+		return nil, dialAddr, "", werr
 	}
 	if b.pool != nil {
 		b.pool.succeeded(dialAddr, host) // combo works: clear any suspicion on this IP and SNI
 	}
-	return &wsConn{Conn: conn, r: r, client: true}, dialAddr, nil
+	return &wsConn{Conn: conn, r: r, client: true}, dialAddr, activeLabel(dialAddr, host), nil
 }
 
 // probeVerdict is the outcome of a differential failure probe: which axis of a failed
@@ -1041,7 +1041,7 @@ func (b *TCP) dialLoop() {
 		if b.closed.Load() {
 			return
 		}
-		conn, label, err := b.dialCarrier() // logs the specific transport failure itself
+		conn, label, combo, err := b.dialCarrier() // logs the specific transport failure itself
 		if err != nil {
 			if b.pool != nil {
 				b.pool.advance() // rotate to the next combo for the retry
@@ -1065,10 +1065,11 @@ func (b *TCP) dialLoop() {
 		cc := conn
 		b.curConn.Store(&cc) // expose the live conn so RotateIP/RotateSNI can drop it
 		if b.pool != nil {
-			// current() set the active (ip · sni) in memory when it picked this edge, but
-			// only burns flushed it to the status file — so a plain rotation left the file
-			// stale and the panel kept showing the old active row. Flush it on every connect.
-			b.pool.writeStatus()
+			// Record the edge we ACTUALLY connected on as the live active and flush the status
+			// file, so a plain rotation reflects the new active immediately (the panel reads this
+			// field and logs the auto-switch off its change). setActive is the single writer of the
+			// active edge — current() no longer touches it, so a standby dial can't corrupt it.
+			b.pool.setActive(combo)
 		}
 		// Proactive rotation: after b.rotate, advance the pool and drop this connection
 		// so dialLoop reconnects on the next edge. A connection that dies on its own
@@ -1113,37 +1114,37 @@ func (b *TCP) dialLoop() {
 // edge (with failure attribution inside establishWS/establishXHTTP), or a plain/cover TCP dial.
 // It returns the live conn and a label for logging, and logs the specific transport-level
 // failure itself so callers only decide retry/rotation policy. It does NOT frame or handshake.
-func (b *TCP) dialCarrier() (net.Conn, string, error) {
+func (b *TCP) dialCarrier() (net.Conn, string, string, error) {
 	if b.ws { // pool or single edge: dial + wss(+ECH) + upgrade, burning on failure
 		var c net.Conn
-		var edge string
+		var edge, combo string
 		var err error
 		if b.xhttp {
-			c, edge, err = b.establishXHTTP()
+			c, edge, combo, err = b.establishXHTTP()
 		} else {
-			c, edge, err = b.establishWS()
+			c, edge, combo, err = b.establishWS()
 		}
 		if err != nil {
 			log.Printf("core/ws: connect via %s failed: %v", edge, err)
-			return nil, edge, err
+			return nil, edge, "", err
 		}
-		return c, edge, nil
+		return c, edge, combo, nil
 	}
 	c, err := b.dialer(10 * time.Second).Dial("tcp", b.addr)
 	if err != nil {
 		log.Printf("core/tcp: dial %s failed: %v", b.addr, err)
-		return nil, b.addr, err
+		return nil, b.addr, "", err
 	}
 	if b.cover { // wrap in a Chrome-fingerprinted TLS session carrying the auth token
 		tconn, cerr := tlscover.ClientConn(c, b.coverSNI, b.psk, time.Now().Add(handshakeTimeout))
 		if cerr != nil {
 			c.Close()
 			log.Printf("core/tcp: tls cover to %s failed: %v", b.addr, cerr)
-			return nil, b.addr, cerr
+			return nil, b.addr, "", cerr
 		}
 		c = tconn
 	}
-	return c, b.addr, nil
+	return c, b.addr, b.addr, nil
 }
 
 // handshakeAndPrime wraps a freshly-dialed conn in a framer, runs the client ephemeral handshake
@@ -1171,26 +1172,26 @@ func (b *TCP) handshakeAndPrime(conn net.Conn) (*connFramer, error) {
 // advance is true it rotates the pool first, so a standby lands on a different edge than the
 // active. On success the pool status file is flushed (as dialLoop does on connect). On a
 // transport failure the pool is advanced so the next attempt tries a different combo.
-func (b *TCP) warmEstablish(advance bool) (*connFramer, net.Conn, string, error) {
+func (b *TCP) warmEstablish(advance bool) (*connFramer, net.Conn, string, string, error) {
 	if advance && b.pool != nil {
 		b.pool.advance()
 	}
-	conn, label, err := b.dialCarrier()
+	conn, label, combo, err := b.dialCarrier()
 	if err != nil {
 		if b.pool != nil {
 			b.pool.advance() // move off the failing edge for the next attempt
 		}
-		return nil, nil, label, err
+		return nil, nil, label, "", err
 	}
 	cf, err := b.handshakeAndPrime(conn)
 	if err != nil {
 		conn.Close()
-		return nil, nil, label, err
+		return nil, nil, label, "", err
 	}
 	if b.pool != nil {
-		b.pool.writeStatus()
+		b.pool.writeStatus() // flush any health/burn state this dial discovered (NOT the active edge)
 	}
-	return cf, conn, label, nil
+	return cf, conn, label, combo, nil
 }
 
 // warmConn bundles a freshly-established carrier framer with its underlying conn (and the edge
@@ -1198,7 +1199,8 @@ func (b *TCP) warmEstablish(advance bool) (*connFramer, net.Conn, string, error)
 type warmConn struct {
 	cf    *connFramer
 	conn  net.Conn
-	label string
+	label string // the edge IP (health accounting)
+	combo string // the full "ip · sni" for the status file's live active edge
 }
 
 // dialLoopWarm is the make-before-break client loop for a ws edge pool: it keeps the ACTIVE
@@ -1217,6 +1219,10 @@ func (b *TCP) dialLoopWarm() {
 	// Track the active carrier's edge + when it started carrying data, so a promoted-then-quickly-
 	// dead edge is attributed to the right IP for data-plane throttle detection (C1).
 	var activeLabel, standbyLabel string
+	// The full "ip · sni" combo of each carrier, for the status file's live active edge. Kept
+	// separate from activeLabel (the IP, used for health accounting) and threaded per-dial so a
+	// standby build can never overwrite the live active — only setActive/promote publish it.
+	var activeCombo, standbyCombo string
 	var activeSince time.Time
 	standbyBuilding := false
 
@@ -1232,13 +1238,17 @@ func (b *TCP) dialLoopWarm() {
 			}
 		}()
 	}
-	setActive := func(cf *connFramer, conn net.Conn, label string) {
+	setActive := func(cf *connFramer, conn net.Conn, label, combo string) {
 		active = cf
 		activeLabel = label
+		activeCombo = combo
 		activeSince = time.Now()
 		b.cur.Store(cf)
 		cc := conn
 		b.curConn.Store(&cc)
+		if b.pool != nil {
+			b.pool.setActive(combo) // publish the live active edge + flush the status file
+		}
 		startReader(cf)
 	}
 	// requestStandby dials a new standby in the background unless one is already up or building.
@@ -1254,7 +1264,7 @@ func (b *TCP) dialLoopWarm() {
 				if b.closed.Load() {
 					return
 				}
-				cf, conn, label, err := b.warmEstablish(true) // different edge than the active
+				cf, conn, label, combo, err := b.warmEstablish(true) // different edge than the active
 				if err != nil {
 					if b.sleep(1 * time.Second) {
 						return
@@ -1262,7 +1272,7 @@ func (b *TCP) dialLoopWarm() {
 					continue
 				}
 				select {
-				case ready <- warmConn{cf, conn, label}:
+				case ready <- warmConn{cf, conn, label, combo}:
 				case <-b.closeCh:
 					conn.Close()
 				}
@@ -1285,8 +1295,10 @@ func (b *TCP) dialLoopWarm() {
 		}
 		active = standby
 		activeLabel = standbyLabel
+		activeCombo = standbyCombo
 		activeSince = time.Now() // the standby starts carrying data now
 		standbyLabel = ""
+		standbyCombo = ""
 		b.cur.Store(standby) // instant failover; the next TUN packet flips the server downstream
 		if sc := b.standbyConn.Load(); sc != nil {
 			b.curConn.Store(sc)
@@ -1294,6 +1306,9 @@ func (b *TCP) dialLoopWarm() {
 		standby = nil
 		b.standby.Store(nil)
 		b.standbyConn.Store(nil)
+		if b.pool != nil {
+			b.pool.setActive(activeCombo) // the promoted standby is now the live edge — publish + flush
+		}
 		if old != nil {
 			old.conn.Close() // retire the old edge; its reader reports an (ignored) exit
 		}
@@ -1307,7 +1322,7 @@ func (b *TCP) dialLoopWarm() {
 			if b.closed.Load() {
 				return false
 			}
-			cf, conn, label, err := b.warmEstablish(false)
+			cf, conn, label, combo, err := b.warmEstablish(false)
 			if err != nil {
 				if b.sleep(1 * time.Second) {
 					return false
@@ -1315,7 +1330,7 @@ func (b *TCP) dialLoopWarm() {
 				continue
 			}
 			log.Printf("core/tcp: connected to %s", label)
-			setActive(cf, conn, label)
+			setActive(cf, conn, label, combo)
 			return true
 		}
 	}
@@ -1401,6 +1416,7 @@ func (b *TCP) dialLoopWarm() {
 			}
 			standby = wc.cf
 			standbyLabel = wc.label
+			standbyCombo = wc.combo
 			b.standby.Store(wc.cf)
 			sc := wc.conn
 			b.standbyConn.Store(&sc)

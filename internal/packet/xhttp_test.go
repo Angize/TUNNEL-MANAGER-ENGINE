@@ -86,7 +86,7 @@ func TestXHTTPCarrierRoundTrip(t *testing.T) {
 	srv := echoXHTTP()
 	defer srv.Close()
 	b := &TCP{addr: srv.Listener.Addr().String(), wsPath: "/", wsTLS: false}
-	conn, _, err := b.establishXHTTP()
+	conn, _, _, err := b.establishXHTTP()
 	if err != nil {
 		t.Fatalf("establishXHTTP: %v", err)
 	}

@@ -262,10 +262,10 @@ func (b *TCP) xhttpClientTLS(host string, ech []byte) *tls.Config {
 //	                     short complete POSTs at once.
 //	grpc (b.xhMode=="grpc", or the legacy "stream" alias): one full-duplex request presented as a
 //	                     real gRPC call — needs HTTP/2 to the edge (ws_tls) so a CDN streams it.
-func (b *TCP) establishXHTTP() (net.Conn, string, error) {
+func (b *TCP) establishXHTTP() (net.Conn, string, string, error) {
 	dialAddr, host, ech, path, err := b.xhttpEdge()
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	single := b.xhMode == "stream" || b.xhMode == "grpc" // one full-duplex request (both need h2)
 	tr := &http.Transport{
@@ -315,7 +315,11 @@ func (b *TCP) establishXHTTP() (net.Conn, string, error) {
 			b.pool.succeeded(dialAddr, host)
 		}
 	}
-	return conn, dialAddr, err
+	combo := ""
+	if err == nil {
+		combo = activeLabel(dialAddr, host)
+	}
+	return conn, dialAddr, combo, err
 }
 
 // --- gRPC framing (mode "grpc") ---------------------------------------------------------------
