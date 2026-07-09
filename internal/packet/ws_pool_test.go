@@ -296,6 +296,61 @@ func TestAdvanceIPAndSNIIndependently(t *testing.T) {
 	}
 }
 
+// TestDataPlaneFaultBurn locks down C1: a carrier that connects then dies quickly (throttle /
+// blackhole-after-handshake) is attributed to its IP after dataFailThreshold short deaths — but
+// only with a recent good session (outage guard) and a healthy alternative (never strand the pool).
+func TestDataPlaneFaultBurn(t *testing.T) {
+	p, _ := clockPool([]string{"a", "b", "c"}, snis("x"), true, "")
+
+	// Outage guard: with no recent good session, short deaths must NOT burn (server/local outage).
+	p.dataFailure("a")
+	p.dataFailure("a")
+	if p.ipHealth["a"] != nil {
+		t.Fatal("burned an IP with no recent good session (outage guard failed)")
+	}
+
+	// A good session elsewhere arms attribution; then it takes the threshold to burn.
+	p.dataSuccess("b")
+	p.dataFailure("a")
+	if p.ipHealth["a"] != nil {
+		t.Fatal("burned after a single data fault; want threshold")
+	}
+	p.dataFailure("a")
+	if p.ipHealth["a"] == nil || p.ipHealth["a"].state != stateSuspect {
+		t.Fatal("expected 'a' suspect after dataFailThreshold short deaths")
+	}
+	if p.ipHealth["a"].nextRetest != 1000+suspectBackoff[2] {
+		t.Fatalf("data-plane suspect should use the longer backoff, got nextRetest=%d", p.ipHealth["a"].nextRetest)
+	}
+
+	// dataSuccess resets the per-IP counter.
+	p.dataFailure("c")
+	p.dataSuccess("c")
+	p.dataFailure("c")
+	if p.ipHealth["c"] != nil {
+		t.Fatal("dataSuccess should have reset c's fault counter")
+	}
+
+	// No healthy alternative -> never strand the pool (don't burn the last usable IP).
+	p2, _ := clockPool([]string{"d", "e"}, snis("x"), true, "")
+	p2.dataSuccess("e")
+	p2.ipHealth["e"] = &healthRec{state: stateDead, nextRetest: 1 << 40} // only 'd' remains usable
+	p2.dataFailure("d")
+	p2.dataFailure("d")
+	if p2.ipHealth["d"] != nil {
+		t.Fatal("burned the last healthy IP (no-alt guard failed)")
+	}
+
+	// autoBurn off -> data faults are ignored entirely.
+	p3, _ := clockPool([]string{"a", "b"}, snis("x"), false, "")
+	p3.dataSuccess("b")
+	p3.dataFailure("a")
+	p3.dataFailure("a")
+	if p3.ipHealth["a"] != nil {
+		t.Fatal("data fault burned an edge with autoBurn off")
+	}
+}
+
 // TestDifferentialProbeVerdicts locks down the REPRODUCE-FIRST prober: a working combo is a
 // transient blip (blame nothing), and a confirmed-down combo is attributed to the axis that
 // still works in isolation — deterministically, with no dependence on goroutine scheduling

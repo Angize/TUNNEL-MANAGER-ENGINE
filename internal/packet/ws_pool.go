@@ -67,6 +67,16 @@ var suspectBackoff = []int64{30, 60, 120, 300, 600}
 // deadRetest is the slow interval (seconds) a DEAD entry is retested on.
 const deadRetest int64 = 1800
 
+// Data-plane fault tuning. A pool carrier that completes its handshake but then dies quickly is
+// the throttle / blackhole-after-handshake signature the connect-time (TLS/upgrade) prober can
+// NOT see. We attribute such short-lived sessions to the active IP and, after a few in a row,
+// pull it from rotation — but only when a healthy alternative exists and a good session happened
+// recently, so a whole-server or local outage (where EVERY edge dies fast) never burns the pool.
+const (
+	dataFailThreshold = 2   // consecutive short-lived sessions on an IP before it is suspected
+	dataGoodWindow    = 120 // sec: only blame the edge if some edge sustained a session this recently
+)
+
 // healthRec tracks one non-healthy pool entry. fails counts failed retests since it entered
 // suspect; nextRetest is the unix time the scheduler may probe it again.
 type healthRec struct {
@@ -89,14 +99,63 @@ type wsPool struct {
 	autoBurn   bool
 	statusPath string
 	active     string
-	now        func() int64 // injectable clock (unix seconds); overridden in tests
+	dataFail   map[string]int // per-IP count of consecutive short-lived (data-plane-fault) sessions
+	lastGood   int64          // unix time of the last SUSTAINED session on any edge (outage guard)
+	now        func() int64   // injectable clock (unix seconds); overridden in tests
 }
 
 func newWSPool(ips []string, snis []wsSNIEntry, autoBurn bool, statusPath string) *wsPool {
 	p := &wsPool{ips: ips, snis: snis, ipHealth: map[string]*healthRec{}, sniHealth: map[string]*healthRec{},
-		autoBurn: autoBurn, statusPath: statusPath, now: func() int64 { return time.Now().Unix() }}
+		dataFail: map[string]int{}, autoBurn: autoBurn, statusPath: statusPath, now: func() int64 { return time.Now().Unix() }}
 	p.writeStatus()
 	return p
+}
+
+// dataSuccess records a SUSTAINED session on ip: it clears the IP's data-plane fault counter and
+// stamps the fleet "something worked recently" clock, which suppresses data-plane burns during a
+// whole-server / local outage. Called by the pool client when a carrier lived long enough to be
+// considered genuinely healthy.
+func (p *wsPool) dataSuccess(ip string) {
+	p.mu.Lock()
+	delete(p.dataFail, ip)
+	p.lastGood = p.now()
+	p.mu.Unlock()
+}
+
+// dataFailure records a SHORT-lived session on ip — the handshake succeeded but the data plane
+// died quickly (throttle / blackhole-after-handshake), which the connect-time prober can't see.
+// After dataFailThreshold consecutive short deaths the IP is marked suspect so rotation skips it.
+// Guarded to avoid false burns: autoBurn on; a healthy alternative IP exists (never strand the
+// pool); and a good session happened recently (so a server-side/local outage, where every edge
+// dies fast, does not burn the whole pool). Data-plane suspects start on a LONGER backoff, since
+// the retest can confirm reachability but not throughput — we must not rush a still-throttled
+// edge back into rotation.
+func (p *wsPool) dataFailure(ip string) {
+	if !p.autoBurn {
+		return
+	}
+	p.mu.Lock()
+	burned := false
+	recentGood := p.lastGood > 0 && p.now()-p.lastGood < dataGoodWindow
+	hasAlt := false
+	for _, o := range p.ips {
+		if o != ip && p.ipHealth[o] == nil {
+			hasAlt = true
+			break
+		}
+	}
+	if recentGood && hasAlt {
+		p.dataFail[ip]++
+		if p.dataFail[ip] >= dataFailThreshold && p.ipHealth[ip] == nil {
+			p.ipHealth[ip] = &healthRec{state: stateSuspect, nextRetest: p.now() + suspectBackoff[2]}
+			p.dataFail[ip] = 0
+			burned = true
+		}
+	}
+	p.mu.Unlock()
+	if burned {
+		p.writeStatus()
+	}
 }
 
 // healthMap returns the record map for the given axis ("ip" or "sni"). Caller holds the lock.

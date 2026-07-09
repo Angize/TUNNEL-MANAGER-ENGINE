@@ -76,6 +76,11 @@ const (
 	// probeTimeout bounds a single differential/retest edge probe (TCP dial + TLS, no WS, no data).
 	probeTimeout = 5 * time.Second
 
+	// minLiveness (pool client) is the shortest a carrier may live and still count as a healthy
+	// session. A connection that handshakes then dies sooner than this is treated as a data-plane
+	// fault (throttle / blackhole-after-handshake) against its edge, not a healthy session.
+	minLiveness = 20 * time.Second
+
 	// maxAuthConns bounds concurrent AUTHENTICATED server connections. A warm-standby client
 	// keeps a second live carrier up (make-before-break), so the server must NOT evict the
 	// previous connection when a new one authenticates; instead it holds up to this many and,
@@ -831,6 +836,41 @@ func (b *TCP) probeEdge(ip string, sni wsSNIEntry) bool {
 	return true
 }
 
+// probeEdgeFull is a higher-fidelity reachability probe than probeEdge: it completes the FULL
+// client control path to (ip, sni) — TCP + (wss TLS+ECH) + WebSocket UPGRADE — then closes, with
+// no data and no pool-state changes. Because a LIVE success requires the upgrade (not just TLS),
+// using this for retests/attribution stops a broken ws/origin path (TLS completes, upgrade 502s
+// — the steady state of a dead origin behind a CDN that terminates TLS for anyone) from being
+// mislabeled "reachable" the way a TLS-only probe would, and from falsely healing a suspect.
+// For xhttp edges (no ws upgrade) it falls back to the TLS-only probeEdge.
+func (b *TCP) probeEdgeFull(ip string, sni wsSNIEntry) bool {
+	if b.xhttp {
+		return b.probeEdge(ip, sni)
+	}
+	conn, err := b.dialer(probeTimeout).Dial("tcp", ip)
+	if err != nil {
+		return false
+	}
+	host := sni.host
+	if host == "" {
+		host = ip
+	}
+	if b.wsTLS {
+		tc, terr := b.tlsToEdge(conn, ip, host, sni.ech) // closes conn on failure
+		if terr != nil {
+			return false
+		}
+		conn = tc
+	}
+	path := sni.path
+	if path == "" {
+		path = "/"
+	}
+	_, werr := wsClientHandshake(conn, host, path, time.Now().Add(handshakeTimeout))
+	conn.Close()
+	return werr == nil
+}
+
 // differentialProbe attributes a failed (ip, sni) connect to a specific axis. It is
 // REPRODUCE-FIRST and deterministic (no race), because the old racing version blamed a
 // random axis whenever every edge was actually reachable — a transient blip could sideline
@@ -848,7 +888,7 @@ func (b *TCP) probeEdge(ip string, sni wsSNIEntry) bool {
 // With no healthy alternative on either axis (a single edge) there is nowhere to move and
 // nothing to compare, so the verdict is UNKNOWN — blame nothing.
 func (b *TCP) differentialProbe(failIP string, failSNI wsSNIEntry) probeVerdict {
-	probe := b.probeEdge
+	probe := b.probeEdgeFull // full TLS+ws-upgrade path, so a dead origin isn't read as "reachable"
 	if b.probeFn != nil {
 		probe = b.probeFn
 	}
@@ -925,7 +965,9 @@ func (b *TCP) retestLoop() {
 				if b.closed.Load() {
 					return
 				}
-				b.pool.retestResult(spec.kind, spec.key, b.probeEdge(spec.ip, spec.sni))
+				// Full TLS+ws-upgrade probe so a suspect isn't falsely healed by a TLS-only success
+				// on an edge whose ws/origin path is actually broken.
+				b.pool.retestResult(spec.kind, spec.key, b.probeEdgeFull(spec.ip, spec.sni))
 			}
 		}
 	}
@@ -959,6 +1001,7 @@ func (b *TCP) dialLoop() {
 			continue
 		}
 		log.Printf("core/tcp: connected to %s", label)
+		connectedAt := time.Now()
 		b.cur.Store(cf)
 		cc := conn
 		b.curConn.Store(&cc) // expose the live conn so RotateIP/RotateSNI can drop it
@@ -982,6 +1025,18 @@ func (b *TCP) dialLoop() {
 		}
 		b.curConn.CompareAndSwap(&cc, nil)
 		b.cur.CompareAndSwap(cf, nil)
+		// Data-plane health (pool only): a carrier that connected but died fast is the throttle /
+		// blackhole-after-handshake signature the TLS/upgrade prober can't see. Feed it to the FSM
+		// (short session -> fault + move off the edge; sustained session -> confirm it healthy) so a
+		// throttled edge is finally pulled from rotation instead of being redialed forever.
+		if b.pool != nil && !b.closed.Load() {
+			if time.Since(connectedAt) < minLiveness {
+				b.pool.dataFailure(label)
+				b.pool.advance() // don't re-stick on the bad edge
+			} else {
+				b.pool.dataSuccess(label)
+			}
+		}
 		if b.sleep(1 * time.Second) {
 			return
 		}
@@ -1072,11 +1127,12 @@ func (b *TCP) warmEstablish(advance bool) (*connFramer, net.Conn, string, error)
 	return cf, conn, label, nil
 }
 
-// warmConn bundles a freshly-established carrier framer with its underlying conn, handed from a
-// background dial worker to the warm-standby manager.
+// warmConn bundles a freshly-established carrier framer with its underlying conn (and the edge
+// label it dialed), handed from a background dial worker to the warm-standby manager.
 type warmConn struct {
-	cf   *connFramer
-	conn net.Conn
+	cf    *connFramer
+	conn  net.Conn
+	label string
 }
 
 // dialLoopWarm is the make-before-break client loop for a ws edge pool: it keeps the ACTIVE
@@ -1092,6 +1148,10 @@ func (b *TCP) dialLoopWarm() {
 	exits := make(chan *connFramer, 8) // a per-conn reader finished (its conn died)
 	ready := make(chan warmConn, 2)    // a background standby dial completed
 	var active, standby *connFramer
+	// Track the active carrier's edge + when it started carrying data, so a promoted-then-quickly-
+	// dead edge is attributed to the right IP for data-plane throttle detection (C1).
+	var activeLabel, standbyLabel string
+	var activeSince time.Time
 	standbyBuilding := false
 
 	// startReader runs a connection's read loop; on exit it reports the framer so the manager
@@ -1106,8 +1166,10 @@ func (b *TCP) dialLoopWarm() {
 			}
 		}()
 	}
-	setActive := func(cf *connFramer, conn net.Conn) {
+	setActive := func(cf *connFramer, conn net.Conn, label string) {
 		active = cf
+		activeLabel = label
+		activeSince = time.Now()
 		b.cur.Store(cf)
 		cc := conn
 		b.curConn.Store(&cc)
@@ -1126,7 +1188,7 @@ func (b *TCP) dialLoopWarm() {
 				if b.closed.Load() {
 					return
 				}
-				cf, conn, _, err := b.warmEstablish(true) // different edge than the active
+				cf, conn, label, err := b.warmEstablish(true) // different edge than the active
 				if err != nil {
 					if b.sleep(1 * time.Second) {
 						return
@@ -1134,7 +1196,7 @@ func (b *TCP) dialLoopWarm() {
 					continue
 				}
 				select {
-				case ready <- warmConn{cf, conn}:
+				case ready <- warmConn{cf, conn, label}:
 				case <-b.closeCh:
 					conn.Close()
 				}
@@ -1149,7 +1211,16 @@ func (b *TCP) dialLoopWarm() {
 			return false
 		}
 		old := active
+		// Proactive rotation retires a still-live active — count its sustained session as healthy
+		// so its edge isn't wrongly suspected. (On a FAILOVER the caller has already nil'd active
+		// and accounted for its death, so old==nil here and this is skipped.)
+		if old != nil && activeLabel != "" && time.Since(activeSince) >= minLiveness {
+			b.pool.dataSuccess(activeLabel)
+		}
 		active = standby
+		activeLabel = standbyLabel
+		activeSince = time.Now() // the standby starts carrying data now
+		standbyLabel = ""
 		b.cur.Store(standby) // instant failover; the next TUN packet flips the server downstream
 		if sc := b.standbyConn.Load(); sc != nil {
 			b.curConn.Store(sc)
@@ -1178,7 +1249,7 @@ func (b *TCP) dialLoopWarm() {
 				continue
 			}
 			log.Printf("core/tcp: connected to %s", label)
-			setActive(cf, conn)
+			setActive(cf, conn, label)
 			return true
 		}
 	}
@@ -1202,7 +1273,16 @@ func (b *TCP) dialLoopWarm() {
 		case ex := <-exits:
 			switch ex {
 			case active:
-				// Active died: promote the warm standby, else fall back to a fresh dial.
+				// Active died: attribute its data-plane health (short-lived -> throttle fault on
+				// its edge; sustained -> confirm healthy), then promote the warm standby, else fall
+				// back to a fresh dial.
+				if activeLabel != "" {
+					if time.Since(activeSince) < minLiveness {
+						b.pool.dataFailure(activeLabel)
+					} else {
+						b.pool.dataSuccess(activeLabel)
+					}
+				}
 				b.cur.CompareAndSwap(active, nil)
 				b.curConn.Store(nil)
 				active = nil
@@ -1233,6 +1313,7 @@ func (b *TCP) dialLoopWarm() {
 				continue
 			}
 			standby = wc.cf
+			standbyLabel = wc.label
 			b.standby.Store(wc.cf)
 			sc := wc.conn
 			b.standbyConn.Store(&sc)
