@@ -103,10 +103,17 @@ type wsPool struct {
 	lastGood   int64          // unix time of the last SUSTAINED session on any edge (outage guard)
 	events     []coreEvent    // rolling ring of core-observed events (down/burn) for the panel log
 	evSeq      int64          // monotonic sequence so the panel can consume each event exactly once
-	pinIP      string         // operator-pinned IP: current() forces it (absolute), no auto-rotation
-	pinSNI     string         // operator-pinned SNI: current() forces it (absolute)
+	pinIP      string         // operator-pinned IP: current() forces it until pinUntil (one-shot jump)
+	pinSNI     string         // operator-pinned SNI: current() forces it until pinUntil
+	pinUntil   int64          // unix time the pin is honoured until; after it, normal rotation resumes
 	now        func() int64   // injectable clock (unix seconds); overridden in tests
 }
+
+// pinTTL is how long a manual pin FORCES the exact chosen edge. It only needs to outlast the
+// jump + settle, not lock forever: once the edge is active it simply stays (no self-triggered
+// re-dial) until the next proactive rotation, so the pin is a one-shot "jump exactly here now",
+// not a permanent lock — and a dead pinned edge can't strand the tunnel past this window.
+const pinTTL int64 = 20
 
 // coreEvent is one core-observed occurrence surfaced to the panel's system log: the CORE knows the
 // real reason a carrier dropped or an edge was burned (it saw the actual error), so instead of the
@@ -207,15 +214,18 @@ func (p *wsPool) current() (string, wsSNIEntry, bool) {
 	if len(p.ips) == 0 || len(p.snis) == 0 {
 		return "", wsSNIEntry{}, false
 	}
-	// An operator PIN is ABSOLUTE: the chosen axis is forced (even if it is suspect/dead) so the
-	// EXACT edge the operator selected is what runs — never a neighbour, and it never drifts on a
-	// rotation/failover. Only the UNPINNED axis is free to pick a healthy value. This is what makes
-	// "pin edge X" atomic: every dial (active OR a promoted warm standby) resolves to X.
+	// A manual pin is a ONE-SHOT exact jump: while it is fresh (within pinTTL) current() FORCES the
+	// chosen axis, so the jump — and any warm-standby promotion during it — lands on EXACTLY that
+	// edge, never a neighbour. Once the pin expires it is cleared and normal rotation resumes; the
+	// active edge simply stays put (no self-triggered re-dial) until the next proactive rotation.
 	if p.pinIP != "" || p.pinSNI != "" {
-		ip := p.resolvePinIPLocked()
-		sni := p.resolvePinSNILocked()
-		p.active = ip + " · " + sni.host
-		return ip, sni, true
+		if p.now() < p.pinUntil {
+			ip := p.resolvePinIPLocked()
+			sni := p.resolvePinSNILocked()
+			p.active = ip + " · " + sni.host
+			return ip, sni, true
+		}
+		p.pinIP, p.pinSNI, p.pinUntil = "", "", 0 // expired -> resume normal rotation
 	}
 	n := len(p.ips) * len(p.snis)
 	for k := 0; k < n; k++ {
@@ -279,11 +289,13 @@ func (p *wsPool) healthyOrBestSNILocked() wsSNIEntry {
 	return p.bestSNILocked()
 }
 
-// isPinned reports whether the operator has pinned either axis (proactive rotation is then off).
+// isPinned reports whether a manual pin is still in its (short) force window, during which
+// proactive rotation is held off so the jump lands exactly. After the window it returns false
+// and normal rotation resumes.
 func (p *wsPool) isPinned() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.pinIP != "" || p.pinSNI != ""
+	return (p.pinIP != "" || p.pinSNI != "") && p.now() < p.pinUntil
 }
 
 // bestIPLocked / bestSNILocked return the least-bad entry for the current() fallback: a
@@ -562,6 +574,9 @@ func (p *wsPool) selectEntry(kind, key string) bool {
 				break
 			}
 		}
+	}
+	if ok {
+		p.pinUntil = p.now() + pinTTL // force the exact edge for the jump window, then resume rotation
 	}
 	p.mu.Unlock()
 	if ok {
