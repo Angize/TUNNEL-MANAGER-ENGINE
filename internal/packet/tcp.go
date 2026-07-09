@@ -876,7 +876,14 @@ func (b *TCP) differentialProbe(failIP string, failSNI wsSNIEntry) probeVerdict 
 	case ipKnown && ipOK && !(sniKnown && sniOK):
 		return verdictSNIGuilty // the IP works elsewhere but the SNI doesn't -> SNI is the culprit
 	case ipKnown && !ipOK && sniKnown && !sniOK:
-		return verdictIPGuilty // both isolated probes failed -> both blocked; pin the IP (SNI heals on retest)
+		// Both isolated probes failed though both partners are FSM-healthy: either both edges
+		// are genuinely blocked, OR the client's own uplink just dropped. Confirm with a
+		// KNOWN-GOOD combo before blaming, so a local/broad outage never falsely burns a clean
+		// edge (which is exactly the false-positive this whole rewrite exists to prevent).
+		if probe(altIP, altSNI) {
+			return verdictIPGuilty // uplink is fine -> both edges really are down; pin the IP (SNI heals on retest)
+		}
+		return verdictUnknown // even a known-good combo fails -> local/broad outage; blame nothing
 	default:
 		return verdictUnknown // both work in isolation (ambiguous/origin), or nothing to compare
 	}

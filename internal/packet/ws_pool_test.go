@@ -338,9 +338,13 @@ func TestDifferentialProbeVerdicts(t *testing.T) {
 	if v := mk(ips, hosts, all(ips, hosts, "s1")).differentialProbe("ip1", fail); v != verdictSNIGuilty {
 		t.Fatalf("dead sni: got %v, want SNI-guilty", v)
 	}
-	// both dead: pin the IP (SNI heals on retest).
+	// both dead but the client uplink is fine (altIP+altSNI works): pin the IP (SNI heals on retest).
 	if v := mk(ips, hosts, all(ips, hosts, "ip1", "s1")).differentialProbe("ip1", fail); v != verdictIPGuilty {
 		t.Fatalf("both dead: got %v, want IP-guilty", v)
+	}
+	// local/broad outage: NOTHING is reachable (client uplink down) -> blame nothing, never burn a clean edge.
+	if v := mk(ips, hosts, map[string]bool{}).differentialProbe("ip1", fail); v != verdictUnknown {
+		t.Fatalf("local outage: got %v, want unknown (no false burn)", v)
 	}
 	// single SNI, dead IP (the screenshot case: 2 IPs, 1 SNI) -> IP guilty, never blames the lone SNI.
 	if v := mk(ips, []string{"s1"}, all(ips, []string{"s1"}, "ip1")).differentialProbe("ip1", fail); v != verdictIPGuilty {
