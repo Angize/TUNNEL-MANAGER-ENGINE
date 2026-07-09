@@ -81,6 +81,21 @@ type UDP struct {
 
 	closeCh   chan struct{}
 	closeOnce sync.Once
+
+	st *coreStatus // client-only: precise self-heal event ring written to the status file (nil = off)
+}
+
+// SetStatusPath (client, optional) wires a status-file event ring so self-heal re-handshakes and
+// recoveries surface in the panel's system log. Call before Run(). No-op path leaves it off.
+func (b *UDP) SetStatusPath(path string) {
+	if path == "" || !b.isClient {
+		return
+	}
+	peer := ""
+	if p := b.peer.Load(); p != nil {
+		peer = p.String()
+	}
+	b.st = newCoreStatus(path, "udp · "+peer)
 }
 
 // sessionStale reports that the client has heard nothing it could authenticate from the server
@@ -331,6 +346,7 @@ func (b *UDP) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 		b.rp = replayGuard{}
 		b.session.Store(&sealerBox{s: s})
 		b.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale"
+		b.st.reconnected("udp")               // recovery after a self-heal (nil-safe; silent on first connect)
 		return
 	}
 	// server: authenticate an init, reply, and install the fresh session.
@@ -407,6 +423,7 @@ func (b *UDP) clientLoop() {
 			b.session.Store(nil) // server likely restarted — drop the dead session so we re-handshake
 			b.ci.Store(nil)
 			log.Print("core: no reply from the peer's session — re-handshaking (peer likely restarted)")
+			b.st.down("stale", "udp") // precise reason for the panel log (nil-safe when off)
 		}
 		if b.sealer() == nil && b.cryptoOn {
 			b.sendInit()

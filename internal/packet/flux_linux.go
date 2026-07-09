@@ -74,6 +74,21 @@ type Flux struct {
 	sendDown  bool                   // set under sendMu.Lock in Close: no more Sendto on the (about-to-be-closed) raw fd
 	closeCh   chan struct{}
 	closeOnce sync.Once
+
+	st *coreStatus // client-only: precise self-heal event ring written to the status file (nil = off)
+}
+
+// SetStatusPath (client, optional) wires a status-file event ring so self-heal re-handshakes and
+// recoveries surface in the panel's system log. Call before Run(). No-op path leaves it off.
+func (f *Flux) SetStatusPath(path string) {
+	if path == "" || !f.isClient {
+		return
+	}
+	peer := ""
+	if p := f.peer.Load(); p != nil {
+		peer = p.String()
+	}
+	f.st = newCoreStatus(path, "flux:"+f.carrier+" · "+peer)
 }
 
 func newFlux(dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier, shape string, epochOffset int64, fec bool, fecData, fecParity int, isClient bool) *Flux {
@@ -599,6 +614,7 @@ func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
 		f.rp = replayGuard{}
 		f.session.Store(&sealerBox{s: s})
 		f.lastRx.Store(time.Now().UnixNano())
+		f.st.reconnected("flux") // recovery after a self-heal (nil-safe; silent on first connect)
 		return
 	}
 	// Compute-DoS mitigation: an attacker replaying captured valid inits at high rate
@@ -681,6 +697,7 @@ func (f *Flux) clientLoop() {
 			f.session.Store(nil)
 			f.ci.Store(nil)
 			log.Print("flux: no reply from the peer's session — re-handshaking (peer likely restarted)")
+			f.st.down("stale", "flux") // precise reason for the panel log (nil-safe when off)
 		}
 		if f.cryptoOn && f.sealer() == nil {
 			f.sendInit()

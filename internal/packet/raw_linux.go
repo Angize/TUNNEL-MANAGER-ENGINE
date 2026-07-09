@@ -83,6 +83,21 @@ type Raw struct {
 
 	closeCh   chan struct{}
 	closeOnce sync.Once
+
+	st *coreStatus // client-only: precise self-heal event ring written to the status file (nil = off)
+}
+
+// SetStatusPath (client, optional) wires a status-file event ring so self-heal re-handshakes and
+// recoveries surface in the panel's system log. Call before Run(). No-op path leaves it off.
+func (r *Raw) SetStatusPath(path string) {
+	if path == "" || !r.isClient {
+		return
+	}
+	peer := ""
+	if p := r.peer.Load(); p != nil {
+		peer = p.String()
+	}
+	r.st = newCoreStatus(path, "raw:"+r.profile+" · "+peer)
 }
 
 func newRaw(conn *net.IPConn, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile string, isClient bool) *Raw {
@@ -653,6 +668,7 @@ func (r *Raw) tryHandshake(body []byte, addr *net.IPAddr) {
 		r.rp = replayGuard{}
 		r.session.Store(&sealerBox{s: s})
 		r.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale"
+		r.st.reconnected("raw")               // recovery after a self-heal (nil-safe; silent on first connect)
 		return
 	}
 	// Compute-DoS mitigation: an attacker replaying captured valid inits at high rate
@@ -746,6 +762,7 @@ func (r *Raw) clientLoop() {
 			r.session.Store(nil) // server likely restarted — drop the dead session so we re-handshake
 			r.ci.Store(nil)
 			log.Print("raw: no reply from the peer's session — re-handshaking (peer likely restarted)")
+			r.st.down("stale", "raw") // precise reason for the panel log (nil-safe when off)
 		}
 		if r.cryptoOn && r.sealer() == nil {
 			r.sendInit()

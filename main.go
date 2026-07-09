@@ -237,6 +237,15 @@ func main() {
 			log.Printf("tnl-core: binding outbound source IP to %s", cfg.BindIP)
 		}
 	}
+	// Datagram transports (udp/raw/flux): wire a status-file event ring so the client's precise
+	// self-heal events reach the node/panel system log. Only the client writes it; the transports
+	// that don't implement it (tcp/ws) simply ignore this.
+	if cfg.Role == "client" && cfg.StatusPath != "" {
+		if s, ok := b.(interface{ SetStatusPath(string) }); ok {
+			s.SetStatusPath(cfg.StatusPath)
+			log.Printf("tnl-core: writing status/events to %s", cfg.StatusPath)
+		}
+	}
 	defer b.Close()
 
 	// Clean shutdown removes the TUN (via defers) on SIGINT/SIGTERM.

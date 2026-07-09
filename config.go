@@ -146,6 +146,13 @@ type Config struct {
 	// IP/SNI lists) so the node/panel can surface and persist auto-burns. Set by main.
 	WSStatusPath string `json:"ws_status_path"`
 
+	// StatusPath is the general per-core status file for the connectionless datagram transports
+	// (udp/raw/flux): the client writes its precise self-heal event ring here so the node/panel
+	// system log can surface disconnects/recoveries with a core-observed reason. Empty = off. The
+	// ws pool uses WSStatusPath instead; keeping the two separate lets the node tell a pool core
+	// (which has SIGHUP/SIGUSR handlers) apart from a plain datagram core (which does not).
+	StatusPath string `json:"status_path"`
+
 	// WSWarmStandby keeps a SECOND, fully-handshaked carrier connection to another pool edge
 	// warm in the background (make-before-break). On the active carrier's failure or a proactive
 	// rotation the standby is promoted instantly instead of dialing fresh, so the TUN never sees a
