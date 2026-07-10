@@ -1,0 +1,86 @@
+//go:build linux
+
+// Fake-packet desync: a content-agnostic anti-DPI mechanism shared by the raw and flux
+// carriers (the two that build the whole IPv4 header via IP_HDRINCL, so they can forge a
+// TTL/checksum). Just before each handshake the client emits a few DECOY packets to the
+// peer:
+//
+//   - a low-TTL decoy expires a few hops out — it reaches an on-path DPI but dies before
+//     the server, so the server never sees it;
+//   - a bad-checksum decoy is dropped by the server's IP stack (raw/AF_INET) or fails the
+//     AEAD (flux/AF_PACKET) — it reaches the server host but never enters the session.
+//
+// Either way a STATEFUL DPI that tracks the flow ingests the decoys and mis-syncs its
+// per-flow state, while the real, AEAD-authenticated session is untouched (a decoy that
+// does reach the server carries random bytes and cannot open). This is the paqet/zapret
+// "fake before handshake" idea, done natively for the carriers we fully control. It has
+// no effect on the kernel-socket carriers (udp/tcp/ws), which cannot forge the header.
+package packet
+
+import "crypto/rand"
+
+// desyncCfg holds the client-side fake-packet-desync parameters. The zero value is off.
+type desyncCfg struct {
+	on    bool
+	ttl   int    // hop budget stamped on a low-TTL decoy (it expires before the server)
+	count int    // decoys emitted per handshake cycle
+	mode  string // "ttl" | "badsum" | "both"
+}
+
+// newDesyncCfg normalises the config values (applying the same defaults the node/panel
+// use) and returns an off config when on is false.
+func newDesyncCfg(on bool, ttl, count int, mode string) desyncCfg {
+	if !on {
+		return desyncCfg{}
+	}
+	if ttl <= 0 {
+		ttl = 4
+	}
+	if count <= 0 {
+		count = 2
+	}
+	switch mode {
+	case "ttl", "badsum", "both":
+	default:
+		mode = "ttl"
+	}
+	return desyncCfg{on: true, ttl: ttl, count: count, mode: mode}
+}
+
+// fakeSpec is one decoy's IP-header knobs. A ttl decoy keeps a valid checksum (it must be
+// forwarded until the TTL runs out mid-path); a badsum decoy keeps a normal TTL (it must
+// reach the server host to be dropped there). The two are complementary, so "both"
+// alternates them.
+type fakeSpec struct {
+	ttl    int
+	badSum bool
+}
+
+// specs returns the per-decoy header knobs for this config (len == count, empty when off).
+func (d desyncCfg) specs() []fakeSpec {
+	if !d.on {
+		return nil
+	}
+	out := make([]fakeSpec, 0, d.count)
+	for i := 0; i < d.count; i++ {
+		bad := d.mode == "badsum" || (d.mode == "both" && i%2 == 1)
+		ttl := d.ttl
+		if bad {
+			ttl = 64 // a bad-checksum decoy should reach the server host, so give it a live TTL
+		}
+		out = append(out, fakeSpec{ttl: ttl, badSum: bad})
+	}
+	return out
+}
+
+// fakePayload returns a random-length, random-content payload sized like a small
+// handshake/keepalive frame. Our real frames are AEAD ciphertext (indistinguishable from
+// random on the wire), so a random decoy of a plausible size resembles a real flow packet.
+func fakePayload() []byte {
+	var lb [1]byte
+	_, _ = rand.Read(lb[:])
+	n := 48 + int(lb[0])%64 // 48..111 bytes
+	p := make([]byte, n)
+	_, _ = rand.Read(p)
+	return p
+}
