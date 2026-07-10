@@ -24,6 +24,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -43,6 +44,15 @@ const xhttpUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (K
 
 // maxXhChunk caps a single upstream POST body so a hostile client can't force a huge alloc.
 const maxXhChunk = 1 << 20
+
+// xhttpEstablishTimeout bounds the wait for the establishing request's response HEADERS (the
+// downstream GET, or the grpc POST). TCP dial and the TLS handshake are each already bounded
+// (10s + TLSHandshakeTimeout); this covers the otherwise-unbounded wait for the edge to START
+// streaming. A CDN that completes TCP+TLS but never streams the origin leg (a throttled origin,
+// a half-open grpc call, a stale-ECH edge that Cloudflare still TLS-terminates) must not block
+// establishment forever — that stall is what freezes rotation and manual pin. Generous, because
+// it also covers the bounded TCP+TLS phases; a healthy edge flushes headers immediately.
+const xhttpEstablishTimeout = 3 * handshakeTimeout
 
 // strAddr is a net.Addr for an xhttp conn (there is no single socket behind it).
 type strAddr string
@@ -267,6 +277,42 @@ func (b *TCP) establishXHTTP() (net.Conn, string, string, error) {
 	if err != nil {
 		return nil, "", "", err
 	}
+	conn, err := b.dialXHTTPOnce(dialAddr, host, ech, path)
+	// In-band ECH self-heal (mirrors the ws carrier's tlsToEdge): Cloudflare rotates the ECH key
+	// periodically, and once the config we hold goes stale EVERY edge rejects ECH ("tls: server
+	// rejected ECH") until a rebuild — the exact production stall. The rejection carries a fresh
+	// RetryConfigList; redial ONCE with it BEFORE we blame the edge, so the fleet heals from the
+	// clock with no panel rebuild. errors.As reaches the *tls.ECHRejectionError through the
+	// http.Client.Do error chain (verified for both HTTP/1.1 packet-up and HTTP/2 grpc).
+	if err != nil && b.wsTLS && len(ech) > 0 {
+		var echErr *tls.ECHRejectionError
+		if errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
+			ech = echErr.RetryConfigList
+			conn, err = b.dialXHTTPOnce(dialAddr, host, ech, path)
+		}
+	}
+	// Attribute the outcome to the health FSM here (one place for both modes): a failure runs
+	// the differential probe to decide IP vs SNI vs transient; a success clears both axes.
+	if b.pool != nil {
+		if err != nil {
+			b.attributeFailure(dialAddr, wsSNIEntry{host: host, ech: ech, path: path})
+		} else {
+			b.pool.succeeded(dialAddr, host)
+		}
+	}
+	combo := ""
+	if err == nil {
+		combo = activeLabel(dialAddr, host)
+	}
+	return conn, dialAddr, combo, err
+}
+
+// dialXHTTPOnce builds a fresh transport/client/context for ONE attempt against (dialAddr, host,
+// ech, path) and opens the session in the configured mode. Split out of establishXHTTP so a stale
+// ECH rejection can be retried with a fresh config — each attempt needs its own transport, since
+// the ECH lives in tr.TLSClientConfig. On error, everything this attempt allocated is already torn
+// down by the dialXHTTP* helper (ctx cancelled, pipes/bodies closed).
+func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net.Conn, error) {
 	single := b.xhMode == "stream" || b.xhMode == "grpc" // one full-duplex request (both need h2)
 	tr := &http.Transport{
 		// Always dial the fixed edge, regardless of the request URL host, so the Host/SNI stays
@@ -300,26 +346,35 @@ func (b *TCP) establishXHTTP() (net.Conn, string, string, error) {
 	// "stream" is a legacy alias for grpc: plain stream-one (octet-stream) was removed because it
 	// stalled through CDNs that buffer the origin leg; grpc is the full-duplex mode that streams.
 	var conn net.Conn
+	var err error
 	switch b.xhMode {
 	case "grpc", "stream":
 		conn, _, err = b.dialXHTTPGrpc(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
 	default:
 		conn, _, err = b.dialXHTTPPacket(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
 	}
-	// Attribute the outcome to the health FSM here (one place for both modes): a failure runs
-	// the differential probe to decide IP vs SNI vs transient; a success clears both axes.
-	if b.pool != nil {
-		if err != nil {
-			b.attributeFailure(dialAddr, wsSNIEntry{host: host, ech: ech, path: path})
-		} else {
-			b.pool.succeeded(dialAddr, host)
-		}
+	return conn, err
+}
+
+// doWithHeaderTimeout runs hc.Do but bounds the wait for the response to BEGIN (headers received),
+// not the streaming body that follows. The request context governs the whole session body, so it
+// cannot also bound just this establishment step; without a separate bound, a CDN edge that
+// completes TCP+TLS yet never starts streaming blocks the dial forever, stalling rotation and pin.
+// On timeout the caller cancels the session ctx, which unblocks the parked goroutine (it returns
+// context.Canceled into the buffered channel — no leak).
+func doWithHeaderTimeout(hc *http.Client, req *http.Request, d time.Duration) (*http.Response, error) {
+	type doRes struct {
+		resp *http.Response
+		err  error
 	}
-	combo := ""
-	if err == nil {
-		combo = activeLabel(dialAddr, host)
+	ch := make(chan doRes, 1)
+	go func() { r, e := hc.Do(req); ch <- doRes{r, e} }()
+	select {
+	case r := <-ch:
+		return r.resp, r.err
+	case <-time.After(d):
+		return nil, fmt.Errorf("xhttp: response-header timeout (%s)", d)
 	}
-	return conn, dialAddr, combo, err
 }
 
 // --- gRPC framing (mode "grpc") ---------------------------------------------------------------
@@ -424,7 +479,7 @@ func (b *TCP) dialXHTTPGrpc(hc *http.Client, tr *http.Transport, ctx context.Con
 	req.Header.Set("TE", "trailers")
 	req.Header.Set("grpc-encoding", "identity")
 	req.ContentLength = -1
-	resp, err := hc.Do(req)
+	resp, err := doWithHeaderTimeout(hc, req, xhttpEstablishTimeout)
 	if err != nil {
 		cancel()
 		pw.Close()
@@ -450,7 +505,7 @@ func (b *TCP) dialXHTTPGrpc(hc *http.Client, tr *http.Transport, ctx context.Con
 func (b *TCP) dialXHTTPPacket(hc *http.Client, tr *http.Transport, ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
 	greq, _ := http.NewRequestWithContext(ctx, "GET", base+"?s="+sid, nil)
 	setHdr(greq)
-	gresp, err := hc.Do(greq)
+	gresp, err := doWithHeaderTimeout(hc, greq, xhttpEstablishTimeout)
 	if err != nil {
 		cancel()
 		return nil, dialAddr, err

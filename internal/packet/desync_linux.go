@@ -20,6 +20,13 @@ package packet
 
 import "crypto/rand"
 
+// injectMaxTTL caps the TTL of a kernel-TCP inject decoy (tcp/cover/ws). Unlike a raw/flux decoy
+// (sent to a peer we don't hold a live kernel connection to), an inject decoy rides a REAL
+// connection's 4-tuple — a well-formed segment that reached the server would draw an RST or a
+// challenge-ACK that could disturb the real flow. Clamping the TTL here guarantees the decoy
+// expires on the path (where the DPI still ingests it) no matter how high the operator set fake_ttl.
+const injectMaxTTL = 8
+
 // desyncCfg holds the client-side fake-packet-desync parameters. The zero value is off.
 type desyncCfg struct {
 	on    bool
@@ -87,10 +94,14 @@ func (d desyncCfg) specsTCP() []fakeSpec {
 	if !d.on {
 		return nil
 	}
+	ttl := d.ttl
+	if ttl > injectMaxTTL {
+		ttl = injectMaxTTL // never let an inject decoy reach the server, however high fake_ttl was set
+	}
 	out := make([]fakeSpec, 0, d.count)
 	for i := 0; i < d.count; i++ {
 		bad := d.mode == "badsum" || (d.mode == "both" && i%2 == 1)
-		out = append(out, fakeSpec{ttl: d.ttl, badSum: bad}) // always the configured low TTL
+		out = append(out, fakeSpec{ttl: ttl, badSum: bad}) // always the (clamped) configured low TTL
 	}
 	return out
 }

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -343,6 +344,50 @@ func TestSourceIPBind(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no connection observed")
 	}
+}
+
+// TestDoWithHeaderTimeout covers the establishment header-wait bound added for the pool-freeze fix:
+// a server that stalls before sending headers must make doWithHeaderTimeout give up after ~d and
+// return the timeout error (not block forever, which is what froze rotation and manual pin), while
+// a server that responds immediately returns the real response verbatim.
+func TestDoWithHeaderTimeout(t *testing.T) {
+	// fast path: an immediate response returns with no error.
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer fast.Close()
+	freq, _ := http.NewRequest("GET", fast.URL, nil)
+	resp, err := doWithHeaderTimeout(fast.Client(), freq, 2*time.Second)
+	if err != nil {
+		t.Fatalf("fast path returned error: %v", err)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("fast path status %d, want 204", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// stall path: the handler never writes headers (holds until the client goes away). The bound
+	// must fire after ~d and surface the timeout error, not hang.
+	served := make(chan struct{})
+	stall := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(served)
+		<-r.Context().Done()
+	}))
+	defer stall.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sreq, _ := http.NewRequestWithContext(ctx, "GET", stall.URL, nil)
+	start := time.Now()
+	if _, err := doWithHeaderTimeout(stall.Client(), sreq, 200*time.Millisecond); err == nil {
+		t.Fatal("stall path returned nil error (should have timed out)")
+	} else if !strings.Contains(err.Error(), "response-header timeout") {
+		t.Fatalf("stall path wrong error: %v", err)
+	}
+	if el := time.Since(start); el > 2*time.Second {
+		t.Fatalf("stall path took %v (should be ~200ms)", el)
+	}
+	<-served     // the request did reach the server before we bailed
+	cancel()     // release the parked handler + the buffered background Do goroutine (no leak)
 }
 
 func TestXHTTPConnReadDeadline(t *testing.T) {

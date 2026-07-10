@@ -165,6 +165,13 @@ func TestSpecsTCP(t *testing.T) {
 			t.Fatalf("badsum-mode TCP spec should be low-ttl + badSum, got %+v", s)
 		}
 	}
+	// A high fake_ttl must be clamped on the inject path so a well-formed decoy can't reach the
+	// server (it would draw an RST / challenge-ACK on the real 4-tuple).
+	for i, s := range newDesyncCfg(true, 64, 3, "both").specsTCP() {
+		if s.ttl != injectMaxTTL {
+			t.Fatalf("specsTCP decoy %d: ttl 64 should clamp to %d, got %d", i, injectMaxTTL, s.ttl)
+		}
+	}
 }
 
 // TestBuildTCPSeg checks the crafted segment has the right ports/flags and a VALID TCP checksum
