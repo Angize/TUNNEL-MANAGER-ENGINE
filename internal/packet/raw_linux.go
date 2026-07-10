@@ -82,10 +82,13 @@ type Raw struct {
 	sendDown bool         // set under sendMu.Lock in Close: no more Sendto on the (about-to-be-closed) spoofFd
 
 	// Fake-packet desync (client only). desync holds the decoy parameters; fakeFd is a
-	// dedicated IP_HDRINCL socket for the decoys, opened only when desync is on AND spoofing
-	// did not already open one to borrow (spoofFd). -1 when unused.
+	// dedicated IP_HDRINCL socket for low-TTL decoys, opened only when desync is on AND
+	// spoofing did not already open one to borrow (spoofFd) — -1 when unused. inj is an
+	// AF_PACKET injector for bad-checksum decoys (IP_HDRINCL rewrites the checksum, so those
+	// must bypass it); nil unless a badsum/both mode is on and the socket opened.
 	desync desyncCfg
 	fakeFd int
+	inj    *l2inject
 
 	closeCh   chan struct{}
 	closeOnce sync.Once
@@ -119,13 +122,22 @@ func (r *Raw) SetDesync(on bool, ttl, count int, mode string) {
 	if !d.on {
 		return
 	}
-	if r.spoofFd < 0 { // no spoof socket to borrow — open a dedicated one for the decoys
+	if r.spoofFd < 0 { // no spoof socket to borrow — open a dedicated one for the low-TTL decoys
 		fd, err := openHdrincl(r.proto)
 		if err != nil {
 			log.Printf("raw: fake-desync disabled (cannot open raw socket: %v)", err)
 			return
 		}
 		r.fakeFd = fd
+	}
+	if d.usesBadsum() { // bad-checksum decoys must bypass IP_HDRINCL (which repairs the checksum)
+		if p := r.peer.Load(); p != nil {
+			if inj, err := newL2Inject(p.IP); err != nil {
+				log.Printf("raw: bad-checksum decoys disabled (AF_PACKET: %v) — TTL decoys still active", err)
+			} else {
+				r.inj = inj
+			}
+		}
 	}
 	r.desync = d
 }
@@ -142,9 +154,6 @@ func (r *Raw) sendFakes(to *net.IPAddr) {
 	if fd < 0 {
 		fd = r.fakeFd
 	}
-	if fd < 0 {
-		return
-	}
 	src := r.srcIP()
 	if r.spoofSrc != nil {
 		src = r.spoofSrc
@@ -158,6 +167,18 @@ func (r *Raw) sendFakes(to *net.IPAddr) {
 	for _, sp := range r.desync.specs() {
 		out := buildIP4Ext(src, dst, r.proto, sp.ttl, sp.badSum, fakePayload())
 		if out == nil {
+			continue
+		}
+		if sp.badSum {
+			// Bad-checksum decoy: inject at L2 so the forged checksum survives (IP_HDRINCL
+			// would repair it). Best-effort — a cold next-hop neighbour just drops this one;
+			// the injector has its own fd guard, so it is safe against a concurrent Close.
+			if r.inj != nil {
+				_ = r.inj.send(out)
+			}
+			continue
+		}
+		if fd < 0 { // low-TTL decoy needs the IP_HDRINCL socket (opened in SetDesync)
 			continue
 		}
 		r.sendMu.RLock()
@@ -339,6 +360,9 @@ func (r *Raw) Close() error {
 	if r.fakeFd >= 0 { // dedicated desync socket (only set when spoofFd wasn't, so never the same fd)
 		syscall.Close(r.fakeFd)
 	}
+	if r.inj != nil { // AF_PACKET bad-checksum injector (its own fd guard makes this Close-safe)
+		r.inj.close()
+	}
 	if r.pktFd >= 0 {
 		syscall.Close(r.pktFd)
 	}
@@ -467,12 +491,18 @@ func buildIP4Ext(src, dst net.IP, proto, ttl int, badSum bool, payload []byte) [
 	copy(h[12:16], src.To4())
 	copy(h[16:20], dst.To4())
 	sum := onesComplementSum(h[:20]) // checksum field is 0 during the sum
-	if badSum {
-		// Corrupt it: the correct value and its complement sum to 0xffff, so they are never
-		// equal — the stored checksum is guaranteed invalid and the receiver's IP stack drops it.
-		sum = ^sum
-	}
 	binary.BigEndian.PutUint16(h[10:12], sum)
+	if badSum {
+		// Corrupt it so an on-path DPI / the receiver's IP stack sees an invalid checksum.
+		// ^sum alone is NOT always wrong: one's complement has two representations of zero
+		// (0x0000 and 0xffff both verify), so when the correct sum is 0x0000 its complement
+		// 0xffff still validates. Store the complement, then verify it actually fails (the
+		// whole header must NOT sum to zero) and flip a bit if we hit that zero-twin case.
+		binary.BigEndian.PutUint16(h[10:12], ^sum)
+		if onesComplementSum(h[:20]) == 0 {
+			binary.BigEndian.PutUint16(h[10:12], ^sum^0x0001)
+		}
+	}
 	copy(h[20:], payload)
 	return h
 }

@@ -73,6 +73,7 @@ type Flux struct {
 	sendMu    sync.RWMutex           // senders RLock around the raw-fd Sendto; Close takes the write lock before closing it
 	sendDown  bool                   // set under sendMu.Lock in Close: no more Sendto on the (about-to-be-closed) raw fd
 	desync    desyncCfg              // client-only fake-packet desync (decoys emitted before each handshake); zero value = off
+	inj       *l2inject              // AF_PACKET injector for bad-checksum decoys (IP_HDRINCL repairs the checksum); nil unless a badsum/both mode is on
 	closeCh   chan struct{}
 	closeOnce sync.Once
 
@@ -100,7 +101,17 @@ func (f *Flux) SetDesync(on bool, ttl, count int, mode string) {
 	if !f.isClient {
 		return
 	}
-	f.desync = newDesyncCfg(on, ttl, count, mode)
+	d := newDesyncCfg(on, ttl, count, mode)
+	if d.usesBadsum() { // bad-checksum decoys must bypass IP_HDRINCL (which repairs the checksum)
+		if p := f.peer.Load(); p != nil {
+			if inj, err := newL2Inject(p.IP); err != nil {
+				log.Printf("flux: bad-checksum decoys disabled (AF_PACKET: %v) — TTL decoys still active", err)
+			} else {
+				f.inj = inj
+			}
+		}
+	}
+	f.desync = d
 }
 
 // sendFakes emits the configured decoy packets to the peer just before a real handshake,
@@ -131,6 +142,14 @@ func (f *Flux) sendFakes(to *net.IPAddr) {
 			out = buildIP4Ext(src, to.IP, protoUDP, sp.ttl, sp.badSum, buildUDPSeg(src, to.IP, sh.sport, sh.dport, body))
 		}
 		if out == nil {
+			continue
+		}
+		if sp.badSum {
+			// Bad-checksum decoy: inject at L2 so the forged checksum survives (IP_HDRINCL
+			// would repair it). Best-effort; the injector guards its own fd against Close.
+			if f.inj != nil {
+				_ = f.inj.send(out)
+			}
 			continue
 		}
 		f.sendMu.RLock()
@@ -262,6 +281,9 @@ func (f *Flux) Close() error {
 	}
 	if f.pktFd >= 0 {
 		syscall.Close(f.pktFd)
+	}
+	if f.inj != nil { // AF_PACKET bad-checksum injector (its own fd guard makes this Close-safe)
+		f.inj.close()
 	}
 	return nil
 }
