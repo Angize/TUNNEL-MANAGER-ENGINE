@@ -246,6 +246,17 @@ func main() {
 			log.Printf("tnl-core: writing status/events to %s", cfg.StatusPath)
 		}
 	}
+	// Fake-packet desync (client, raw/flux): emit decoy packets before each handshake to
+	// mis-sync a stateful DPI. Only the raw/flux carriers implement it (they build the IPv4
+	// header themselves); the kernel-socket carriers ignore this.
+	if cfg.Role == "client" && cfg.FakeDesync {
+		if s, ok := b.(interface {
+			SetDesync(bool, int, int, string)
+		}); ok {
+			s.SetDesync(true, cfg.FakeTTL, cfg.FakeCount, cfg.FakeMode)
+			log.Printf("tnl-core: fake-desync on (%d decoys, ttl=%d, mode=%s)", cfg.FakeCount, cfg.FakeTTL, cfg.FakeMode)
+		}
+	}
 	defer b.Close()
 
 	// Clean shutdown removes the TUN (via defers) on SIGINT/SIGTERM.

@@ -72,6 +72,7 @@ type Flux struct {
 	leakOnce  sync.Once              // installs antiLeak exactly once (the server learns the peer late)
 	sendMu    sync.RWMutex           // senders RLock around the raw-fd Sendto; Close takes the write lock before closing it
 	sendDown  bool                   // set under sendMu.Lock in Close: no more Sendto on the (about-to-be-closed) raw fd
+	desync    desyncCfg              // client-only fake-packet desync (decoys emitted before each handshake); zero value = off
 	closeCh   chan struct{}
 	closeOnce sync.Once
 
@@ -89,6 +90,55 @@ func (f *Flux) SetStatusPath(path string) {
 		peer = p.String()
 	}
 	f.st = newCoreStatus(path, "flux:"+f.carrier+" · "+peer)
+}
+
+// SetDesync (client, optional) turns on fake-packet desync: `count` decoy packets go out
+// just before each fresh handshake to mis-sync a stateful DPI. flux always has its
+// IP_HDRINCL send socket (sendFd), so no extra socket is needed. Call before Run(). No-op
+// on the server.
+func (f *Flux) SetDesync(on bool, ttl, count int, mode string) {
+	if !f.isClient {
+		return
+	}
+	f.desync = newDesyncCfg(on, ttl, count, mode)
+}
+
+// sendFakes emits the configured decoy packets to the peer just before a real handshake,
+// each shaped like this epoch's carrier (raw proto / udp+ports / stun) with a per-decoy
+// TTL/checksum and random payload, so a DPI sees them as the same flow. Reuses the
+// IP_HDRINCL send socket and the same sendMu/sendDown guard as carrierOut. flux never
+// forges addresses, so src/dst are the real ones.
+func (f *Flux) sendFakes(to *net.IPAddr) {
+	if !f.desync.on || to == nil || f.sendFd < 0 {
+		return
+	}
+	sh := f.curShape.Load()
+	if sh == nil {
+		return
+	}
+	src := f.srcIP()
+	var sa syscall.SockaddrInet4
+	copy(sa.Addr[:], to.IP.To4())
+	for _, sp := range f.desync.specs() {
+		body := fakePayload()
+		var out []byte
+		switch f.carrier {
+		case "raw":
+			out = buildIP4Ext(src, to.IP, sh.proto, sp.ttl, sp.badSum, body)
+		case "stun":
+			out = buildIP4Ext(src, to.IP, protoUDP, sp.ttl, sp.badSum, buildUDPSeg(src, to.IP, sh.sport, sh.dportSTUN, buildSTUN(body)))
+		default: // udp
+			out = buildIP4Ext(src, to.IP, protoUDP, sp.ttl, sp.badSum, buildUDPSeg(src, to.IP, sh.sport, sh.dport, body))
+		}
+		if out == nil {
+			continue
+		}
+		f.sendMu.RLock()
+		if !f.sendDown {
+			_ = syscall.Sendto(f.sendFd, out, 0, &sa)
+		}
+		f.sendMu.RUnlock()
+	}
 }
 
 func newFlux(dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk, cipher, carrier, shape string, epochOffset int64, fec bool, fecData, fecParity int, isClient bool) *Flux {
@@ -732,6 +782,8 @@ func (f *Flux) sendInit() {
 			return
 		}
 		f.ci.Store(ci)
+		// Fresh handshake cycle (not a 1s retransmit): desync the DPI right before the init.
+		f.sendFakes(peer)
 	}
 	f.sendCtrl(crypto.InitMsg(f.psk, ci), peer)
 }

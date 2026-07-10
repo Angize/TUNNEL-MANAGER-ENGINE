@@ -81,6 +81,12 @@ type Raw struct {
 	sendMu   sync.RWMutex // senders RLock around the raw spoofFd Sendto; Close write-locks before closing it
 	sendDown bool         // set under sendMu.Lock in Close: no more Sendto on the (about-to-be-closed) spoofFd
 
+	// Fake-packet desync (client only). desync holds the decoy parameters; fakeFd is a
+	// dedicated IP_HDRINCL socket for the decoys, opened only when desync is on AND spoofing
+	// did not already open one to borrow (spoofFd). -1 when unused.
+	desync desyncCfg
+	fakeFd int
+
 	closeCh   chan struct{}
 	closeOnce sync.Once
 
@@ -100,12 +106,74 @@ func (r *Raw) SetStatusPath(path string) {
 	r.st = newCoreStatus(path, "raw:"+r.profile+" · "+peer)
 }
 
+// SetDesync (client, optional) turns on fake-packet desync: `count` decoy packets go out
+// just before each fresh handshake to mis-sync a stateful DPI. It needs an IP_HDRINCL
+// socket to stamp the decoy TTL/checksum; when spoofing already opened one (spoofFd) it is
+// reused, otherwise a dedicated socket is opened here. Failure to open only disables the
+// decoys (it never fails the tunnel). Call before Run(). No-op on the server.
+func (r *Raw) SetDesync(on bool, ttl, count int, mode string) {
+	if !r.isClient {
+		return
+	}
+	d := newDesyncCfg(on, ttl, count, mode)
+	if !d.on {
+		return
+	}
+	if r.spoofFd < 0 { // no spoof socket to borrow — open a dedicated one for the decoys
+		fd, err := openHdrincl(r.proto)
+		if err != nil {
+			log.Printf("raw: fake-desync disabled (cannot open raw socket: %v)", err)
+			return
+		}
+		r.fakeFd = fd
+	}
+	r.desync = d
+}
+
+// sendFakes emits the configured decoy packets toward the peer just before a real
+// handshake. Each decoy shares the real flow's src/dst/proto (mirroring writeOut's forge
+// choices, so a DPI sees them as the same flow) with a per-decoy TTL/checksum and random
+// payload. Guarded by sendMu/sendDown exactly like writeOut so Close can't race the fd shut.
+func (r *Raw) sendFakes(to *net.IPAddr) {
+	if !r.desync.on || to == nil {
+		return
+	}
+	fd := r.spoofFd
+	if fd < 0 {
+		fd = r.fakeFd
+	}
+	if fd < 0 {
+		return
+	}
+	src := r.srcIP()
+	if r.spoofSrc != nil {
+		src = r.spoofSrc
+	}
+	dst := to.IP
+	if r.spoofDst != nil {
+		dst = r.spoofDst
+	}
+	var sa syscall.SockaddrInet4
+	copy(sa.Addr[:], to.IP.To4())
+	for _, sp := range r.desync.specs() {
+		out := buildIP4Ext(src, dst, r.proto, sp.ttl, sp.badSum, fakePayload())
+		if out == nil {
+			continue
+		}
+		r.sendMu.RLock()
+		if !r.sendDown {
+			_ = syscall.Sendto(fd, out, 0, &sa)
+		}
+		r.sendMu.RUnlock()
+	}
+}
+
 func newRaw(conn *net.IPConn, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile string, isClient bool) *Raw {
 	var idb [2]byte
 	_, _ = rand.Read(idb[:])
 	return &Raw{
 		conn: conn, dev: dev, keepalive: ka, obfs: obfs, cryptoOn: cryptoOn,
-		psk: psk, cipher: cipher, profile: profile, isClient: isClient, spoofFd: -1, pktFd: -1,
+		psk: psk, cipher: cipher, profile: profile, isClient: isClient, spoofFd: -1, pktFd: -1, fakeFd: -1,
 		icmpID: binary.BigEndian.Uint16(idb[:]), closeCh: make(chan struct{}),
 	}
 }
@@ -268,6 +336,9 @@ func (r *Raw) Close() error {
 	if r.spoofFd >= 0 {
 		syscall.Close(r.spoofFd)
 	}
+	if r.fakeFd >= 0 { // dedicated desync socket (only set when spoofFd wasn't, so never the same fd)
+		syscall.Close(r.fakeFd)
+	}
 	if r.pktFd >= 0 {
 		syscall.Close(r.pktFd)
 	}
@@ -369,19 +440,39 @@ func (r *Raw) replyAddr(addr *net.IPAddr) *net.IPAddr {
 	return addr
 }
 
-// buildIP4 assembles an IPv4 header (with a computed checksum) in front of payload.
+// buildIP4 assembles an IPv4 header (TTL 64, valid checksum) in front of payload.
 func buildIP4(src, dst net.IP, proto int, payload []byte) []byte {
+	return buildIP4Ext(src, dst, proto, 64, false, payload)
+}
+
+// buildIP4Ext is buildIP4 with an explicit TTL and an option to store a deliberately
+// WRONG header checksum — the two knobs a fake-packet desync needs: a low TTL makes a
+// decoy expire a few hops out (before the server), and a bad checksum makes the server's
+// IP stack drop it. ttl is clamped to 1..255. With ttl=64 and badSum=false it is byte-for-
+// byte identical to the original buildIP4, so the normal carrier path is unchanged.
+func buildIP4Ext(src, dst net.IP, proto, ttl int, badSum bool, payload []byte) []byte {
 	if len(payload) > 0xffff-20 {
 		return nil // the IPv4 total-length field is 16-bit; refuse rather than truncate it (MTU-bounded, so defensive)
+	}
+	if ttl < 1 {
+		ttl = 1
+	} else if ttl > 255 {
+		ttl = 255
 	}
 	h := make([]byte, 20+len(payload))
 	h[0] = 0x45 // version 4, IHL 5 (no options)
 	binary.BigEndian.PutUint16(h[2:4], uint16(len(h)))
-	h[8] = 64 // TTL
+	h[8] = byte(ttl)
 	h[9] = byte(proto)
 	copy(h[12:16], src.To4())
 	copy(h[16:20], dst.To4())
-	binary.BigEndian.PutUint16(h[10:12], onesComplementSum(h[:20])) // checksum field is 0 during the sum
+	sum := onesComplementSum(h[:20]) // checksum field is 0 during the sum
+	if badSum {
+		// Corrupt it: the correct value and its complement sum to 0xffff, so they are never
+		// equal — the stored checksum is guaranteed invalid and the receiver's IP stack drops it.
+		sum = ^sum
+	}
+	binary.BigEndian.PutUint16(h[10:12], sum)
 	copy(h[20:], payload)
 	return h
 }
@@ -797,6 +888,8 @@ func (r *Raw) sendInit() {
 			return
 		}
 		r.ci.Store(ci)
+		// Fresh handshake cycle (not a 1s retransmit): desync the DPI right before the init.
+		r.sendFakes(peer)
 	}
 	r.writeCtrl(crypto.InitMsg(r.psk, ci), peer)
 }

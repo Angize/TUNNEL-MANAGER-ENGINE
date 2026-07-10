@@ -205,6 +205,18 @@ type Config struct {
 	FecData   int `json:"fec_data"`
 	FecParity int `json:"fec_parity"`
 
+	// FakeDesync (client, raw/flux carriers only) emits FakeCount decoy packets to the peer
+	// just before each handshake to mis-sync a stateful DPI. A low-TTL decoy expires a few
+	// hops out (before the server); a bad-checksum decoy is dropped by the server's IP stack —
+	// either way an on-path DPI ingests the decoy and mis-tracks the flow while the real,
+	// AEAD-authenticated session is untouched. It only helps where the core builds the whole
+	// IPv4 header (raw/flux); the kernel-socket carriers (udp/tcp/ws) cannot forge a
+	// TTL/checksum. Needs CAP_NET_RAW (the raw/flux carriers already require it).
+	FakeDesync bool   `json:"fake_desync"`
+	FakeTTL    int    `json:"fake_ttl"`   // low-TTL decoy hop budget (default 4)
+	FakeCount  int    `json:"fake_count"` // decoys per handshake (default 2)
+	FakeMode   string `json:"fake_mode"`  // "ttl" (default) | "badsum" | "both"
+
 	// GSO opens the TUN with a virtio-net header and TCP/UDP segmentation
 	// offload, so the kernel hands the core large super-packets on bulk
 	// transfers instead of many MTU-sized ones — fewer syscalls/copies, higher
@@ -263,6 +275,17 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Transport == "ws" && c.WSPath == "" {
 		c.WSPath = "/"
+	}
+	if c.FakeDesync { // fake-packet desync defaults (raw/flux client)
+		if c.FakeTTL <= 0 {
+			c.FakeTTL = 4
+		}
+		if c.FakeCount <= 0 {
+			c.FakeCount = 2
+		}
+		if c.FakeMode == "" {
+			c.FakeMode = "ttl"
+		}
 	}
 }
 
@@ -431,6 +454,28 @@ func (c *Config) validate() error {
 		}
 		if ed < 1 || ep < 1 || ed+ep > 255 {
 			return errors.New("effective fec_data (default 10) + fec_parity (default 3) must satisfy fec_data>=1, fec_parity>=1, fec_data+fec_parity<=255")
+		}
+	}
+	if c.FakeDesync {
+		// Desync forges the outer IPv4 header (TTL/checksum), which only the carriers that
+		// build it themselves can do: raw and flux. On udp/tcp/ws the kernel owns the header,
+		// so the core cannot stamp a decoy TTL or corrupt a checksum there. (It is a client-side
+		// mechanism; a server that carries the same fields simply ignores them.)
+		switch c.Transport {
+		case "raw", "flux":
+		default:
+			return errors.New("fake_desync is only supported on the raw and flux carriers (they build the IPv4 header; udp/tcp/ws use kernel sockets)")
+		}
+		if c.FakeTTL < 0 || c.FakeTTL > 255 {
+			return errors.New("fake_ttl must be between 0 and 255 (0 defaults to 4)")
+		}
+		if c.FakeCount < 0 || c.FakeCount > 64 {
+			return errors.New("fake_count must be between 0 and 64 (0 defaults to 2)")
+		}
+		switch c.FakeMode {
+		case "", "ttl", "badsum", "both":
+		default:
+			return errors.New("fake_mode must be \"ttl\", \"badsum\", or \"both\"")
 		}
 	}
 	if c.Cover && c.Transport != "tcp" {
