@@ -42,6 +42,36 @@ func TestPoolRotatesAllCombos(t *testing.T) {
 	}
 }
 
+// updateECH persists a self-healed ECH key onto the matching pool SNI and reports a real change
+// exactly once, so the self-heal event fires per rotation (first heal) not per reconnect (repeats).
+func TestPoolUpdateECHTransitionGate(t *testing.T) {
+	p := newWSPool([]string{"a"}, snis("x", "y"), true, "")
+	fresh := []byte{1, 2, 3}
+	// first heal on x: stored key (nil) differs -> change reported, key persisted
+	if !p.updateECH("x", fresh) {
+		t.Fatal("first updateECH should report a change")
+	}
+	if _, sni, _ := p.current(); string(sni.ech) != string(fresh) {
+		t.Fatalf("current() should carry the persisted key, got %v", sni.ech)
+	}
+	// same key again (next reconnect uses the fresh key, or a concurrent healer) -> no change, no event
+	if p.updateECH("x", fresh) {
+		t.Fatal("repeat updateECH with an unchanged key must report no change (suppresses repeat events)")
+	}
+	// a later rotation delivers a different key -> change reported again
+	if !p.updateECH("x", []byte{9, 9}) {
+		t.Fatal("updateECH with a rotated key should report a change")
+	}
+	// unknown host -> no change (never panics, never mislabels)
+	if p.updateECH("zzz", fresh) {
+		t.Fatal("updateECH for an absent host must report no change")
+	}
+	// the other SNI stays untouched
+	if p.snis[1].host != "y" || p.snis[1].ech != nil {
+		t.Fatalf("sibling SNI y should be untouched, got %#v", p.snis[1])
+	}
+}
+
 // A verdict of IP_GUILTY (applied via markSuspect) moves a healthy IP into suspect, and
 // current() then skips it while a healthy alternative remains.
 func TestMarkSuspectPullsFromRotation(t *testing.T) {

@@ -8,6 +8,7 @@
 package packet
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -124,7 +125,7 @@ const pinTTL int64 = 300
 type coreEvent struct {
 	Seq    int64  `json:"seq"`
 	TS     int64  `json:"ts"`
-	Kind   string `json:"kind"`   // "down" (carrier dropped) | "burn" (edge sidelined)
+	Kind   string `json:"kind"`   // "down" (carrier dropped) | "up" (reconnected) | "burn" (edge sidelined) | "ech" (ECH self-heal)
 	Code   string `json:"code"`   // stable reason category, e.g. ping_timeout / reset / tls / ws_upgrade / throttle
 	Detail string `json:"detail"` // optional extra: the edge key, or a short raw-error snippet
 }
@@ -241,6 +242,27 @@ func (p *wsPool) current() (string, wsSNIEntry, bool) {
 	ip := p.bestIPLocked()
 	sni := p.bestSNILocked()
 	return ip, sni, true
+}
+
+// updateECH replaces the stored ECHConfigList for the pool SNI matching host with the fresh key the
+// edge returned (RetryConfigList) after an in-band self-heal. Persisting it means the NEXT reconnect
+// presents the fresh key directly, so the stale-key rejection — and its self-heal event — does not
+// recur on every reconnect until the panel's periodic refresh rebuilds the core. Returns true only
+// when the stored key actually changed, giving the caller a transition gate (emit the event once per
+// rotation, not per reconnect; concurrent healers converge — only the first sees a change).
+func (p *wsPool) updateECH(host string, ech []byte) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i := range p.snis {
+		if p.snis[i].host == host {
+			if bytes.Equal(p.snis[i].ech, ech) {
+				return false
+			}
+			p.snis[i].ech = ech
+			return true
+		}
+	}
+	return false
 }
 
 // activeLabel builds the status-file "active edge" string for an (ip, sni) combo.
