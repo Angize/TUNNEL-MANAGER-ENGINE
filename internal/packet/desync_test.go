@@ -143,6 +143,51 @@ func TestBuildIP4ExtTTLClamp(t *testing.T) {
 	}
 }
 
+// TestSpecsTCP checks the kernel-TCP inject path keeps EVERY decoy at the low TTL (never the
+// 64 that specs() promotes badsum to), because a well-formed segment on a real 4-tuple must not
+// reach the server. badSum still varies per mode.
+func TestSpecsTCP(t *testing.T) {
+	both := newDesyncCfg(true, 3, 4, "both").specsTCP()
+	if len(both) != 4 {
+		t.Fatalf("want 4 specs, got %d", len(both))
+	}
+	for i, s := range both {
+		if s.ttl != 3 {
+			t.Fatalf("specsTCP decoy %d has ttl %d, want the low 3 (never promoted to 64)", i, s.ttl)
+		}
+		wantBad := i%2 == 1
+		if s.badSum != wantBad {
+			t.Fatalf("specsTCP decoy %d badSum=%v, want %v", i, s.badSum, wantBad)
+		}
+	}
+	for _, s := range newDesyncCfg(true, 5, 2, "badsum").specsTCP() {
+		if s.ttl != 5 || !s.badSum {
+			t.Fatalf("badsum-mode TCP spec should be low-ttl + badSum, got %+v", s)
+		}
+	}
+}
+
+// TestBuildTCPSeg checks the crafted segment has the right ports/flags and a VALID TCP checksum
+// (recomputing over the segment with the stored checksum in place sums to zero).
+func TestBuildTCPSeg(t *testing.T) {
+	src := net.IPv4(10, 0, 0, 1)
+	dst := net.IPv4(10, 0, 1, 2)
+	seg := buildTCPSeg(src, dst, 40000, 443, 0x11223344, 0x55667788, tcpPshAck, 0xffff, []byte("decoy-body"))
+	if binary.BigEndian.Uint16(seg[0:2]) != 40000 || binary.BigEndian.Uint16(seg[2:4]) != 443 {
+		t.Fatal("ports not stamped correctly")
+	}
+	if seg[13] != tcpPshAck {
+		t.Fatalf("flags = %#x, want PSH|ACK %#x", seg[13], tcpPshAck)
+	}
+	if binary.BigEndian.Uint32(seg[4:8]) != 0x11223344 || binary.BigEndian.Uint32(seg[8:12]) != 0x55667788 {
+		t.Fatal("seq/ack not stamped")
+	}
+	// A valid TCP checksum: the pseudo-header + segment (checksum in place) one's-complement to 0.
+	if s := l4Checksum(src, dst, protoTCP, seg); s != 0 {
+		t.Fatalf("TCP checksum should verify to 0, got %#04x", s)
+	}
+}
+
 // TestFakePayload checks the decoy payload stays in the intended plausible-frame size band.
 func TestFakePayload(t *testing.T) {
 	for i := 0; i < 200; i++ {

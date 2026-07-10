@@ -344,6 +344,17 @@ type TCP struct {
 	addr     string // server: listen addr; client: peer addr
 	bindIP   string // client: source IP to dial FROM (empty = kernel default); tcp/ws/xhttp only
 
+	// TCP-segment injection desync (client, optional): after each kernel TCP connect we inject a
+	// few decoy TCP segments on the real 4-tuple (low-TTL, so they die before the edge/server) to
+	// mis-sync a stateful DPI, leaving the kernel-owned connection untouched. Primitive fields
+	// (not the linux-only desyncCfg) so this compiles on every platform; the linux sendTCPFakes
+	// reads them. Best-effort: needs CAP_NET_RAW (AF_PACKET); a failure just skips the decoys.
+	dsOn       bool
+	dsTTL      int
+	dsCount    int
+	dsMode     string
+	dsFailOnce sync.Once // logs an AF_PACKET/capability failure at most once (fired per connect)
+
 	ln      net.Listener
 	cur     atomic.Pointer[connFramer] // currently live connection / server downstream target (nil when none)
 	curConn atomic.Pointer[net.Conn]   // client+pool: the live carrier conn, closed to force a re-dial on rotation
@@ -362,6 +373,18 @@ type TCP struct {
 // registered IP), so on a multi-IP host the peer/CDN sees that IP instead of the kernel's
 // default primary. No effect on the server side or on raw/flux carriers. Call before Run.
 func (b *TCP) SetSourceIP(ip string) { b.bindIP = ip }
+
+// SetDesync (client, optional) turns on TCP-segment injection desync for the tcp/cover/ws
+// carriers: after each connect, sendTCPFakes injects `count` decoy segments on the real
+// 4-tuple to mis-sync a stateful DPI. Stores the config; the actual injection is Linux-only
+// (AF_PACKET). No-op on the server. Call before Run(). The same config surface (fake_*) the
+// raw/flux carriers use — main wires it via the same SetDesync type assertion.
+func (b *TCP) SetDesync(on bool, ttl, count int, mode string) {
+	if !b.isClient || !on {
+		return
+	}
+	b.dsOn, b.dsTTL, b.dsCount, b.dsMode = true, ttl, count, mode
+}
 
 // dialer returns a net.Dialer that, when a source IP is pinned, binds the outbound socket to
 // it (LocalAddr). A malformed or non-local IP is ignored (falls back to the kernel default).
@@ -1152,6 +1175,9 @@ func (b *TCP) dialCarrier() (net.Conn, string, string, error) {
 // On any failure the returned error is non-nil and the caller closes conn. On success the framer
 // is fully established and ready for serve/readLoop.
 func (b *TCP) handshakeAndPrime(conn net.Conn) (*connFramer, error) {
+	// Desync the DPI as early as possible: inject decoy TCP segments on the freshly-connected
+	// 4-tuple before our own handshake bytes flow. Best-effort, kernel connection untouched.
+	b.sendTCPFakes(conn)
 	cf := b.newFramer(conn)
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	if b.cryptoOn { // ephemeral handshake first: establishes the session sealer
