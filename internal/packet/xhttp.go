@@ -475,11 +475,12 @@ func (b *TCP) dialXHTTPPacket(hc *http.Client, tr *http.Transport, ctx context.C
 // --- server ----------------------------------------------------------------------------------
 
 type xhttpSession struct {
-	upR   *io.PipeReader
-	upW   *io.PipeWriter
-	done  chan struct{}
-	start sync.Once
-	end   sync.Once
+	upR    *io.PipeReader
+	upW    *io.PipeWriter
+	done   chan struct{}
+	served chan struct{} // closed when a downstream GET binds and serve starts (the reap watchdog checks this)
+	start  sync.Once
+	end    sync.Once
 
 	upMu    sync.Mutex        // orders packet-up POSTs by seq before writing to the upstream pipe
 	nextSeq uint64            // next seq we expect to hand to upW
@@ -495,16 +496,23 @@ func (b *TCP) xhttpGetOrCreate(sid string) *xhttpSession {
 		return s
 	}
 	pr, pw := io.Pipe()
-	s := &xhttpSession{upR: pr, upW: pw, done: make(chan struct{}), pend: map[uint64][]byte{}}
+	s := &xhttpSession{upR: pr, upW: pw, done: make(chan struct{}), served: make(chan struct{}), pend: map[uint64][]byte{}}
 	b.xhSessions[sid] = s
-	time.AfterFunc(handshakeTimeout, func() { // no serve started in time -> reap
-		select {
-		case <-s.done:
-		default:
-			s.close(b, sid)
-		}
-	})
+	time.AfterFunc(handshakeTimeout, func() { s.reapIfUnserved(b, sid) })
 	return s
+}
+
+// reapIfUnserved closes a session that never had a downstream GET bind (serve start) within the
+// handshake window. It MUST spare a live session: the guard is s.served (closed when the GET starts
+// serving), NOT s.done (closed only at session END) — checking s.done would reap every healthy
+// packet-up session at handshakeTimeout.
+func (s *xhttpSession) reapIfUnserved(b *TCP, sid string) {
+	select {
+	case <-s.served: // a GET bound and serve started -> live session, leave it
+	case <-s.done: // already ended
+	default:
+		s.close(b, sid) // no downstream GET arrived in time -> reap the orphan
+	}
 }
 
 // deliver feeds one packet-up chunk into the ordered upstream. Out-of-order chunks are buffered
@@ -619,7 +627,10 @@ func (b *TCP) xhttpHandler(w http.ResponseWriter, r *http.Request) {
 		closeFn: func() { s.close(b, sid) },
 	}
 	// Drive the authenticated core session once (the GET owns the downstream writer).
-	s.start.Do(func() { go b.handleServerConn(conn) })
+	s.start.Do(func() {
+		close(s.served) // tell the reap watchdog a downstream GET bound in time — don't kill this live session at 10s
+		go b.handleServerConn(conn)
+	})
 	<-s.done // hold the GET open (streaming downstream) until the session ends
 }
 

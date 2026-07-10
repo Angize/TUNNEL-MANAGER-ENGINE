@@ -487,6 +487,3 @@ func iff(cond bool, a, b []byte) []byte {
 }
 
 var errBadFrame = errors.New("core: bad frame")
-
-// ErrClosed is returned by Run when the connection was closed intentionally.
-var ErrClosed = errors.New("core: closed")

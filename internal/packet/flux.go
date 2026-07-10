@@ -40,7 +40,11 @@ import (
 // (same-segment / L2-adjacent / a cooperative datacenter). Across the open
 // internet most transit drops anything that is not TCP/UDP/ICMP, so the "udp"
 // carrier below is the internet-safe default.
-var fluxProtoPool = []int{253, 254, 252, 251, 250, 249, 248, 247}
+// Note: 253 (protoBIP) is deliberately EXCLUDED — flux's raw carrier installs a per-peer PREROUTING
+// DROP for every pool proto, which would silently black-hole a co-located raw/"bip" tunnel to the
+// same peer (bip rides proto 253). 246 takes its slot; both ends derive from this list so they stay
+// in sync (a breaking change is fine — no on-wire backward-compat is kept).
+var fluxProtoPool = []int{254, 252, 251, 250, 249, 248, 247, 246}
 
 // fluxDportPool is the set of UDP destination ports the "udp" flux carrier rotates
 // through. Every entry is a universally-passed QUIC/STUN/WebRTC media port, so the

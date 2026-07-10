@@ -179,11 +179,6 @@ func sealerFromKeys(name string, c2sKey, s2cKey, c2sMask, s2cMask []byte, isClie
 	return s, nil
 }
 
-// Overhead is the number of bytes Seal adds to a plaintext (salt + nonce + tag).
-func (s *Sealer) Overhead() int {
-	return maskSaltLen + s.sendAEAD.NonceSize() + s.sendAEAD.Overhead()
-}
-
 // sessionID compresses a nonce prefix into a 64-bit id used only to key the
 // receiver's anti-replay window. A collision merely resets a window early, which
 // is safe, so a right-aligned truncation to 8 bytes is enough.

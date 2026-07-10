@@ -91,6 +91,7 @@ type healthRec struct {
 // retest scheduler live in tcp.go and drive the FSM through these pure methods.
 type wsPool struct {
 	mu         sync.Mutex
+	writeMu    sync.Mutex // serializes the status file write+rename so concurrent writers don't race the shared .tmp
 	ips        []string
 	snis       []wsSNIEntry
 	ipHealth   map[string]*healthRec // absent == healthy
@@ -718,6 +719,8 @@ func (p *wsPool) writeStatus() {
 	}{Active: p.active, BurnedIPs: burnedIPs, BurnedSNIs: burnedSNIs, Health: health, Events: evs, PinIP: p.pinIP, PinSNI: p.pinSNI, TS: time.Now().Unix()}
 	p.mu.Unlock()
 	if data, err := json.Marshal(st); err == nil {
+		p.writeMu.Lock() // serialize writers: the shared ".tmp" path must not be raced by concurrent writeStatus() calls
+		defer p.writeMu.Unlock()
 		tmp := p.statusPath + ".tmp"
 		if os.WriteFile(tmp, data, 0o644) == nil {
 			_ = os.Rename(tmp, p.statusPath) // atomic replace so a reader never sees a half file

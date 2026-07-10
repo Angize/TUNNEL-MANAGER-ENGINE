@@ -76,7 +76,6 @@ type Config struct {
 
 	TunName string `json:"tun_name"` // requested interface name, e.g. "tnl0"
 	TunAddr string `json:"tun_addr"` // local L3 address with prefix, e.g. "10.200.0.1/24"
-	TunPeer string `json:"tun_peer"` // peer L3 address (reference), e.g. "10.200.0.2"
 	MTU     int    `json:"mtu"`      // TUN MTU, e.g. 1400
 
 	Keepalive int       `json:"keepalive"` // client ping interval in seconds (default 15)

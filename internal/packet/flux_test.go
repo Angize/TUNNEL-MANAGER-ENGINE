@@ -89,8 +89,8 @@ func TestFluxGraceWindow(t *testing.T) {
 // "rotate now" advances both ends in lock-step to a shape they'd otherwise reach later.
 func TestFluxEpochOffsetShiftsSchedule(t *testing.T) {
 	base := fluxEpochAt(600*time.Second, time.Unix(1_700_000_000, 0))
-	if deriveFluxShape("k", base+5, "random") != deriveFluxShape("k", base+5, "random") {
-		t.Fatal("nondeterministic")
+	if s1, s2 := deriveFluxShape("k", base+5, "random"), deriveFluxShape("k", base+5, "random"); s1 != s2 {
+		t.Fatal("deriveFluxShape must be deterministic for the same (key, epoch, shape)") // two separate calls, not x!=x
 	}
 	// offset of +5 lands on the epoch-(base+5) shape; without it we'd be on base.
 	if deriveFluxShape("k", base, "random").proto == deriveFluxShape("k", base+5, "random").proto &&

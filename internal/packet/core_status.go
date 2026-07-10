@@ -17,6 +17,7 @@ import (
 // every method a no-op. Safe for concurrent use.
 type coreStatus struct {
 	mu      sync.Mutex
+	writeMu sync.Mutex // serializes the file write+rename so concurrent writers don't race the shared .tmp path
 	path    string
 	active  string // short human descriptor of the live carrier, e.g. "udp · 1.2.3.4:443"
 	events  []coreEvent
@@ -91,6 +92,8 @@ func (s *coreStatus) write() {
 	if err != nil {
 		return
 	}
+	s.writeMu.Lock() // serialize writers: the shared ".tmp" path must not be raced by concurrent write() calls
+	defer s.writeMu.Unlock()
 	tmp := s.path + ".tmp"
 	if os.WriteFile(tmp, buf, 0o600) != nil {
 		return
