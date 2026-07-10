@@ -1,11 +1,42 @@
 package packet
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// TestTCPSingleEdgeECHSelfHeal verifies a single fixed-edge ws client (no pool) persists the fresh
+// ECH key onto wsECH and writes exactly one ech/self_heal event per rotation to its status file —
+// so a single-edge in-band self-heal reaches the panel without spamming on every reconnect.
+func TestTCPSingleEdgeECHSelfHeal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "core-x.status")
+	b := &TCP{st: newCoreStatus(path, "ws · edge:443"), wsECH: []byte{0x01}}
+
+	b.noteECHSelfHeal("h.example", []byte{0x02, 0x03}) // first heal: key differs -> persist + emit
+	if !bytes.Equal(b.wsECH, []byte{0x02, 0x03}) {
+		t.Fatalf("wsECH should be persisted to the fresh key, got %v", b.wsECH)
+	}
+	evs := readEvents(t, path)
+	if len(evs) != 1 || evs[0].Kind != "ech" || evs[0].Code != "self_heal" {
+		t.Fatalf("want 1 ech/self_heal event, got %+v", evs)
+	}
+	if evs[0].Detail != "h.example AgM=" { // host + base64(0x02,0x03)
+		t.Fatalf("detail should carry host + base64 key, got %q", evs[0].Detail)
+	}
+
+	b.noteECHSelfHeal("h.example", []byte{0x02, 0x03}) // same key -> no repeat event
+	if evs = readEvents(t, path); len(evs) != 1 {
+		t.Fatalf("repeat with an unchanged key must be silent; got %d events", len(evs))
+	}
+
+	b.noteECHSelfHeal("h.example", []byte{0x09}) // rotated key -> emit again
+	if evs = readEvents(t, path); len(evs) != 2 {
+		t.Fatalf("a rotated key should emit again; got %d events", len(evs))
+	}
+}
 
 // TestCoreStatusEventPairing verifies the datagram self-heal event contract: the initial connect is
 // silent (no spurious "reconnect"), a stale-detect emits one "down", and only then does a connect
