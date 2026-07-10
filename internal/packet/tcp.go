@@ -768,8 +768,9 @@ func (b *TCP) removeAuthConn(cf *connFramer) {
 // edge rejects a stale ECH config it returns a fresh RetryConfigList — we redial
 // once and retry with it, so Cloudflare's periodic ECH-key rotation self-heals
 // without a rebuild. On any failure the passed (or redialed) conn is closed.
-func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte) (net.Conn, error) {
+func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live bool) (net.Conn, error) {
 	var err error
+	healed := false // set once we redial with a fresh RetryConfigList
 	for attempt := 0; attempt < 2; attempt++ {
 		cfg := &tls.Config{ServerName: host}
 		if len(ech) > 0 {
@@ -780,6 +781,9 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte) (net.C
 		if err = tc.Handshake(); err == nil {
 			var zero time.Time
 			tc.SetDeadline(zero)
+			if healed && live && b.pool != nil { // surface a SUCCESSFUL live self-heal to the panel log
+				b.pool.event("ech", "self_heal", host+" "+base64.StdEncoding.EncodeToString(ech))
+			}
 			return tc, nil
 		}
 		conn.Close()
@@ -788,6 +792,7 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte) (net.C
 			ech = echErr.RetryConfigList // stale ECH key: redial and retry with the fresh one
 			log.Printf("core/ws: ECH self-heal for %s (%s) — stale key rejected, retrying with fresh key %s",
 				host, dialAddr, base64.StdEncoding.EncodeToString(ech))
+			healed = true
 			if conn, err = b.dialer(10 * time.Second).Dial("tcp", dialAddr); err != nil {
 				return nil, err
 			}
@@ -822,7 +827,7 @@ func (b *TCP) establishWS() (net.Conn, string, string, error) {
 		return nil, dialAddr, "", err
 	}
 	if b.wsTLS {
-		tc, terr := b.tlsToEdge(conn, dialAddr, host, ech)
+		tc, terr := b.tlsToEdge(conn, dialAddr, host, ech, true) // live carrier: a self-heal is panel-worthy
 		if terr != nil {
 			b.attributeFailure(dialAddr, sniEnt)
 			return nil, dialAddr, "", terr
@@ -866,7 +871,7 @@ func (b *TCP) probeEdge(ip string, sni wsSNIEntry) bool {
 	if host == "" {
 		host = ip
 	}
-	tc, err := b.tlsToEdge(conn, ip, host, sni.ech) // closes conn on failure
+	tc, err := b.tlsToEdge(conn, ip, host, sni.ech, false) // probe: don't emit a self-heal event
 	if err != nil {
 		return false
 	}
@@ -894,7 +899,7 @@ func (b *TCP) probeEdgeFull(ip string, sni wsSNIEntry) bool {
 		host = ip
 	}
 	if b.wsTLS {
-		tc, terr := b.tlsToEdge(conn, ip, host, sni.ech) // closes conn on failure
+		tc, terr := b.tlsToEdge(conn, ip, host, sni.ech, false) // probe: don't emit a self-heal event
 		if terr != nil {
 			return false
 		}

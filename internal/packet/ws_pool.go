@@ -124,7 +124,7 @@ const pinTTL int64 = 300
 type coreEvent struct {
 	Seq    int64  `json:"seq"`
 	TS     int64  `json:"ts"`
-	Kind   string `json:"kind"`   // "down" (carrier dropped) | "burn" (edge sidelined)
+	Kind   string `json:"kind"`   // "down" (carrier dropped) | "up" (reconnected) | "burn" (edge sidelined) | "ech" (ECH self-heal)
 	Code   string `json:"code"`   // stable reason category, e.g. ping_timeout / reset / tls / ws_upgrade / throttle
 	Detail string `json:"detail"` // optional extra: the edge key, or a short raw-error snippet
 }

@@ -292,6 +292,9 @@ func (b *TCP) establishXHTTP() (net.Conn, string, string, error) {
 			log.Printf("core/xhttp: ECH self-heal for %s (%s) — stale key rejected, retrying with fresh key %s",
 				host, dialAddr, base64.StdEncoding.EncodeToString(ech))
 			conn, err = b.dialXHTTPOnce(dialAddr, host, ech, path)
+			if err == nil && b.pool != nil { // surface a SUCCESSFUL self-heal to the panel log
+				b.pool.event("ech", "self_heal", host+" "+base64.StdEncoding.EncodeToString(ech))
+			}
 		}
 	}
 	// Attribute the outcome to the health FSM here (one place for both modes): a failure runs
