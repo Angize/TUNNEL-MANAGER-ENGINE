@@ -781,8 +781,10 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 		if err = tc.Handshake(); err == nil {
 			var zero time.Time
 			tc.SetDeadline(zero)
-			if healed && live && b.pool != nil { // surface a SUCCESSFUL live self-heal to the panel log
-				b.pool.event("ech", "self_heal", host+" "+base64.StdEncoding.EncodeToString(ech))
+			if healed && live && b.pool != nil { // live self-heal: persist the fresh key, log it once per rotation
+				if b.pool.updateECH(host, ech) {
+					b.pool.event("ech", "self_heal", host+" "+base64.StdEncoding.EncodeToString(ech))
+				}
 			}
 			return tc, nil
 		}
