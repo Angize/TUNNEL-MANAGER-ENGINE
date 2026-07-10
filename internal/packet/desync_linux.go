@@ -6,15 +6,16 @@
 // peer:
 //
 //   - a low-TTL decoy expires a few hops out — it reaches an on-path DPI but dies before
-//     the server, so the server never sees it;
-//   - a bad-checksum decoy is dropped by the server's IP stack (raw/AF_INET) or fails the
-//     AEAD (flux/AF_PACKET) — it reaches the server host but never enters the session.
+//     the server, so the server never sees it (sent via IP_HDRINCL, which honours the TTL);
+//   - a bad-checksum decoy is discarded by the first hop that validates the IP checksum (most
+//     routers, and the server's own stack) — it must be injected at L2 via AF_PACKET, because
+//     an IP_HDRINCL socket ALWAYS recomputes the checksum and would silently repair it.
 //
 // Either way a STATEFUL DPI that tracks the flow ingests the decoys and mis-syncs its
-// per-flow state, while the real, AEAD-authenticated session is untouched (a decoy that
-// does reach the server carries random bytes and cannot open). This is the paqet/zapret
-// "fake before handshake" idea, done natively for the carriers we fully control. It has
-// no effect on the kernel-socket carriers (udp/tcp/ws), which cannot forge the header.
+// per-flow state, while the real, AEAD-authenticated session is untouched (a decoy that does
+// reach the server carries random bytes and cannot open). This is the paqet/zapret "fake
+// before handshake" idea, done natively for the carriers we fully control. It has no effect
+// on the kernel-socket carriers (udp/tcp/ws), which cannot forge the header.
 package packet
 
 import "crypto/rand"
@@ -46,6 +47,10 @@ func newDesyncCfg(on bool, ttl, count int, mode string) desyncCfg {
 	}
 	return desyncCfg{on: true, ttl: ttl, count: count, mode: mode}
 }
+
+// usesBadsum reports whether any decoy this config emits carries a corrupted checksum, so a
+// carrier knows to set up the AF_PACKET injector (IP_HDRINCL would repair the checksum).
+func (d desyncCfg) usesBadsum() bool { return d.on && (d.mode == "badsum" || d.mode == "both") }
 
 // fakeSpec is one decoy's IP-header knobs. A ttl decoy keeps a valid checksum (it must be
 // forwarded until the TTL runs out mid-path); a badsum decoy keeps a normal TTL (it must

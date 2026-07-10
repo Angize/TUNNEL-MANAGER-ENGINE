@@ -108,6 +108,29 @@ func TestBuildIP4Ext(t *testing.T) {
 	}
 }
 
+// TestBuildIP4ExtBadSumZeroTwin locks in the one's-complement zero-twin fix: when the correct
+// header checksum is 0x0000, its bitwise complement 0xffff ALSO verifies (both are valid
+// representations of zero), so a naive ^sum would leave a VALID checksum. buildIP4Ext must
+// still produce an invalid one. src=10.0.0.0 dst=192.168.1.0 proto=253 ttl=238 len(payload)=69
+// is a header whose correct checksum is exactly 0x0000.
+func TestBuildIP4ExtBadSumZeroTwin(t *testing.T) {
+	src := net.IPv4(10, 0, 0, 0)
+	dst := net.IPv4(192, 168, 1, 0)
+	payload := make([]byte, 69)
+
+	good := buildIP4Ext(src, dst, protoBIP, 238, false, payload)
+	if binary.BigEndian.Uint16(good[10:12]) != 0x0000 {
+		t.Fatalf("test premise broken: correct checksum should be 0x0000, got %#04x", binary.BigEndian.Uint16(good[10:12]))
+	}
+	if onesComplementSum(good[:20]) != 0 {
+		t.Fatal("the 0x0000-checksum header must itself verify")
+	}
+	bad := buildIP4Ext(src, dst, protoBIP, 238, true, payload)
+	if onesComplementSum(bad[:20]) == 0 {
+		t.Fatalf("badSum header STILL verifies (zero-twin not handled): checksum=%#04x", binary.BigEndian.Uint16(bad[10:12]))
+	}
+}
+
 // TestBuildIP4ExtTTLClamp checks the TTL is clamped into 1..255 (a 0 or negative TTL would
 // be an instantly-dead packet or a malformed byte).
 func TestBuildIP4ExtTTLClamp(t *testing.T) {
