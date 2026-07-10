@@ -78,6 +78,23 @@ func (d desyncCfg) specs() []fakeSpec {
 	return out
 }
 
+// specsTCP is specs() for the kernel-TCP inject path (tcp/cover/ws): every decoy keeps the LOW
+// TTL and is never promoted to 64, because a well-formed-looking segment on a REAL connection's
+// 4-tuple must not reach the server (it would draw an RST / challenge-ACK); the low TTL makes it
+// die on the path, where the DPI still sees it. badsum still corrupts the checksum for extra
+// insurance against a DPI that validates it.
+func (d desyncCfg) specsTCP() []fakeSpec {
+	if !d.on {
+		return nil
+	}
+	out := make([]fakeSpec, 0, d.count)
+	for i := 0; i < d.count; i++ {
+		bad := d.mode == "badsum" || (d.mode == "both" && i%2 == 1)
+		out = append(out, fakeSpec{ttl: d.ttl, badSum: bad}) // always the configured low TTL
+	}
+	return out
+}
+
 // fakePayload returns a random-length, random-content payload sized like a small
 // handshake/keepalive frame. Our real frames are AEAD ciphertext (indistinguishable from
 // random on the wire), so a random decoy of a plausible size resembles a real flow packet.

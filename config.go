@@ -457,14 +457,14 @@ func (c *Config) validate() error {
 		}
 	}
 	if c.FakeDesync {
-		// Desync forges the outer IPv4 header (TTL/checksum), which only the carriers that
-		// build it themselves can do: raw and flux. On udp/tcp/ws the kernel owns the header,
-		// so the core cannot stamp a decoy TTL or corrupt a checksum there. (It is a client-side
-		// mechanism; a server that carries the same fields simply ignores them.)
+		// Desync is delivered two ways: raw/flux build the whole IPv4 header, so they forge decoy
+		// packets directly; tcp/ws own a kernel TCP connection, so they INJECT decoy TCP segments
+		// on its 4-tuple via AF_PACKET (see tcp_inject_linux.go). Plain udp has no such hook. It is
+		// a client-side mechanism; a server that carries the same fields simply ignores them.
 		switch c.Transport {
-		case "raw", "flux":
+		case "raw", "flux", "tcp", "ws":
 		default:
-			return errors.New("fake_desync is only supported on the raw and flux carriers (they build the IPv4 header; udp/tcp/ws use kernel sockets)")
+			return errors.New("fake_desync is supported on the raw, flux, tcp and ws carriers (not plain udp)")
 		}
 		if c.FakeTTL < 0 || c.FakeTTL > 255 {
 			return errors.New("fake_ttl must be between 0 and 255 (0 defaults to 4)")
