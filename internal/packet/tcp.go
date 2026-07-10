@@ -26,6 +26,7 @@ package packet
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
@@ -302,6 +303,7 @@ type TCP struct {
 
 	pool   *wsPool       // client: rotating edge pool (nil = single fixed edge above)
 	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
+	st     *coreStatus   // client + single-edge ws/xhttp: self-heal event ring -> status file (nil = off / pool / server)
 
 	// probeFn lets tests substitute a deterministic reachability oracle for probeEdge (which
 	// does a real TCP+TLS dial). nil in production -> the differential prober uses probeEdge.
@@ -385,6 +387,22 @@ func (b *TCP) SetDesync(on bool, ttl, count int, mode string) {
 		return
 	}
 	b.dsOn, b.dsTTL, b.dsCount, b.dsMode = true, ttl, count, mode
+}
+
+// SetStatusPath (client, single-edge ws/xhttp) wires a status-file event ring so the carrier's
+// precise self-heal events (e.g. an in-band ECH self-heal) reach the node/panel system log — the
+// same file shape the datagram carriers write. A pool writes its own richer status file, so this is
+// skipped when a pool is configured; the server never wires it. main wires it via the shared
+// SetStatusPath type assertion. Call before Run().
+func (b *TCP) SetStatusPath(path string) {
+	if !b.isClient || path == "" || b.pool != nil {
+		return
+	}
+	carrier := "ws"
+	if b.xhttp {
+		carrier = "xhttp"
+	}
+	b.st = newCoreStatus(path, carrier+" · "+b.addr)
 }
 
 // dialer returns a net.Dialer that, when a source IP is pinned, binds the outbound socket to
@@ -762,6 +780,26 @@ func (b *TCP) removeAuthConn(cf *connFramer) {
 	b.authMu.Unlock()
 }
 
+// noteECHSelfHeal runs after a SUCCESSFUL in-band ECH self-heal on the LIVE carrier. It persists
+// the fresh key so the next reconnect stops re-healing (no repeat rejection), and surfaces the
+// event to the panel exactly once per rotation — via the edge pool (multi-edge) or, for a single
+// fixed edge, the status file. A no-op emit when neither sink exists.
+func (b *TCP) noteECHSelfHeal(host string, ech []byte) {
+	detail := host + " " + base64.StdEncoding.EncodeToString(ech)
+	if b.pool != nil {
+		if b.pool.updateECH(host, ech) { // persist onto the matching SNI; emit only on a real change
+			b.pool.event("ech", "self_heal", detail)
+		}
+		return
+	}
+	// Single edge: wsECH is touched only by the one dial-loop goroutine, so this needs no lock.
+	// Persist the fresh key and emit once per actual change (the next connect presents it directly).
+	if !bytes.Equal(b.wsECH, ech) {
+		b.wsECH = ech
+		b.st.event("ech", "self_heal", detail) // nil-safe: a no-op when no status file is wired
+	}
+}
+
 // tlsToEdge performs the client-side TLS handshake to the CDN edge over an
 // already-dialed conn. ServerName=wsHost is the SNI; when wsECH is set that SNI
 // is encrypted (ECH) so only a benign public name is visible on the wire. If the
@@ -781,10 +819,8 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 		if err = tc.Handshake(); err == nil {
 			var zero time.Time
 			tc.SetDeadline(zero)
-			if healed && live && b.pool != nil { // live self-heal: persist the fresh key, log it once per rotation
-				if b.pool.updateECH(host, ech) {
-					b.pool.event("ech", "self_heal", host+" "+base64.StdEncoding.EncodeToString(ech))
-				}
+			if healed && live { // live self-heal: persist the fresh key and surface it (pool or single-edge)
+				b.noteECHSelfHeal(host, ech)
 			}
 			return tc, nil
 		}
