@@ -1,0 +1,83 @@
+package packet
+
+import (
+	"bytes"
+	"net"
+	"testing"
+)
+
+// captureConn is a net.Conn that records each Write as a separate segment so a test can assert how
+// the first write was fragmented.
+type captureConn struct {
+	net.Conn
+	writes [][]byte
+}
+
+func (c *captureConn) Write(p []byte) (int, error) {
+	b := make([]byte, len(p))
+	copy(b, p)
+	c.writes = append(c.writes, b)
+	return len(p), nil
+}
+
+func TestFragConnAutoSplitsInsideHostname(t *testing.T) {
+	cap := &captureConn{}
+	f := newFragConn(cap, "cdn.spacefly.ir", 0) // auto: split in the middle of the hostname
+	// a ClientHello-shaped buffer with the cleartext SNI embedded
+	hello := append([]byte{0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00}, []byte("....cdn.spacefly.ir....rest....")...)
+	if _, err := f.Write(hello); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if len(cap.writes) != 2 {
+		t.Fatalf("first write should split into 2 segments, got %d", len(cap.writes))
+	}
+	// Neither segment may contain the full hostname; concatenation must equal the original.
+	for i, w := range cap.writes {
+		if bytes.Contains(w, []byte("cdn.spacefly.ir")) {
+			t.Fatalf("segment %d still contains the full hostname", i)
+		}
+	}
+	if got := append(append([]byte{}, cap.writes[0]...), cap.writes[1]...); !bytes.Equal(got, hello) {
+		t.Fatalf("reassembled bytes differ from the original ClientHello")
+	}
+	// Subsequent writes pass through unsplit.
+	if _, err := f.Write([]byte("data")); err != nil {
+		t.Fatalf("write2: %v", err)
+	}
+	if len(cap.writes) != 3 || string(cap.writes[2]) != "data" {
+		t.Fatalf("post-handshake writes must pass through whole, got %v", cap.writes)
+	}
+}
+
+func TestFragConnExplicitPos(t *testing.T) {
+	cap := &captureConn{}
+	f := newFragConn(cap, "example.com", 4) // explicit offset overrides auto
+	if _, err := f.Write([]byte("ABCDEFGH")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if len(cap.writes) != 2 || string(cap.writes[0]) != "ABCD" || string(cap.writes[1]) != "EFGH" {
+		t.Fatalf("explicit split at 4 wrong: %q", cap.writes)
+	}
+}
+
+func TestFragConnNoSplitWhenHostAbsent(t *testing.T) {
+	cap := &captureConn{}
+	f := newFragConn(cap, "hidden.example", 0) // ECH-like: hostname not in cleartext
+	if _, err := f.Write([]byte("no matching host here")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if len(cap.writes) != 1 {
+		t.Fatalf("absent hostname must write whole (no split), got %d segments", len(cap.writes))
+	}
+}
+
+func TestFragConnOutOfRangePos(t *testing.T) {
+	cap := &captureConn{}
+	f := newFragConn(cap, "", 999) // pos past the buffer -> write whole
+	if _, err := f.Write([]byte("short")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if len(cap.writes) != 1 || string(cap.writes[0]) != "short" {
+		t.Fatalf("out-of-range pos must write whole, got %q", cap.writes)
+	}
+}

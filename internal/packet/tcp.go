@@ -305,6 +305,9 @@ type TCP struct {
 	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
 	st     *coreStatus   // client + single-edge ws/xhttp: self-heal event ring -> status file (nil = off / pool / server)
 
+	sniSplit bool // client ws/xhttp: split the ClientHello so the cleartext SNI crosses a TCP segment boundary
+	splitPos int  // explicit split offset into the ClientHello (0 = auto: middle of the hostname)
+
 	// probeFn lets tests substitute a deterministic reachability oracle for probeEdge (which
 	// does a real TCP+TLS dial). nil in production -> the differential prober uses probeEdge.
 	probeFn func(ip string, sni wsSNIEntry) bool
@@ -387,6 +390,27 @@ func (b *TCP) SetDesync(on bool, ttl, count int, mode string) {
 		return
 	}
 	b.dsOn, b.dsTTL, b.dsCount, b.dsMode = true, ttl, count, mode
+}
+
+// SetSNISplit (client, ws/xhttp) turns on SNI fragmentation: the TLS ClientHello to the edge is
+// written across two TCP segments so the cleartext SNI is split, defeating a stateless SNI-blocklist
+// DPI. pos is the split offset into the ClientHello (0 = auto: the middle of the hostname). Only
+// meaningful with wss; a no-op on the server or a non-ws carrier. main wires it via the shared
+// SetSNISplit type assertion. Call before Run().
+func (b *TCP) SetSNISplit(on bool, pos int) {
+	if !b.isClient || !on || !b.ws {
+		return
+	}
+	b.sniSplit, b.splitPos = true, pos
+}
+
+// fragWrap wraps conn in a ClientHello-splitting fragConn when SNI fragmentation is enabled, else
+// returns conn unchanged. host is the SNI, used for auto split-point location.
+func (b *TCP) fragWrap(conn net.Conn, host string) net.Conn {
+	if b.sniSplit {
+		return newFragConn(conn, host, b.splitPos)
+	}
+	return conn
 }
 
 // SetStatusPath (client, single-edge ws/xhttp) wires a status-file event ring so the carrier's
@@ -814,7 +838,7 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 		if len(ech) > 0 {
 			cfg.EncryptedClientHelloConfigList = ech
 		}
-		tc := tls.Client(conn, cfg)
+		tc := tls.Client(b.fragWrap(conn, host), cfg) // split the ClientHello's SNI when enabled
 		tc.SetDeadline(time.Now().Add(handshakeTimeout))
 		if err = tc.Handshake(); err == nil {
 			var zero time.Time

@@ -107,6 +107,13 @@ type Config struct {
 	WSHost string `json:"ws_host"`
 	WSPath string `json:"ws_path"`
 	WSTLS  bool   `json:"ws_tls"`
+	// SNISplit fragments the wss ClientHello across two TCP segments so the cleartext SNI lands on
+	// the segment boundary — a stateless SNI-blocklist DPI can no longer match the full hostname
+	// (SNI fragmentation). A cheap complement to ECH for edges/censors where ECH is unavailable;
+	// ws/xhttp client + wss only. SplitPos is the split offset into the ClientHello (0 = auto: the
+	// middle of the cleartext hostname; naturally a no-op under ECH, where the SNI is encrypted).
+	SNISplit bool `json:"sni_split"`
+	SplitPos int  `json:"split_pos"`
 	// WSXHTTP switches the ws carrier from a WebSocket upgrade to the xhttp mode (a
 	// GET-down + POST-up HTTP request pair), which passes CDNs that block WebSocket.
 	// Same fronting fields (ws_host/ws_tls/ws_ech/ws_path). Not combined with the pool.
@@ -383,6 +390,17 @@ func (c *Config) validate() error {
 			}
 			if _, err := base64.StdEncoding.DecodeString(c.WSECH); err != nil {
 				return errors.New("ws_ech is not valid base64")
+			}
+		}
+		// SNI fragmentation splits the wss ClientHello, so it needs wss on a client. split_pos is a
+		// byte offset into the ClientHello (0 = auto: middle of the hostname); cap it so a runaway
+		// value can't push the split past a plausible ClientHello.
+		if c.SNISplit {
+			if !c.WSTLS || c.Role != "client" {
+				return errors.New("sni_split requires ws_tls on a client")
+			}
+			if c.SplitPos < 0 || c.SplitPos > 1400 {
+				return errors.New("split_pos must be between 0 and 1400")
 			}
 		}
 		// xhttp upstream style: packet-up (default) or grpc ("stream" is a legacy alias for

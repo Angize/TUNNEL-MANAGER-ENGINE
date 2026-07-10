@@ -257,6 +257,14 @@ func main() {
 			log.Printf("tnl-core: fake-desync on (%d decoys, ttl=%d, mode=%s)", cfg.FakeCount, cfg.FakeTTL, cfg.FakeMode)
 		}
 	}
+	// SNI fragmentation (client, ws/xhttp): split the wss ClientHello so the cleartext SNI crosses a
+	// TCP segment boundary. Only the ws/xhttp carrier implements it; others ignore this.
+	if cfg.Role == "client" && cfg.SNISplit {
+		if s, ok := b.(interface{ SetSNISplit(bool, int) }); ok {
+			s.SetSNISplit(true, cfg.SplitPos)
+			log.Printf("tnl-core: SNI fragmentation on (split_pos=%d)", cfg.SplitPos)
+		}
+	}
 	defer b.Close()
 
 	// Clean shutdown removes the TUN (via defers) on SIGINT/SIGTERM.
