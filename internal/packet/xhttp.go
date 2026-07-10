@@ -324,7 +324,14 @@ func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net
 		// Always dial the fixed edge, regardless of the request URL host, so the Host/SNI stays
 		// the fronting domain while we connect to a specific (clean) CDN IP.
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return b.dialer(10 * time.Second).DialContext(ctx, "tcp", dialAddr)
+			c, err := b.dialer(10 * time.Second).DialContext(ctx, "tcp", dialAddr)
+			if err != nil {
+				return nil, err
+			}
+			if b.wsTLS { // the transport does TLS on this conn -> split its ClientHello SNI when enabled
+				c = b.fragWrap(c, host)
+			}
+			return c, nil
 		},
 		// packet-up rides HTTP/1.1 (each POST is a complete request); stream-one and grpc are
 		// full-duplex and need HTTP/2 to the edge so upstream frames flush per-write, not buffer.
