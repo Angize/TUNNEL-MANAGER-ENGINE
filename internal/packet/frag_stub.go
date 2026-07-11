@@ -7,3 +7,9 @@ package packet
 func (f *fragConn) writeDisorder(p []byte, at int) (int, error) {
 	return f.writeSplit(p, at)
 }
+
+// writeFake falls back to a plain split off Linux (the raw AF_PACKET injection + TCP_REPAIR seq read
+// the fake overlap needs are Linux-only).
+func (f *fragConn) writeFake(p []byte, at int) (int, error) {
+	return f.writeSplit(p, at)
+}

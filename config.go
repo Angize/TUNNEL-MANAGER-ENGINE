@@ -409,9 +409,9 @@ func (c *Config) validate() error {
 				return errors.New("split_pos must be between 0 and 1400")
 			}
 			switch c.SNIMode {
-			case "", "split", "disorder":
+			case "", "split", "disorder", "fake":
 			default:
-				return errors.New("sni_mode must be \"split\" or \"disorder\"")
+				return errors.New("sni_mode must be \"split\", \"disorder\", or \"fake\"")
 			}
 			if c.SplitTTL < 0 || c.SplitTTL > 255 {
 				return errors.New("split_ttl must be between 0 and 255")

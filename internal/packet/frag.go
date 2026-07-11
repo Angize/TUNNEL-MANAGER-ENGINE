@@ -19,6 +19,12 @@ const (
 	// server still reassembles the real ClientHello. This desyncs a reassembling DPI's view — the
 	// zapret/GoodbyeDPI "disorder" idea — at the cost of one retransmit (~RTO) on connect.
 	sniDisorderMode = "disorder"
+	// sniFakeMode injects a whole FAKE ClientHello (real one with the SNI overwritten by a benign
+	// decoy) as a raw segment at the SAME sequence as the real one, at a low TTL. A reassembling DPI
+	// resolves the overlap to the decoy SNI and clears the flow; the server never sees the fake and
+	// gets the real ClientHello. This is the technique that beats a DPI which reassembles the stream
+	// (which plain split and disorder do not). Linux + IPv4; falls back to disorder otherwise.
+	sniFakeMode = "fake"
 )
 
 // fragGap separates the two segments so TCP_NODELAY (set by Go's dialer) reliably emits them as two
@@ -64,8 +70,11 @@ func (f *fragConn) Write(p []byte) (int, error) {
 	if at <= 0 || at >= len(p) {
 		return f.Conn.Write(p)
 	}
-	if f.mode == sniDisorderMode {
+	switch f.mode {
+	case sniDisorderMode:
 		return f.writeDisorder(p, at) // linux: low-TTL head; stub: plain split
+	case sniFakeMode:
+		return f.writeFake(p, at) // linux: overlapping decoy-SNI ClientHello; stub: plain split
 	}
 	return f.writeSplit(p, at)
 }
@@ -80,6 +89,18 @@ func (f *fragConn) writeSplit(p []byte, at int) (int, error) {
 	time.Sleep(fragGap)
 	n2, err := f.Conn.Write(p[at:])
 	return n1 + n2, err
+}
+
+// decoySNI returns n benign hostname bytes to overwrite the real SNI in the fake ClientHello — a
+// name a censor never blocks (the CDN's own domain), repeated/truncated so the SNI length field in
+// the record stays valid.
+func decoySNI(n int) []byte {
+	const base = "www.cloudflare.com"
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = base[i%len(base)]
+	}
+	return out
 }
 
 // splitAt returns the offset in the first write to split at: the configured pos when > 0, else the
