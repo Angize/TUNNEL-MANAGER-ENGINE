@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/chacha20"
+	utls "github.com/refraction-networking/utls"
 
 	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/crypto"
 	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/tlscover"
@@ -827,8 +828,11 @@ func (b *TCP) noteECHSelfHeal(host string, ech []byte) {
 }
 
 // tlsToEdge performs the client-side TLS handshake to the CDN edge over an
-// already-dialed conn. ServerName=wsHost is the SNI; when wsECH is set that SNI
-// is encrypted (ECH) so only a benign public name is visible on the wire. If the
+// already-dialed conn, using uTLS with a Chrome fingerprint so the ClientHello is
+// indistinguishable from a real browser's (Go's crypto/tls has a distinctive JA3
+// a censor can block even under ECH). ServerName=wsHost is the SNI; when wsECH is
+// set that SNI is encrypted (ECH) — uTLS carries the real ECH inside the
+// Chrome-shaped hello, so we keep both the fingerprint and the hidden SNI. If the
 // edge rejects a stale ECH config it returns a fresh RetryConfigList — we redial
 // once and retry with it, so Cloudflare's periodic ECH-key rotation self-heals
 // without a rebuild. On any failure the passed (or redialed) conn is closed.
@@ -836,22 +840,32 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 	var err error
 	healed := false // set once we redial with a fresh RetryConfigList
 	for attempt := 0; attempt < 2; attempt++ {
-		cfg := &tls.Config{ServerName: host}
+		// uTLS with a Chrome fingerprint: the ClientHello matches a real Chrome on the wire, so a
+		// censor cannot fingerprint-block us by the distinctive Go crypto/tls JA3 — a gap ECH does
+		// NOT close (ECH hides the SNI, not the TLS fingerprint). ALPN is forced to http/1.1 (Chrome
+		// offers h2 too; if the edge picked h2 our raw HTTP/1.1 WebSocket upgrade would break), which
+		// changes only the ALPN values, not the extension set, so the JA3 still matches Chrome. When
+		// ech is set, uTLS injects real ECH in place of Chrome's GREASE-ECH — Chrome fingerprint AND
+		// hidden SNI together; a stale key still surfaces as a *utls.ECHRejectionError with a fresh
+		// RetryConfigList, driving the self-heal below.
+		ucfg := &utls.Config{ServerName: host}
 		if len(ech) > 0 {
-			cfg.EncryptedClientHelloConfigList = ech
+			ucfg.EncryptedClientHelloConfigList = ech
 		}
-		tc := tls.Client(b.fragWrap(conn, host), cfg) // split the ClientHello's SNI when enabled
-		tc.SetDeadline(time.Now().Add(handshakeTimeout))
-		if err = tc.Handshake(); err == nil {
-			var zero time.Time
-			tc.SetDeadline(zero)
+		uc := utls.UClient(b.fragWrap(conn, host), ucfg, utls.HelloCustom) // split the ClientHello's SNI when enabled
+		if err = applyChromeH1(uc); err == nil {
+			conn.SetDeadline(time.Now().Add(handshakeTimeout))
+			err = uc.Handshake()
+		}
+		if err == nil {
+			conn.SetDeadline(time.Time{})
 			if healed && live { // live self-heal: persist the fresh key and surface it (pool or single-edge)
 				b.noteECHSelfHeal(host, ech)
 			}
-			return tc, nil
+			return uc, nil
 		}
 		conn.Close()
-		var echErr *tls.ECHRejectionError
+		var echErr *utls.ECHRejectionError
 		if attempt == 0 && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
 			ech = echErr.RetryConfigList // stale ECH key: redial and retry with the fresh one
 			log.Printf("core/ws: ECH self-heal for %s (%s) — stale key rejected, retrying with fresh key %s",
@@ -865,6 +879,26 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 		break
 	}
 	return nil, err
+}
+
+// applyChromeH1 applies a current-Chrome ClientHello fingerprint to uc, with ALPN forced to
+// http/1.1 only. Chrome offers [h2, http/1.1]; if the CDN edge negotiated h2 our raw HTTP/1.1
+// WebSocket upgrade (wsClientHandshake) would break, so we drop h2 from the ALPN VALUES — the
+// extension SET is unchanged, so the JA3 still matches Chrome. UTLSIdToSpec returns a freshly
+// built spec each call, so mutating its ALPN does not disturb the shared parrot. The spec keeps
+// Chrome's GREASE-ECH placeholder, which uTLS replaces with real ECH when the config carries an
+// ECHConfigList.
+func applyChromeH1(uc *utls.UConn) error {
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
+	if err != nil {
+		return err
+	}
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+		}
+	}
+	return uc.ApplyPreset(&spec)
 }
 
 // establishWS opens one WebSocket connection: it picks the current pool edge (or the
