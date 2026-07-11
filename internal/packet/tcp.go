@@ -295,12 +295,11 @@ type TCP struct {
 	// mutually exclusive with cover. On the client, wsTLS wraps the connection in a
 	// standard TLS session (ServerName=wsHost) BEFORE the upgrade, so the client
 	// speaks wss:// to a CDN edge; the server stays plain (the CDN terminates TLS).
-	ws      bool
-	wsHost  string // client: Host header + TLS SNI (the fronting/origin domain)
-	wsPath  string // client: request path (default "/")
-	wsTLS   bool   // client: TLS to the edge before the WebSocket upgrade
-	wsECH   []byte // client: ECHConfigList — when set, the SNI is encrypted (hidden)
-	wsNoSNI bool   // client: omit the SNI extension entirely — the edge routes by the (encrypted) Host header, so an SNI-matching censor has nothing to match. Mutually exclusive with wsECH/sniSplit.
+	ws     bool
+	wsHost string // client: Host header + TLS SNI (the fronting/origin domain)
+	wsPath string // client: request path (default "/")
+	wsTLS  bool   // client: TLS to the edge before the WebSocket upgrade
+	wsECH  []byte // client: ECHConfigList — when set, the SNI is encrypted (hidden)
 
 	pool   *wsPool       // client: rotating edge pool (nil = single fixed edge above)
 	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
@@ -405,21 +404,6 @@ func (b *TCP) SetSNISplit(on bool, pos int, mode string, ttl int) {
 		return
 	}
 	b.sniSplit, b.splitPos, b.sniMode, b.splitTTL = true, pos, mode, ttl
-}
-
-// SetNoSNI (client, ws/xhttp) omits the TLS SNI extension on the handshake to the edge: no server
-// name is sent, so an SNI-matching censor (RST-on-SNI) has nothing to match, while the edge still
-// routes to the origin by the Host header carried INSIDE the encrypted stream (the WebSocket/HTTP
-// upgrade). Because no SNI is sent, the edge serves a default cert that will not match wsHost, so
-// outer-cert verification is disabled — this is safe here because the core's own X25519+AEAD layer
-// (keyed by the PSK) authenticates the peer; the outer TLS is cover only. An alternative to ECH for
-// a CDN that serves without SNI; mutually exclusive with ECH and SNI fragmentation (there is no SNI
-// to encrypt or split). Only meaningful with wss on a client; a no-op otherwise. Call before Run().
-func (b *TCP) SetNoSNI(on bool) {
-	if !b.isClient || !on || !b.ws || !b.wsTLS {
-		return
-	}
-	b.wsNoSNI = true
 }
 
 // fragWrap wraps conn in a ClientHello-splitting fragConn when SNI fragmentation is enabled, else
@@ -853,19 +837,10 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 	healed := false // set once we redial with a fresh RetryConfigList
 	for attempt := 0; attempt < 2; attempt++ {
 		cfg := &tls.Config{ServerName: host}
-		wrapConn := b.fragWrap(conn, host) // split the ClientHello's SNI when enabled
-		if b.wsNoSNI {
-			// Omit the SNI entirely — nothing on the wire for an SNI-matching censor to match. The
-			// edge serves a default cert that won't match host, so skip outer verification (the
-			// core's own X25519+AEAD layer authenticates the peer). ECH/fragmentation don't apply:
-			// there is no SNI to encrypt or split, so bypass fragWrap too.
-			cfg.ServerName = ""
-			cfg.InsecureSkipVerify = true
-			wrapConn = conn
-		} else if len(ech) > 0 {
+		if len(ech) > 0 {
 			cfg.EncryptedClientHelloConfigList = ech
 		}
-		tc := tls.Client(wrapConn, cfg)
+		tc := tls.Client(b.fragWrap(conn, host), cfg) // split the ClientHello's SNI when enabled
 		tc.SetDeadline(time.Now().Add(handshakeTimeout))
 		if err = tc.Handshake(); err == nil {
 			var zero time.Time

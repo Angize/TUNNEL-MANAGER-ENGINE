@@ -142,14 +142,6 @@ type Config struct {
 	// (collateral cost) to stop it. The node fetches this from the domain's HTTPS DNS
 	// record over DoH (ordinary DNS is often poisoned). Empty = no ECH.
 	WSECH string `json:"ws_ech"`
-	// WSNoSNI omits the TLS SNI extension entirely on the wss client handshake: no server name is
-	// sent, so an SNI-matching censor (RST-on-SNI) has nothing to match, while the edge still routes
-	// to the origin by the Host header carried inside the encrypted upgrade. An alternative to ECH
-	// for a CDN that serves without SNI; ws/xhttp client + wss only, and mutually exclusive with
-	// ws_ech and sni_split (there is no SNI to encrypt or fragment). Outer-cert verification is
-	// skipped (the edge's default cert won't match ws_host); the core's own X25519+AEAD layer
-	// authenticates the peer, so the outer TLS is cover only.
-	WSNoSNI bool `json:"ws_no_sni"`
 
 	// WSEdgeIPs / WSEdgeSNIs form a rotation POOL for the ws client: the core cycles
 	// (edge-IP × SNI) combinations so no single IP or domain stays exposed long enough
@@ -404,23 +396,6 @@ func (c *Config) validate() error {
 			}
 			if _, err := base64.StdEncoding.DecodeString(c.WSECH); err != nil {
 				return errors.New("ws_ech is not valid base64")
-			}
-		}
-		// No-SNI omits the SNI extension on the wss client handshake, so it needs wss on a client. It
-		// and ECH both hide the SNI, and there is no SNI left to fragment, so reject those combos and
-		// the rotation pool (whose whole point is cycling SNIs — pointless with none).
-		if c.WSNoSNI {
-			if !c.WSTLS || c.Role != "client" {
-				return errors.New("ws_no_sni requires ws_tls on a client")
-			}
-			if c.WSECH != "" {
-				return errors.New("ws_no_sni cannot be combined with ws_ech (both hide the SNI)")
-			}
-			if c.SNISplit {
-				return errors.New("ws_no_sni cannot be combined with sni_split (no SNI to fragment)")
-			}
-			if len(c.WSEdgeIPs) > 0 {
-				return errors.New("ws_no_sni cannot be combined with a ws edge pool (the pool rotates SNIs)")
 			}
 		}
 		// SNI fragmentation splits the wss ClientHello, so it needs wss on a client. split_pos is a

@@ -252,18 +252,10 @@ func (b *TCP) xhttpEdge() (dialAddr, host string, ech []byte, path string, err e
 }
 
 // xhttpClientTLS builds the client TLS config for the edge: SNI = the fronting host, with ECH
-// when configured. When no-SNI is set the SNI is omitted entirely (the edge routes by the Host
-// header) — the same trade-off as the ws carrier's tlsToEdge, and for the same reason the outer
-// cert is not verified (the core's own X25519+AEAD layer authenticates the peer). xhTLS (test-only)
-// overrides it wholesale.
+// when configured. xhTLS (test-only) overrides it wholesale.
 func (b *TCP) xhttpClientTLS(host string, ech []byte) *tls.Config {
 	if b.xhTLS != nil {
 		return b.xhTLS
-	}
-	if b.wsNoSNI {
-		// Omit the SNI; the edge serves a default cert that won't match host, so skip verification.
-		// No ECH applies (there is no SNI to encrypt); config rejects combining the two anyway.
-		return &tls.Config{ServerName: "", InsecureSkipVerify: true}
 	}
 	cfg := &tls.Config{ServerName: host}
 	if len(ech) > 0 {
