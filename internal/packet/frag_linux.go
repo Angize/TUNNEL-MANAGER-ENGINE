@@ -13,6 +13,11 @@ import (
 // enough to pass the first few hops where a DPI usually sits.
 const disorderTTL = 4
 
+// fakeTTL is the TTL of the injected fake ClientHello in fake mode: a normal value, because the fake
+// is killed at the server by a bad TCP checksum (hop-independent), not by TTL — so it only needs a
+// TTL high enough to reach the on-path DPI, which any normal value satisfies.
+const fakeTTL = 64
+
 // TCP_REPAIR socket options (stable Linux ABI). They let us READ the connection's current send/recv
 // sequence numbers without disturbing it — needed so a fake segment can overlap the real ClientHello
 // at the exact sequence a stateful DPI reassembles on. We only read; we never rewind or write.
@@ -101,11 +106,14 @@ func readSeqs(raw syscall.RawConn) (snd, rcv uint32, ok bool) {
 }
 
 // writeFake injects a fake ClientHello — a copy of the real one with the SNI overwritten by a decoy
-// — as a raw TCP segment at the SAME sequence as the real ClientHello, at a low TTL so it expires
-// before the server. A stateful DPI reassembles the fake (decoy SNI) at that sequence and clears the
-// flow; the server never sees the fake (TTL) and gets the real ClientHello, written normally right
-// after (the socket's sequence is untouched, because the fake goes out via AF_PACKET, not the
-// socket). This defeats a DPI that reassembles the stream — which plain split/disorder do not.
+// — as a raw TCP segment at the SAME sequence as the real ClientHello, carrying a deliberately BAD
+// TCP checksum so the server's stack drops it. A stateful DPI reassembles the fake (decoy SNI) at
+// that sequence and clears the flow; the server discards the fake (bad checksum) and gets the real
+// ClientHello, written normally right after (the socket's sequence is untouched, because the fake
+// goes out via AF_PACKET, not the socket). Killing by checksum instead of a low TTL is
+// hop-independent — it works even when the server is a nearby CDN edge, where no TTL window exists.
+// AF_PACKET SOCK_RAW hands the frame to the driver with CHECKSUM_NONE, so TX offload does not repair
+// the checksum. This defeats a DPI that reassembles the stream — which plain split/disorder do not.
 // IPv4 only (the raw injector builds IPv4); falls back to disorder on IPv6 or when any primitive is
 // unavailable. Needs CAP_NET_RAW + CAP_NET_ADMIN, which the core holds (it runs as root).
 func (f *fragConn) writeFake(p []byte, at int) (int, error) {
@@ -140,13 +148,10 @@ func (f *fragConn) writeFake(p []byte, at int) (int, error) {
 	if i := bytes.Index(fake, []byte(f.host)); i >= 0 {
 		copy(fake[i:i+len(f.host)], decoySNI(len(f.host)))
 	}
-	ttl := f.ttl
-	if ttl <= 0 {
-		ttl = disorderTTL
-	}
 	seg := buildTCPSeg(src, dst, uint16(la.Port), uint16(ra.Port), snd, rcv, tcpPshAck, 0xffff, fake)
-	if ip := buildIP4Ext(src, dst, protoTCP, ttl, false, seg); ip != nil {
-		_ = inj.send(ip) // fake ClientHello at the real sequence, low TTL -> DPI sees it, server won't
+	badTCPChecksum(seg)                                                // the SERVER drops the fake (bad L4 checksum); the DPI still ingests it
+	if ip := buildIP4Ext(src, dst, protoTCP, fakeTTL, false, seg); ip != nil { // normal TTL so the fake reaches the DPI; the checksum, not TTL, kills it before the server
+		_ = inj.send(ip)
 	}
 	return f.Conn.Write(p) // the real ClientHello, whole, at the same sequence (socket untouched)
 }

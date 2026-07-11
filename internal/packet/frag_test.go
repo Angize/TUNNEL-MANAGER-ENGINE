@@ -116,6 +116,16 @@ func TestFragConnFakeFallsBackToSplit(t *testing.T) {
 	}
 }
 
+func TestBadTCPChecksum(t *testing.T) {
+	seg := make([]byte, 20)
+	seg[16], seg[17] = 0x12, 0x34
+	badTCPChecksum(seg)
+	if seg[16] == 0x12 && seg[17] == 0x34 {
+		t.Fatal("badTCPChecksum must change the TCP checksum field so the server drops the fake")
+	}
+	badTCPChecksum([]byte{1, 2, 3}) // too short -> safe no-op, must not panic
+}
+
 func TestDecoySNISameLength(t *testing.T) {
 	for _, n := range []int{0, 1, 5, 19, 40} {
 		if got := len(decoySNI(n)); got != n {

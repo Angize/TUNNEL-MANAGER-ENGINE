@@ -20,10 +20,12 @@ const (
 	// zapret/GoodbyeDPI "disorder" idea — at the cost of one retransmit (~RTO) on connect.
 	sniDisorderMode = "disorder"
 	// sniFakeMode injects a whole FAKE ClientHello (real one with the SNI overwritten by a benign
-	// decoy) as a raw segment at the SAME sequence as the real one, at a low TTL. A reassembling DPI
-	// resolves the overlap to the decoy SNI and clears the flow; the server never sees the fake and
-	// gets the real ClientHello. This is the technique that beats a DPI which reassembles the stream
-	// (which plain split and disorder do not). Linux + IPv4; falls back to disorder otherwise.
+	// decoy) as a raw segment at the SAME sequence as the real one, with a corrupt TCP checksum so
+	// the server drops it. A reassembling DPI resolves the overlap to the decoy SNI and clears the
+	// flow; the server discards the fake (bad checksum) and gets the real ClientHello. Killing by
+	// checksum is hop-independent, so unlike disorder it works even when the server is a nearby CDN
+	// edge. This is the technique that beats a DPI which reassembles the stream (which plain split and
+	// disorder do not). Linux + IPv4; falls back to disorder otherwise.
 	sniFakeMode = "fake"
 )
 
@@ -89,6 +91,21 @@ func (f *fragConn) writeSplit(p []byte, at int) (int, error) {
 	time.Sleep(fragGap)
 	n2, err := f.Conn.Write(p[at:])
 	return n1 + n2, err
+}
+
+// badTCPChecksum corrupts the TCP checksum of an IPv4 TCP segment (the checksum field is bytes 16-17
+// of the TCP header) so the SERVER's stack drops the segment — a hop-distance-independent way to make
+// the fake ClientHello die before the server while an on-path DPI (which usually does not verify the
+// TCP checksum) still ingests it. Routers operate at L3 and never touch the L4 checksum, so a bad TCP
+// checksum survives all the way to the server — unlike a bad IP checksum, which a TTL-decrementing
+// router recomputes and "repairs". This is why fake mode kills its decoy by checksum, not by TTL:
+// TTL needs the fake to die between the DPI and the server, a window that may not exist when the
+// server is a nearby CDN edge.
+func badTCPChecksum(seg []byte) {
+	if len(seg) < 18 {
+		return
+	}
+	seg[16] ^= 0xff // flip the high checksum byte -> guaranteed to differ from the correct checksum
 }
 
 // decoySNI returns n benign hostname bytes to overwrite the real SNI in the fake ClientHello — a
