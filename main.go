@@ -271,6 +271,14 @@ func main() {
 			log.Printf("tnl-core: SNI fragmentation on (mode=%s split_pos=%d ttl=%d)", mode, cfg.SplitPos, cfg.SplitTTL)
 		}
 	}
+	// No-SNI (client, ws/xhttp): omit the SNI extension so an SNI-matching censor has nothing to
+	// match; the edge routes by the encrypted Host header. Only the ws/xhttp carrier implements it.
+	if cfg.Role == "client" && cfg.WSNoSNI {
+		if s, ok := b.(interface{ SetNoSNI(bool) }); ok {
+			s.SetNoSNI(true)
+			log.Printf("tnl-core: no-SNI on (SNI extension omitted; edge routes by Host header)")
+		}
+	}
 	defer b.Close()
 
 	// Clean shutdown removes the TUN (via defers) on SIGINT/SIGTERM.
