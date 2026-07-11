@@ -20,6 +20,10 @@ func (c *captureConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// The embedded net.Conn is nil, so override the addr accessors the fake/disorder paths probe.
+func (c *captureConn) LocalAddr() net.Addr  { return nil }
+func (c *captureConn) RemoteAddr() net.Addr { return nil }
+
 func TestFragConnAutoSplitsInsideHostname(t *testing.T) {
 	cap := &captureConn{}
 	f := newFragConn(cap, "cdn.spacefly.ir", 0, "split", 0) // auto: split in the middle of the hostname
@@ -94,5 +98,31 @@ func TestFragConnDisorderFallsBackToSplit(t *testing.T) {
 	}
 	if got := append(append([]byte{}, cap.writes[0]...), cap.writes[1]...); !bytes.Equal(got, hello) {
 		t.Fatalf("reassembled bytes differ from the original ClientHello")
+	}
+}
+
+func TestFragConnFakeFallsBackToSplit(t *testing.T) {
+	cap := &captureConn{} // no *net.TCPAddr / no raw fd -> fake can't inject, must still split
+	f := newFragConn(cap, "cdn.spacefly.ir", 0, "fake", 4)
+	hello := append([]byte{0x16, 0x03, 0x01}, []byte("xxcdn.spacefly.iryy")...)
+	if _, err := f.Write(hello); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if len(cap.writes) != 2 {
+		t.Fatalf("fake without a real 4-tuple/fd must fall back to a 2-segment split, got %d", len(cap.writes))
+	}
+	if got := append(append([]byte{}, cap.writes[0]...), cap.writes[1]...); !bytes.Equal(got, hello) {
+		t.Fatalf("reassembled bytes differ from the original ClientHello")
+	}
+}
+
+func TestDecoySNISameLength(t *testing.T) {
+	for _, n := range []int{0, 1, 5, 19, 40} {
+		if got := len(decoySNI(n)); got != n {
+			t.Fatalf("decoySNI(%d) len = %d, want %d (must preserve the SNI length field)", n, got, n)
+		}
+	}
+	if bytes.Contains(decoySNI(19), []byte("cdn.spacefly.ir")) {
+		t.Fatal("decoy must not contain the real (blocked) hostname")
 	}
 }

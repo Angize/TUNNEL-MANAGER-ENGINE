@@ -3,14 +3,26 @@
 package packet
 
 import (
+	"bytes"
 	"net"
 	"syscall"
 )
 
-// disorderTTL is the default TTL for a disorder head segment when none is configured: low enough to
-// expire before the server (so the on-path DPI sees an out-of-order ClientHello) yet high enough to
-// pass the first few hops where a DPI usually sits.
+// disorderTTL is the default TTL for a disorder/fake head or decoy segment when none is configured:
+// low enough to expire before the server (so the on-path DPI, not the server, ingests it) yet high
+// enough to pass the first few hops where a DPI usually sits.
 const disorderTTL = 4
+
+// TCP_REPAIR socket options (stable Linux ABI). They let us READ the connection's current send/recv
+// sequence numbers without disturbing it — needed so a fake segment can overlap the real ClientHello
+// at the exact sequence a stateful DPI reassembles on. We only read; we never rewind or write.
+const (
+	optTCPRepair      = 19 // TCP_REPAIR
+	optTCPRepairQueue = 20 // TCP_REPAIR_QUEUE
+	optTCPQueueSeq    = 21 // TCP_QUEUE_SEQ
+	queueRecv         = 1  // TCP_RECV_QUEUE (kernel enum: NO_QUEUE=0, RECV=1, SEND=2)
+	queueSend         = 2  // TCP_SEND_QUEUE
+)
 
 // ttlOpt returns the (level, option) pair for the hop-limit socket option of the connection's
 // address family: IP_TTL for IPv4, IPV6_UNICAST_HOPS for IPv6. Using the IPv4 pair on an AF_INET6
@@ -60,4 +72,81 @@ func (f *fragConn) writeDisorder(p []byte, at int) (int, error) {
 	}
 	n2, werr := f.Conn.Write(p[at:])
 	return n1 + n2, werr
+}
+
+// readSeqs briefly enters TCP_REPAIR mode on the (idle, established) socket at the ClientHello point
+// to read the send and receive sequence numbers, then leaves it. Returns ok=false if any step
+// fails. Read-only: it never changes a queue's contents or sequence, so it does not disturb the
+// connection (this is the CRIU checkpoint path, done here on a connection with no in-flight data).
+func readSeqs(raw syscall.RawConn) (snd, rcv uint32, ok bool) {
+	_ = raw.Control(func(fd uintptr) {
+		f := int(fd)
+		if syscall.SetsockoptInt(f, syscall.IPPROTO_TCP, optTCPRepair, 1) != nil {
+			return
+		}
+		defer syscall.SetsockoptInt(f, syscall.IPPROTO_TCP, optTCPRepair, 0)
+		if syscall.SetsockoptInt(f, syscall.IPPROTO_TCP, optTCPRepairQueue, queueSend) != nil {
+			return
+		}
+		s, e1 := syscall.GetsockoptInt(f, syscall.IPPROTO_TCP, optTCPQueueSeq)
+		if syscall.SetsockoptInt(f, syscall.IPPROTO_TCP, optTCPRepairQueue, queueRecv) != nil {
+			return
+		}
+		r, e2 := syscall.GetsockoptInt(f, syscall.IPPROTO_TCP, optTCPQueueSeq)
+		if e1 == nil && e2 == nil {
+			snd, rcv, ok = uint32(s), uint32(r), true
+		}
+	})
+	return
+}
+
+// writeFake injects a fake ClientHello — a copy of the real one with the SNI overwritten by a decoy
+// — as a raw TCP segment at the SAME sequence as the real ClientHello, at a low TTL so it expires
+// before the server. A stateful DPI reassembles the fake (decoy SNI) at that sequence and clears the
+// flow; the server never sees the fake (TTL) and gets the real ClientHello, written normally right
+// after (the socket's sequence is untouched, because the fake goes out via AF_PACKET, not the
+// socket). This defeats a DPI that reassembles the stream — which plain split/disorder do not.
+// IPv4 only (the raw injector builds IPv4); falls back to disorder on IPv6 or when any primitive is
+// unavailable. Needs CAP_NET_RAW + CAP_NET_ADMIN, which the core holds (it runs as root).
+func (f *fragConn) writeFake(p []byte, at int) (int, error) {
+	la, ok1 := f.Conn.LocalAddr().(*net.TCPAddr)
+	ra, ok2 := f.Conn.RemoteAddr().(*net.TCPAddr)
+	if !ok1 || !ok2 {
+		return f.writeDisorder(p, at)
+	}
+	src, dst := la.IP.To4(), ra.IP.To4()
+	if src == nil || dst == nil { // IPv6 -> the raw injector can't build it; disorder is the next best
+		return f.writeDisorder(p, at)
+	}
+	sc, ok := f.Conn.(syscall.Conn)
+	if !ok {
+		return f.writeDisorder(p, at)
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return f.writeDisorder(p, at)
+	}
+	snd, rcv, ok := readSeqs(raw)
+	if !ok {
+		return f.writeDisorder(p, at)
+	}
+	inj, err := newL2Inject(ra.IP)
+	if err != nil {
+		return f.writeDisorder(p, at)
+	}
+	defer inj.close()
+	fake := make([]byte, len(p))
+	copy(fake, p)
+	if i := bytes.Index(fake, []byte(f.host)); i >= 0 {
+		copy(fake[i:i+len(f.host)], decoySNI(len(f.host)))
+	}
+	ttl := f.ttl
+	if ttl <= 0 {
+		ttl = disorderTTL
+	}
+	seg := buildTCPSeg(src, dst, uint16(la.Port), uint16(ra.Port), snd, rcv, tcpPshAck, 0xffff, fake)
+	if ip := buildIP4Ext(src, dst, protoTCP, ttl, false, seg); ip != nil {
+		_ = inj.send(ip) // fake ClientHello at the real sequence, low TTL -> DPI sees it, server won't
+	}
+	return f.Conn.Write(p) // the real ClientHello, whole, at the same sequence (socket untouched)
 }
