@@ -114,6 +114,12 @@ type Config struct {
 	// middle of the cleartext hostname; naturally a no-op under ECH, where the SNI is encrypted).
 	SNISplit bool `json:"sni_split"`
 	SplitPos int  `json:"split_pos"`
+	// SNIMode picks how the split is sent: "split" (default) = two in-order segments; "disorder"
+	// additionally sends the head segment at a low TTL (SplitTTL) so it expires in transit and a
+	// reassembling DPI sees the ClientHello out of order, while the kernel retransmits it so the
+	// server still gets the real bytes. SplitTTL is the disorder head TTL (0 = default).
+	SNIMode  string `json:"sni_mode"`
+	SplitTTL int    `json:"split_ttl"`
 	// WSXHTTP switches the ws carrier from a WebSocket upgrade to the xhttp mode (a
 	// GET-down + POST-up HTTP request pair), which passes CDNs that block WebSocket.
 	// Same fronting fields (ws_host/ws_tls/ws_ech/ws_path). Not combined with the pool.
@@ -401,6 +407,14 @@ func (c *Config) validate() error {
 			}
 			if c.SplitPos < 0 || c.SplitPos > 1400 {
 				return errors.New("split_pos must be between 0 and 1400")
+			}
+			switch c.SNIMode {
+			case "", "split", "disorder":
+			default:
+				return errors.New("sni_mode must be \"split\" or \"disorder\"")
+			}
+			if c.SplitTTL < 0 || c.SplitTTL > 255 {
+				return errors.New("split_ttl must be between 0 and 255")
 			}
 		}
 		// xhttp upstream style: packet-up (default) or grpc ("stream" is a legacy alias for

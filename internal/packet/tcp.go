@@ -305,8 +305,10 @@ type TCP struct {
 	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
 	st     *coreStatus   // client + single-edge ws/xhttp: self-heal event ring -> status file (nil = off / pool / server)
 
-	sniSplit bool // client ws/xhttp: split the ClientHello so the cleartext SNI crosses a TCP segment boundary
-	splitPos int  // explicit split offset into the ClientHello (0 = auto: middle of the hostname)
+	sniSplit bool   // client ws/xhttp: split the ClientHello so the cleartext SNI crosses a TCP segment boundary
+	splitPos int    // explicit split offset into the ClientHello (0 = auto: middle of the hostname)
+	sniMode  string // "split" (in-order) | "disorder" (low-TTL head, desyncs a reassembling DPI)
+	splitTTL int    // disorder head-segment TTL (0 = default)
 
 	// probeFn lets tests substitute a deterministic reachability oracle for probeEdge (which
 	// does a real TCP+TLS dial). nil in production -> the differential prober uses probeEdge.
@@ -397,18 +399,18 @@ func (b *TCP) SetDesync(on bool, ttl, count int, mode string) {
 // DPI. pos is the split offset into the ClientHello (0 = auto: the middle of the hostname). Only
 // meaningful with wss; a no-op on the server or a non-ws carrier. main wires it via the shared
 // SetSNISplit type assertion. Call before Run().
-func (b *TCP) SetSNISplit(on bool, pos int) {
+func (b *TCP) SetSNISplit(on bool, pos int, mode string, ttl int) {
 	if !b.isClient || !on || !b.ws {
 		return
 	}
-	b.sniSplit, b.splitPos = true, pos
+	b.sniSplit, b.splitPos, b.sniMode, b.splitTTL = true, pos, mode, ttl
 }
 
 // fragWrap wraps conn in a ClientHello-splitting fragConn when SNI fragmentation is enabled, else
 // returns conn unchanged. host is the SNI, used for auto split-point location.
 func (b *TCP) fragWrap(conn net.Conn, host string) net.Conn {
 	if b.sniSplit {
-		return newFragConn(conn, host, b.splitPos)
+		return newFragConn(conn, host, b.splitPos, b.sniMode, b.splitTTL)
 	}
 	return conn
 }

@@ -260,9 +260,15 @@ func main() {
 	// SNI fragmentation (client, ws/xhttp): split the wss ClientHello so the cleartext SNI crosses a
 	// TCP segment boundary. Only the ws/xhttp carrier implements it; others ignore this.
 	if cfg.Role == "client" && cfg.SNISplit {
-		if s, ok := b.(interface{ SetSNISplit(bool, int) }); ok {
-			s.SetSNISplit(true, cfg.SplitPos)
-			log.Printf("tnl-core: SNI fragmentation on (split_pos=%d)", cfg.SplitPos)
+		if s, ok := b.(interface {
+			SetSNISplit(bool, int, string, int)
+		}); ok {
+			mode := cfg.SNIMode
+			if mode == "" {
+				mode = "split"
+			}
+			s.SetSNISplit(true, cfg.SplitPos, mode, cfg.SplitTTL)
+			log.Printf("tnl-core: SNI fragmentation on (mode=%s split_pos=%d ttl=%d)", mode, cfg.SplitPos, cfg.SplitTTL)
 		}
 	}
 	defer b.Close()
