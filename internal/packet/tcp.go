@@ -525,6 +525,30 @@ func idleFor(keepalive time.Duration) time.Duration {
 	return d
 }
 
+// deadWindow resolves the per-tunnel dead-detection window: the operator's explicit dead_after_secs when
+// set (clamped to >=2×keepalive so a healthy pinging link is never mis-reaped between pongs), else def.
+// Shared by every carrier so one config knob tunes self-heal speed uniformly.
+func deadWindow(keepalive time.Duration, deadAfterSecs int, def time.Duration) time.Duration {
+	if deadAfterSecs <= 0 {
+		return def
+	}
+	d := time.Duration(deadAfterSecs) * time.Second
+	if floor := 2 * keepalive; d < floor {
+		d = floor
+	}
+	return d
+}
+
+// SetDeadAfter (client) tightens the carrier's dead-detection read-deadline to the per-tunnel
+// dead_after_secs, so the tunnel self-heals faster than the default (~3×keepalive ping-loss / 60s idle
+// backstop). No-op for secs<=0. Call before Run.
+func (b *TCP) SetDeadAfter(secs int) {
+	if secs <= 0 {
+		return
+	}
+	b.idle = deadWindow(b.keepalive, secs, b.idle)
+}
+
 // DialTCP (client role) targets peerAddr and reconnects on drop. When cover is
 // set the connection is wrapped in a Chrome-fingerprinted TLS session presenting
 // coverSNI, so it looks like HTTPS on the wire.
@@ -950,7 +974,7 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 		var echErr *utls.ECHRejectionError
 		if attempt == 0 && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
 			ech = echErr.RetryConfigList // stale ECH key: redial and retry with the fresh one
-			log.Printf("core/ws: ECH self-heal for %s (%s) — stale key rejected, retrying with fresh key %s",
+			log.Printf("core/ws: ECH-SELFHEAL[reactive/in-band] for %s (%s) — stale key rejected, retrying with fresh key %s",
 				host, dialAddr, base64.StdEncoding.EncodeToString(ech))
 			healed = true
 			if conn, err = b.dialer(10*time.Second).Dial("tcp", dialAddr); err != nil {

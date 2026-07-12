@@ -36,14 +36,15 @@ import (
 // Flux carries L3 packets between a TUN device and a peer over a raw IPv4 carrier
 // whose protocol number rotates every epoch.
 type Flux struct {
-	dev       *tun.Device
-	keepalive time.Duration
-	rotate    time.Duration
-	obfs      bool
-	cryptoOn  bool
-	psk       string
-	cipher    string
-	isClient  bool
+	dev           *tun.Device
+	keepalive     time.Duration
+	deadAfterSecs int // per-tunnel self-heal deadline override (0 = default 3×keepalive/10s floor)
+	rotate        time.Duration
+	obfs          bool
+	cryptoOn      bool
+	psk           string
+	cipher        string
+	isClient      bool
 
 	carrier     string // "raw" (rotate IP protocol) | "udp" (proto 17, rotate ports) | "stun" (udp + STUN header, WebRTC-shaped)
 	shapeProf   string // statistical shape profile: "quic" | "video" | "webrtc" | "random"
@@ -80,6 +81,14 @@ type Flux struct {
 	st *coreStatus // client-only: precise self-heal event ring written to the status file (nil = off)
 	pp *PeerPool   // client-only: destination-IP rotation pool (nil = single fixed peer, no rotation)
 	sp *PeerPool   // client-only: source-IP rotation pool (nil = single fixed source; swaps the crafted header src)
+}
+
+// SetDeadAfter (client) tightens the session-stale deadline to the per-tunnel dead_after_secs so the
+// tunnel re-handshakes faster than the default (3×keepalive). No-op for secs<=0. Call before Run.
+func (f *Flux) SetDeadAfter(secs int) {
+	if secs > 0 {
+		f.deadAfterSecs = secs
+	}
 }
 
 // SetStatusPath (client, optional) wires a status-file event ring so self-heal re-handshakes and
@@ -763,10 +772,11 @@ func (f *Flux) sessionStale() bool {
 	if last == 0 {
 		return false
 	}
-	w := 3 * f.keepalive
-	if w < 10*time.Second {
-		w = 10 * time.Second
+	def := 3 * f.keepalive
+	if def < 10*time.Second {
+		def = 10 * time.Second
 	}
+	w := deadWindow(f.keepalive, f.deadAfterSecs, def) // per-tunnel override tightens the self-heal deadline
 	return time.Since(time.Unix(0, last)) > w
 }
 

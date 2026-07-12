@@ -32,16 +32,17 @@ import (
 
 // Raw carries L3 packets between a TUN device and a peer over a raw IPv4 socket.
 type Raw struct {
-	conn      *net.IPConn
-	dev       *tun.Device
-	keepalive time.Duration
-	obfs      bool
-	cryptoOn  bool
-	psk       string
-	cipher    string
-	profile   string
-	isClient  bool
-	icmpID    uint16 // per-process ICMP echo identifier (receiver ignores it)
+	conn          *net.IPConn
+	dev           *tun.Device
+	keepalive     time.Duration
+	deadAfterSecs int // per-tunnel self-heal deadline override (0 = default 3×keepalive/10s floor)
+	obfs          bool
+	cryptoOn      bool
+	psk           string
+	cipher        string
+	profile       string
+	isClient      bool
+	icmpID        uint16 // per-process ICMP echo identifier (receiver ignores it)
 
 	// IP spoofing. spoofFd is a SOCK_RAW+IP_HDRINCL socket used to build the whole IPv4
 	// header ourselves, so any of the outer addresses can be forged:
@@ -96,6 +97,14 @@ type Raw struct {
 	st *coreStatus // client-only: precise self-heal event ring written to the status file (nil = off)
 	pp *PeerPool   // client-only: destination-IP rotation pool (nil = single fixed peer, no rotation)
 	sp *PeerPool   // client-only: source-IP rotation pool (nil = fixed source; ignored under spoofSrc)
+}
+
+// SetDeadAfter (client) tightens the session-stale deadline to the per-tunnel dead_after_secs so the
+// tunnel re-handshakes faster than the default (3×keepalive). No-op for secs<=0. Call before Run.
+func (r *Raw) SetDeadAfter(secs int) {
+	if secs > 0 {
+		r.deadAfterSecs = secs
+	}
 }
 
 // SetStatusPath (client, optional) wires a status-file event ring so self-heal re-handshakes and
@@ -875,10 +884,11 @@ func (r *Raw) sessionStale() bool {
 	if last == 0 {
 		return false
 	}
-	w := 3 * r.keepalive
-	if w < 10*time.Second {
-		w = 10 * time.Second
+	def := 3 * r.keepalive
+	if def < 10*time.Second {
+		def = 10 * time.Second
 	}
+	w := deadWindow(r.keepalive, r.deadAfterSecs, def) // per-tunnel override tightens the self-heal deadline
 	return time.Since(time.Unix(0, last)) > w
 }
 
