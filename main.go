@@ -271,6 +271,18 @@ func main() {
 			log.Printf("tnl-core: SNI fragmentation on (mode=%s split_pos=%d ttl=%d)", mode, cfg.SplitPos, cfg.SplitTTL)
 		}
 	}
+	// Destination rotation pool (client, direct transports udp/tcp/raw/flux): cycle the peer IPs and
+	// burn a blocked one so a single filtered server IP doesn't kill the tunnel — the direct-transport
+	// analogue of the ws edge pool. Only the direct carriers implement SetPeerPool; ws (its own edge
+	// pool) and the server ignore it. Needs >=2 endpoints to actually rotate (config allows fewer only
+	// as the degenerate single-peer case, which never moves).
+	if cfg.Role == "client" && len(cfg.PeerIPs) >= 2 {
+		if s, ok := b.(interface{ SetPeerPool(*packet.PeerPool) }); ok {
+			pp := packet.NewPeerPool(cfg.PeerIPs, cfg.PeerAutoBurn, time.Duration(cfg.PeerRotateSecs)*time.Second, cfg.PeerStatusPath)
+			s.SetPeerPool(pp)
+			log.Printf("tnl-core: destination pool: %d peers rotate=%ds auto_burn=%v", len(cfg.PeerIPs), cfg.PeerRotateSecs, cfg.PeerAutoBurn)
+		}
+	}
 	defer b.Close()
 
 	// Clean shutdown removes the TUN (via defers) on SIGINT/SIGTERM.

@@ -78,6 +78,7 @@ type Flux struct {
 	closeOnce sync.Once
 
 	st *coreStatus // client-only: precise self-heal event ring written to the status file (nil = off)
+	pp *PeerPool   // client-only: destination-IP rotation pool (nil = single fixed peer, no rotation)
 }
 
 // SetStatusPath (client, optional) wires a status-file event ring so self-heal re-handshakes and
@@ -763,7 +764,49 @@ func (f *Flux) sessionStale() bool {
 	return time.Since(time.Unix(0, last)) > w
 }
 
+// SetPeerPool (client) wires a destination-IP rotation pool: a peer whose handshake never completes
+// is burned and the client re-points at the next live endpoint (a proactive timer also rotates).
+// nil / single-endpoint = no rotation. main wires it via the shared SetPeerPool type assertion.
+func (f *Flux) SetPeerPool(pp *PeerPool) {
+	if f.isClient {
+		f.pp = pp
+	}
+}
+
+// rotatePeerFlux points the client at the next pool endpoint (burn+advance, or a timed rotate) and
+// clears the session so the next loop re-handshakes against the new destination. No-op when the pool
+// did not move or the endpoint is not a valid IPv4 (flux is IPv4-only).
+func (f *Flux) rotatePeerFlux(proactive bool) {
+	if f.pp == nil {
+		return
+	}
+	var addr string
+	var moved bool
+	if proactive {
+		addr, moved = f.pp.rotateOnce()
+	} else {
+		addr, moved = f.pp.fail()
+	}
+	if !moved {
+		return
+	}
+	ip := parseIP4(hostOnly(addr))
+	if ip == nil {
+		return
+	}
+	f.peer.Store(&net.IPAddr{IP: ip})
+	f.session.Store(nil)
+	f.ci.Store(nil)
+	log.Printf("flux: rotated destination to %s", addr)
+	f.st.down("peer-rotate", "flux")
+}
+
 func (f *Flux) clientLoop() {
+	failN := 0
+	var rotateAt time.Time
+	if f.pp != nil && f.pp.rotate > 0 {
+		rotateAt = time.Now().Add(f.pp.rotate)
+	}
 	for {
 		if f.cryptoOn && f.sealer() != nil && f.sessionStale() {
 			f.session.Store(nil)
@@ -773,8 +816,20 @@ func (f *Flux) clientLoop() {
 		}
 		if f.cryptoOn && f.sealer() == nil {
 			f.sendInit()
+			if failN++; f.pp != nil && failN >= peerFailThreshold {
+				f.rotatePeerFlux(false)
+				failN = 0
+			}
 		} else {
+			if failN > 0 && f.pp != nil {
+				f.pp.succeeded()
+			}
+			failN = 0
 			f.send(typePing, nil, f.peer.Load())
+			if f.pp != nil && !rotateAt.IsZero() && time.Now().After(rotateAt) {
+				f.rotatePeerFlux(true)
+				rotateAt = time.Now().Add(f.pp.rotate)
+			}
 		}
 		wait := jitter(f.keepalive)
 		if f.cryptoOn && f.sealer() == nil {

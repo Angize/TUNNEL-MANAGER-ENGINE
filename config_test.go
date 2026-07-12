@@ -137,3 +137,95 @@ func TestWSPoolNoHost(t *testing.T) {
 		t.Error("single-edge wss client without ws_host was accepted")
 	}
 }
+
+// validUDP is a minimal valid udp-transport client config to mutate in peer-pool tests.
+func validUDP() *Config {
+	return &Config{
+		Role: "client", Mode: "packet", Profile: "core", Transport: "udp",
+		Peer: "203.0.113.9:9000", TunAddr: "10.200.0.2/24",
+		Crypto: CryptoCfg{Enabled: true, PSK: "a-sufficiently-long-preshared-key"},
+	}
+}
+
+func TestPeerPoolUDPValidAndSeedsPeer(t *testing.T) {
+	c := validUDP()
+	c.Peer = "" // the pool alone must satisfy the client "peer" requirement
+	c.PeerIPs = []string{"203.0.113.9:9000", "198.51.100.7:9000"}
+	if err := c.validate(); err != nil {
+		t.Fatalf("valid udp peer pool rejected: %v", err)
+	}
+	c.applyDefaults()
+	if c.Peer != "203.0.113.9:9000" {
+		t.Errorf("applyDefaults should seed peer from the first pool entry, got %q", c.Peer)
+	}
+	// The pool is authoritative: a Peer that disagrees with PeerIPs[0] must be OVERRIDDEN to the
+	// pool's starting endpoint, so the initial dial and the pool's cur=0 can't desync.
+	c = validUDP()
+	c.Peer = "198.51.100.7:9000" // deliberately != PeerIPs[0]
+	c.PeerIPs = []string{"203.0.113.9:9000", "198.51.100.7:9000"}
+	c.applyDefaults()
+	if c.Peer != "203.0.113.9:9000" {
+		t.Errorf("pool must override a mismatched peer to PeerIPs[0], got %q", c.Peer)
+	}
+}
+
+func TestPeerPoolUDPEntryNeedsPort(t *testing.T) {
+	c := validUDP()
+	c.PeerIPs = []string{"203.0.113.9", "198.51.100.7:9000"} // first entry missing the port
+	if err := c.validate(); err == nil {
+		t.Error("udp peer_ips entry without a port was accepted")
+	}
+}
+
+func TestPeerPoolUDPRejectsHostname(t *testing.T) {
+	c := validUDP()
+	c.PeerIPs = []string{"cdn.example.com:9000"} // the pool dials IPs directly, no DNS
+	if err := c.validate(); err == nil {
+		t.Error("udp peer_ips entry with a hostname was accepted")
+	}
+}
+
+func TestPeerPoolRawAcceptsBareIPRejectsV6(t *testing.T) {
+	c := validRaw()
+	c.PeerIPs = []string{"203.0.113.9", "198.51.100.7"} // raw addresses a bare IPv4
+	if err := c.validate(); err != nil {
+		t.Fatalf("valid raw peer pool (bare IPv4) rejected: %v", err)
+	}
+	// raw/flux are IPv4-only (parseIP4 rejects v6) — an IPv6 entry must be a clean config error,
+	// not a silently-skipped endpoint at rotation time.
+	c = validRaw()
+	c.PeerIPs = []string{"2001:db8::1"}
+	if err := c.validate(); err == nil {
+		t.Error("raw peer_ips entry with an IPv6 address was accepted")
+	}
+}
+
+func TestPeerPoolRejectedOnWSAndServer(t *testing.T) {
+	// ws has its own edge pool; peer_ips is meaningless there.
+	c := &Config{
+		Role: "client", Mode: "packet", Profile: "core", Transport: "ws",
+		Peer: "203.0.113.9", TunAddr: "10.200.0.2/24", WSTLS: true, WSHost: "cdn.example.com",
+		Crypto:  CryptoCfg{Enabled: true, PSK: "a-sufficiently-long-preshared-key"},
+		PeerIPs: []string{"203.0.113.9:443", "198.51.100.7:443"},
+	}
+	if err := c.validate(); err == nil {
+		t.Error("peer_ips on the ws transport was accepted")
+	}
+	// A server listens; it never dials a pool.
+	c = validUDP()
+	c.Role = "server"
+	c.Listen = "0.0.0.0:9000"
+	c.PeerIPs = []string{"203.0.113.9:9000", "198.51.100.7:9000"}
+	if err := c.validate(); err == nil {
+		t.Error("peer_ips on a server was accepted")
+	}
+}
+
+func TestPeerRotateSecsNonNegative(t *testing.T) {
+	c := validUDP()
+	c.PeerIPs = []string{"203.0.113.9:9000", "198.51.100.7:9000"}
+	c.PeerRotateSecs = -5
+	if err := c.validate(); err == nil {
+		t.Error("negative peer_rotate_secs was accepted")
+	}
+}

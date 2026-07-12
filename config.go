@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"strconv"
 )
 
 // CryptoCfg controls confidentiality on the wire. When Enabled is false the
@@ -68,6 +69,19 @@ type Config struct {
 
 	Listen string `json:"listen"` // server: bind address, e.g. "0.0.0.0:9000"
 	Peer   string `json:"peer"`   // client: server address, e.g. "1.2.3.4:9000"
+	// PeerIPs is a rotation pool of DESTINATION endpoints for the direct transports (tcp/udp/raw/
+	// flux): the client cycles them and burns a blocked one, so a single blocked server IP doesn't
+	// kill the tunnel (the direct-transport analogue of the ws edge pool). When it has >1 entry it
+	// overrides the single Peer; each entry is "ip:port" for udp/tcp or "ip" for raw/flux (the port
+	// is ignored there). PeerRotateSecs is the proactive rotation interval (0 = rotate only on a
+	// dead peer); PeerAutoBurn drops a peer whose handshake never completes (the burn signal is a
+	// stalled handshake, so on a crypto-off udp pool — which has no handshake — only PeerRotateSecs
+	// applies and auto-burn is inert; raw/flux/tcp always have a liveness signal). PeerStatusPath is
+	// the status file the node exposes to the panel (which endpoint is active / burned).
+	PeerIPs        []string `json:"peer_ips"`
+	PeerRotateSecs int      `json:"peer_rotate_secs"`
+	PeerAutoBurn   bool     `json:"peer_auto_burn"`
+	PeerStatusPath string   `json:"peer_status_path"`
 	// BindIP is the source IP the client dials FROM (its own node IP). On a host with
 	// several IPs the kernel would otherwise egress from the primary IP; binding pins the
 	// outbound socket to this node's registered IP so the peer/CDN sees the expected source.
@@ -267,6 +281,15 @@ func (c *Config) applyDefaults() {
 	if c.Transport == "" {
 		c.Transport = "udp"
 	}
+	// A destination rotation pool OWNS the dial target: seed the single Peer from the pool's first
+	// entry so the initial datagram dial (cfg.Peer) and the pool's starting endpoint (cur=0) always
+	// agree — otherwise a fail() at cur=0 would burn the wrong entry and the mismatched Peer would be
+	// dropped on the first rotation. The pool is authoritative, so this overrides any Peer the caller
+	// also set. A bare-IP first entry is fine for raw/flux (they ignore the port) and "ip:port" for
+	// udp/tcp; both were validated. It also satisfies the client-role "peer" check for a pool-only cfg.
+	if len(c.PeerIPs) > 0 {
+		c.Peer = c.PeerIPs[0]
+	}
 	if c.Transport == "raw" && c.RawProfile == "" {
 		c.RawProfile = "bip"
 	}
@@ -309,6 +332,35 @@ var rawProfiles = map[string]bool{
 	"bip": true, "ipip": true, "gre": true, "icmp": true, "udp": true, "tcp": true,
 }
 
+// validatePeerEndpoint checks one rotation-pool entry. The pool swaps the destination with no DNS
+// step, so every entry must be a literal IP. The stream/datagram carriers (udp/tcp) dial "ip:port"
+// (needPort), so the host must be an IP and the port a valid number; the raw/flux carriers address a
+// bare IPv4 (the core builds the IP header and resolves via parseIP4, which rejects IPv6 and names),
+// so those entries must be IPv4 — an accidental ":port" there is tolerated and dropped at dial.
+func validatePeerEndpoint(e string, needPort bool) error {
+	if needPort {
+		host, port, err := net.SplitHostPort(e)
+		if err != nil {
+			return errors.New("peer_ips entry " + strconv.Quote(e) + " must be \"ip:port\"")
+		}
+		if net.ParseIP(host) == nil {
+			return errors.New("peer_ips entry " + strconv.Quote(e) + " has a non-IP host (the pool dials IPs directly, no DNS)")
+		}
+		if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+			return errors.New("peer_ips entry " + strconv.Quote(e) + " has an invalid port")
+		}
+		return nil
+	}
+	host := e
+	if h, _, err := net.SplitHostPort(e); err == nil { // tolerate an accidental ip:port on raw/flux
+		host = h
+	}
+	if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
+		return errors.New("peer_ips entry " + strconv.Quote(e) + " must be an IPv4 address (raw/flux are IPv4-only)")
+	}
+	return nil
+}
+
 func (c *Config) validate() error {
 	if c.Mode != "packet" {
 		return errors.New("mode must be \"packet\" in this build")
@@ -322,8 +374,8 @@ func (c *Config) validate() error {
 			return errors.New("server role requires \"listen\"")
 		}
 	case "client":
-		if c.Peer == "" {
-			return errors.New("client role requires \"peer\"")
+		if c.Peer == "" && len(c.PeerIPs) == 0 {
+			return errors.New("client role requires \"peer\" (or a peer_ips rotation pool)")
 		}
 	default:
 		return errors.New("role must be \"server\" or \"client\"")
@@ -449,6 +501,32 @@ func (c *Config) validate() error {
 		}
 	default:
 		return errors.New("transport must be \"udp\", \"tcp\", \"raw\", \"flux\", or \"ws\"")
+	}
+	// PeerIPs is the DESTINATION rotation pool for the direct transports. It is a client-side
+	// dial-layer feature: a server listens (it does not dial), and ws has its own edge pool, so
+	// the pool is meaningless there. Each entry must be a literal IP the pool can swap to with no
+	// DNS step — "ip:port" for the stream/datagram carriers (udp/tcp), a bare IPv4 for raw/flux
+	// (which address the peer by IP; any port is ignored). The single Peer is still allowed
+	// alongside it (applyDefaults seeds Peer from the first pool entry when only the pool is set).
+	if len(c.PeerIPs) > 0 {
+		if c.Role != "client" {
+			return errors.New("peer_ips is a client rotation pool (a server listens, it does not dial)")
+		}
+		switch c.Transport {
+		case "", "udp", "tcp", "raw", "flux":
+		default:
+			return errors.New("peer_ips is only for the direct transports (udp, tcp, raw, flux) — ws has its own edge pool")
+		}
+		// udp/tcp dial "ip:port"; raw/flux address a bare IPv4 (parseIP4 rejects v6 and a hostname).
+		needPort := c.Transport != "raw" && c.Transport != "flux"
+		for _, e := range c.PeerIPs {
+			if err := validatePeerEndpoint(e, needPort); err != nil {
+				return err
+			}
+		}
+	}
+	if c.PeerRotateSecs < 0 {
+		return errors.New("peer_rotate_secs must be >= 0 (0 = rotate only on a dead peer)")
 	}
 	if c.TunAddr == "" {
 		return errors.New("tun_addr is required")

@@ -83,6 +83,50 @@ type UDP struct {
 	closeOnce sync.Once
 
 	st *coreStatus // client-only: precise self-heal event ring written to the status file (nil = off)
+	pp *PeerPool   // client-only: destination-IP rotation pool (nil = single fixed peer, no rotation)
+}
+
+// SetPeerPool (client, direct transports) wires a destination-IP rotation pool: when the current
+// peer looks dead (its handshake never completes) the client burns it and re-points at the next
+// live endpoint, and a proactive timer also rotates. nil / single-endpoint pool = no rotation. main
+// wires it via the shared SetPeerPool type assertion. Call before Run().
+func (b *UDP) SetPeerPool(pp *PeerPool) {
+	if b.isClient {
+		b.pp = pp
+	}
+}
+
+// peerFailThreshold is how many ~1s handshake retransmits with no session go by before the client
+// concludes the current peer is dead and rotates to the next pool endpoint (crypto on). Long enough
+// to ride out a slow handshake / brief loss, short enough to fail over from a blocked IP quickly.
+const peerFailThreshold = 12
+
+// rotatePeerUDP points the client at the next pool endpoint: burn+advance (proactive=false) or a
+// timed rotate (proactive=true). It resolves the endpoint and swaps b.peer, then clears the session
+// so the next loop re-handshakes against the new destination. No-op when the pool did not move.
+func (b *UDP) rotatePeerUDP(proactive bool) {
+	if b.pp == nil {
+		return
+	}
+	var addr string
+	var moved bool
+	if proactive {
+		addr, moved = b.pp.rotateOnce()
+	} else {
+		addr, moved = b.pp.fail()
+	}
+	if !moved {
+		return
+	}
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil || ua == nil {
+		return
+	}
+	b.peer.Store(ua)
+	b.session.Store(nil) // force a fresh handshake to the new destination
+	b.ci.Store(nil)
+	log.Printf("core/udp: rotated destination to %s", addr)
+	b.st.down("peer-rotate", "udp")
 }
 
 // SetStatusPath (client, optional) wires a status-file event ring so self-heal re-handshakes and
@@ -418,6 +462,11 @@ func (b *UDP) dispatch(typ byte, payload []byte, addr *net.UDPAddr) {
 // until a session exists, then pings on a jittered interval. If the session is
 // lost it starts a new handshake.
 func (b *UDP) clientLoop() {
+	failN := 0 // consecutive handshake retransmits with no session -> the peer may be dead
+	var rotateAt time.Time
+	if b.pp != nil && b.pp.rotate > 0 {
+		rotateAt = time.Now().Add(b.pp.rotate)
+	}
 	for {
 		if b.cryptoOn && b.sealer() != nil && b.sessionStale() {
 			b.session.Store(nil) // server likely restarted — drop the dead session so we re-handshake
@@ -427,8 +476,20 @@ func (b *UDP) clientLoop() {
 		}
 		if b.sealer() == nil && b.cryptoOn {
 			b.sendInit()
+			if failN++; b.pp != nil && failN >= peerFailThreshold {
+				b.rotatePeerUDP(false) // current destination won't handshake -> burn + rotate to the next IP
+				failN = 0
+			}
 		} else {
+			if failN > 0 && b.pp != nil {
+				b.pp.succeeded() // the active endpoint handshaked — clear any transient burn on it
+			}
+			failN = 0
 			b.send(typePing, nil, b.peer.Load())
+			if b.pp != nil && !rotateAt.IsZero() && time.Now().After(rotateAt) {
+				b.rotatePeerUDP(true) // proactive rotation (moving target)
+				rotateAt = time.Now().Add(b.pp.rotate)
+			}
 		}
 		wait := b.keepalive
 		if b.sealer() == nil && b.cryptoOn {

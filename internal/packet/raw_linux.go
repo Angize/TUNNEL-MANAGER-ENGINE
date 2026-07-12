@@ -94,6 +94,7 @@ type Raw struct {
 	closeOnce sync.Once
 
 	st *coreStatus // client-only: precise self-heal event ring written to the status file (nil = off)
+	pp *PeerPool   // client-only: destination-IP rotation pool (nil = single fixed peer, no rotation)
 }
 
 // SetStatusPath (client, optional) wires a status-file event ring so self-heal re-handshakes and
@@ -877,7 +878,50 @@ func (r *Raw) sessionStale() bool {
 	return time.Since(time.Unix(0, last)) > w
 }
 
+// SetPeerPool (client) wires a destination-IP rotation pool: a peer whose handshake never completes
+// is burned and the client re-points at the next live endpoint (a proactive timer also rotates).
+// nil / single-endpoint = no rotation. Rotates only the DESTINATION; a spoofed source (bip) is
+// unaffected. main wires it via the shared SetPeerPool type assertion.
+func (r *Raw) SetPeerPool(pp *PeerPool) {
+	if r.isClient {
+		r.pp = pp
+	}
+}
+
+// rotatePeerRaw points the client at the next pool endpoint and clears the session so the next loop
+// re-handshakes against the new destination. No-op when the pool did not move or the endpoint is not
+// valid IPv4 (raw is IPv4-only).
+func (r *Raw) rotatePeerRaw(proactive bool) {
+	if r.pp == nil {
+		return
+	}
+	var addr string
+	var moved bool
+	if proactive {
+		addr, moved = r.pp.rotateOnce()
+	} else {
+		addr, moved = r.pp.fail()
+	}
+	if !moved {
+		return
+	}
+	ip := parseIP4(hostOnly(addr))
+	if ip == nil {
+		return
+	}
+	r.peer.Store(&net.IPAddr{IP: ip})
+	r.session.Store(nil)
+	r.ci.Store(nil)
+	log.Printf("raw: rotated destination to %s", addr)
+	r.st.down("peer-rotate", "raw")
+}
+
 func (r *Raw) clientLoop() {
+	failN := 0
+	var rotateAt time.Time
+	if r.pp != nil && r.pp.rotate > 0 {
+		rotateAt = time.Now().Add(r.pp.rotate)
+	}
 	for {
 		if r.cryptoOn && r.sealer() != nil && r.sessionStale() {
 			r.session.Store(nil) // server likely restarted — drop the dead session so we re-handshake
@@ -887,8 +931,20 @@ func (r *Raw) clientLoop() {
 		}
 		if r.cryptoOn && r.sealer() == nil {
 			r.sendInit()
+			if failN++; r.pp != nil && failN >= peerFailThreshold {
+				r.rotatePeerRaw(false)
+				failN = 0
+			}
 		} else {
+			if failN > 0 && r.pp != nil {
+				r.pp.succeeded()
+			}
+			failN = 0
 			r.send(typePing, nil, r.peer.Load())
+			if r.pp != nil && !rotateAt.IsZero() && time.Now().After(rotateAt) {
+				r.rotatePeerRaw(true)
+				rotateAt = time.Now().Add(r.pp.rotate)
+			}
 		}
 		wait := jitter(r.keepalive)
 		if r.cryptoOn && r.sealer() == nil {
