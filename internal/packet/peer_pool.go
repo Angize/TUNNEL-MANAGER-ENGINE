@@ -220,7 +220,11 @@ func (p *PeerPool) advanceEligibleLocked() bool {
 // (plus whether it actually moved).
 func (p *PeerPool) fail() (addr string, moved bool) {
 	p.mu.Lock()
-	if len(p.addrs) < 2 { // nothing to rotate to; don't bother tracking a sole endpoint
+	// A live operator pin freezes failover ATOMICALLY — checked under the same p.mu that selectEntry
+	// takes — so an in-flight fail() racing a just-set pin can't burn or advance off the pinned endpoint
+	// (current() forces it until it lands or its TTL lapses). This is the authoritative guard; the
+	// rotationController's pinned() check is only a fast path.
+	if len(p.addrs) < 2 || p.pinnedLocked() { // nothing to rotate to, or a pin holds it
 		a := p.addrs[p.cur]
 		p.mu.Unlock()
 		return a, false
@@ -242,7 +246,7 @@ func (p *PeerPool) fail() (addr string, moved bool) {
 // not yet due, does not move).
 func (p *PeerPool) rotateOnce() (addr string, moved bool) {
 	p.mu.Lock()
-	if len(p.addrs) < 2 {
+	if len(p.addrs) < 2 || p.pinnedLocked() { // a pin freezes proactive rotation too (atomic under p.mu)
 		a := p.addrs[p.cur]
 		p.mu.Unlock()
 		return a, false
@@ -322,13 +326,16 @@ func (p *PeerPool) pinApplied(addr string) {
 	}
 }
 
+// pinnedLocked reports whether a manual pin is still in its force window. Caller holds p.mu.
+func (p *PeerPool) pinnedLocked() bool { return p.pinKey != "" && p.now() < p.pinUntil }
+
 // isPinned reports whether a manual pin is still in its force window, during which failover and
 // proactive rotation are held off so the jump lands exactly. After the window it returns false and
 // normal rotation resumes.
 func (p *PeerPool) isPinned() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.pinKey != "" && p.now() < p.pinUntil
+	return p.pinnedLocked()
 }
 
 // cmdPath is the sidecar file the node writes a "select endpoint" request into (JSON {key}). Empty when
@@ -495,6 +502,12 @@ func (p *PeerPool) writeStatus() {
 	if p.statusPath == "" {
 		return
 	}
+	// Hold writeMu across BOTH the snapshot and the file write, so concurrent writers can't snapshot in
+	// one order and win the write in the other — an older snapshot must never overwrite a newer file
+	// (writes are change-driven; there is no periodic re-write to self-correct a stale one). p.mu is
+	// always released before any caller reaches writeStatus, so writeMu→p.mu never inverts a lock order.
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.mu.Lock()
 	health := make([]healthStatus, 0, len(p.addrs))
 	burned := []string{}
@@ -513,8 +526,6 @@ func (p *PeerPool) writeStatus() {
 	if err != nil {
 		return
 	}
-	p.writeMu.Lock() // serialize writers: the shared ".tmp" path must not be raced by concurrent writeStatus() calls
-	defer p.writeMu.Unlock()
 	tmp := p.statusPath + ".tmp"
 	if os.WriteFile(tmp, data, 0o644) == nil {
 		_ = os.Rename(tmp, p.statusPath) // atomic replace so a reader never sees a half file

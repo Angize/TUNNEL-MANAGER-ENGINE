@@ -170,9 +170,19 @@ func TestPeerPoolSelectPin(t *testing.T) {
 	if got := p.current(); got != "c" {
 		t.Fatalf("current() must force the pinned c, got %q", got)
 	}
-	// Even a fresh failure does not move off the pin (the controller freezes rotation; current forces c).
-	if got := p.current(); got != "c" {
-		t.Fatalf("pin must keep forcing c, got %q", got)
+	// A fail() racing the pin must NOT burn or move off the pinned endpoint (atomic guard under p.mu):
+	// current() keeps forcing c until it lands or the TTL lapses.
+	if a, moved := p.fail(); a != "c" || moved {
+		t.Fatalf("fail() while pinned must stay on c: got %q moved=%v, want c false", a, moved)
+	}
+	p.mu.Lock()
+	burnedC := p.health["c"] != nil
+	p.mu.Unlock()
+	if burnedC {
+		t.Fatal("fail() while pinned must not burn the pinned endpoint")
+	}
+	if a, moved := p.rotateOnce(); a != "c" || moved {
+		t.Fatalf("rotateOnce() while pinned must stay on c: got %q moved=%v, want c false", a, moved)
 	}
 	p.pinApplied("c") // the carrier landed on c -> pin releases
 	if p.isPinned() {
