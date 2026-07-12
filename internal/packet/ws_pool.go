@@ -113,12 +113,12 @@ type wsPool struct {
 }
 
 // pinTTL bounds how long a manual pin keeps FORCING the exact chosen edge while it has NOT yet
-// connected. It must outlast a transient origin blip — so a pin placed while the tunnel is down
-// still lands the moment its edge recovers, instead of expiring after a few seconds and letting
-// rotation drift off it — yet still self-release so a permanently-dead pinned edge can't strand the
-// tunnel forever. On a SUCCESSFUL land the pin is cleared immediately (pinApplied), so on success it
-// behaves as a one-shot "jump exactly here now" and never freezes auto-rotation for the whole window.
-const pinTTL int64 = 300
+// connected. It only ever matters when the pinned edge is DEAD: a healthy pin lands within one
+// handshake and clears itself immediately (pinApplied), behaving as a one-shot "jump exactly here
+// now" that never freezes auto-rotation. So this window is the worst-case time a pin onto a *dead*
+// edge can stall rotation — kept short (30s) so a bad manual pick self-releases fast and rotation
+// resumes, while still comfortably outlasting a real handshake so a slow-but-healthy edge still lands.
+const pinTTL int64 = 30
 
 // coreEvent is one core-observed occurrence surfaced to the panel's system log: the CORE knows the
 // real reason a carrier dropped or an edge was burned (it saw the actual error), so instead of the
