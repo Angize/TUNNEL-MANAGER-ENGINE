@@ -764,7 +764,10 @@ func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
 // learnPeer records the peer address (and, on the server, the local source IP
 // toward it, needed for the tcp profile's checksum) once a frame authenticates.
 func (r *Raw) learnPeer(addr *net.IPAddr) {
-	if !r.pinnedPeer() { // with a forged source/decoy the address is not the real peer — keep the configured one
+	// Keep the configured/rotated peer when: a forged source/decoy means the reply address isn't the
+	// real peer (pinnedPeer), OR a destination pool owns the peer (r.pp) — a pool server can answer
+	// from a different IP than the client dialed, and adopting it would pull the client off the pool.
+	if !r.pinnedPeer() && r.pp == nil {
 		r.peer.Store(addr)
 	}
 	if r.localIP.Load() == nil {

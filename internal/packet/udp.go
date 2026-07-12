@@ -413,7 +413,14 @@ func (b *UDP) handleCrypto(pkt []byte, addr *net.UDPAddr) {
 		if typ, session, seq, payload, oerr := b.openWith(s, pkt); oerr == nil && b.rp.ok(session, seq) {
 			// authenticated, fresh frame -> now safe to (re)learn the peer address
 			b.lastRx.Store(time.Now().UnixNano()) // liveness: the session is answering
-			b.peer.Store(addr)
+			// The DESTINATION pool owns the client's peer: don't rebind it from a reply's source. A
+			// pool server may listen on 0.0.0.0 and answer from its default egress IP (≠ the IP the
+			// client dialed); adopting that would silently pull the client off the endpoint the pool
+			// is rotating. Servers (pp==nil) still learn the client here — which is what lets them
+			// follow a client's SOURCE rotation.
+			if b.pp == nil {
+				b.peer.Store(addr)
+			}
 			b.dispatch(typ, payload, addr)
 			return
 		}

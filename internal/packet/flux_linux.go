@@ -648,7 +648,12 @@ func (f *Flux) handleCrypto(body []byte, addr *net.IPAddr) {
 // toward it) once a frame authenticates, and installs the peer's anti-ICMP rule the
 // first time (the server has no peer to scope it to until now).
 func (f *Flux) learnPeer(addr *net.IPAddr) {
-	f.peer.Store(addr)
+	// The destination pool owns the client's peer: don't rebind it from a reply's source (a pool
+	// server can answer from a different IP than the client dialed). Servers (pp==nil) still learn the
+	// client here, which is what lets them follow a client's SOURCE rotation.
+	if f.pp == nil {
+		f.peer.Store(addr)
+	}
 	if f.localIP.Load() == nil {
 		if lip := routeLocalIP(addr.IP); lip != nil {
 			f.localIP.Store(&net.IPAddr{IP: lip})
