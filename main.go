@@ -245,6 +245,15 @@ func main() {
 			log.Printf("tnl-core: binding outbound source IP to %s", cfg.BindIP)
 		}
 	}
+	// Per-tunnel self-heal deadline (client): when set, tighten the carrier's dead-detection window so
+	// this tunnel re-establishes/fails over faster than the default (~3×keepalive / 60s idle backstop).
+	// Every carrier implements it; a 0 value leaves the default formula in place.
+	if cfg.Role == "client" && cfg.DeadAfterSecs > 0 {
+		if s, ok := b.(interface{ SetDeadAfter(int) }); ok {
+			s.SetDeadAfter(cfg.DeadAfterSecs)
+			log.Printf("tnl-core: self-heal deadline set to %ds (>=2×keepalive)", cfg.DeadAfterSecs)
+		}
+	}
 	// Datagram transports (udp/raw/flux): wire a status-file event ring so the client's precise
 	// self-heal events reach the node/panel system log. Only the client writes it; the transports
 	// that don't implement it (tcp/ws) simply ignore this.

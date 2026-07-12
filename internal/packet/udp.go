@@ -71,17 +71,18 @@ type UDP struct {
 	// datagram to another pool IP cannot hijack the reply source. rxConn stashes the current read loop's
 	// socket as a candidate (under rxMu) until that authenticated commit. rxMu serializes the N read loops
 	// into the single-receiver contract the crypto/replay/FEC path assumes.
-	srvConns  []*net.UDPConn
-	replyConn atomic.Pointer[net.UDPConn]
-	rxConn    atomic.Pointer[net.UDPConn]
-	rxMu      sync.Mutex
-	dev       *tun.Device
-	keepalive time.Duration
-	obfs      bool
-	cryptoOn  bool
-	psk       string
-	cipher    string
-	isClient  bool
+	srvConns      []*net.UDPConn
+	replyConn     atomic.Pointer[net.UDPConn]
+	rxConn        atomic.Pointer[net.UDPConn]
+	rxMu          sync.Mutex
+	dev           *tun.Device
+	keepalive     time.Duration
+	deadAfterSecs int // per-tunnel self-heal deadline override (0 = default 3×keepalive/10s floor)
+	obfs          bool
+	cryptoOn      bool
+	psk           string
+	cipher        string
+	isClient      bool
 
 	peer    atomic.Pointer[net.UDPAddr]      // current known peer (server learns it)
 	session atomic.Pointer[sealerBox]        // negotiated session sealer (nil until handshake / clear mode)
@@ -289,6 +290,14 @@ func (b *UDP) pinPollLoop(rc *rotationController) {
 	}
 }
 
+// SetDeadAfter (client) tightens the session-stale deadline to the per-tunnel dead_after_secs so the
+// tunnel re-handshakes faster than the default (3×keepalive). No-op for secs<=0. Call before Run.
+func (b *UDP) SetDeadAfter(secs int) {
+	if secs > 0 {
+		b.deadAfterSecs = secs
+	}
+}
+
 // SetStatusPath (client, optional) wires a status-file event ring so self-heal re-handshakes and
 // recoveries surface in the panel's system log. Call before Run(). No-op path leaves it off.
 func (b *UDP) SetStatusPath(path string) {
@@ -313,10 +322,11 @@ func (b *UDP) sessionStale() bool {
 	if last == 0 {
 		return false // no baseline yet
 	}
-	w := 3 * b.keepalive
-	if w < 10*time.Second {
-		w = 10 * time.Second
+	def := 3 * b.keepalive
+	if def < 10*time.Second {
+		def = 10 * time.Second
 	}
+	w := deadWindow(b.keepalive, b.deadAfterSecs, def) // per-tunnel override tightens the self-heal deadline
 	return time.Since(time.Unix(0, last)) > w
 }
 

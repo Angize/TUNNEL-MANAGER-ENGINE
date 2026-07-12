@@ -107,8 +107,15 @@ type Config struct {
 	TunAddr string `json:"tun_addr"` // local L3 address with prefix, e.g. "10.200.0.1/24"
 	MTU     int    `json:"mtu"`      // TUN MTU, e.g. 1400
 
-	Keepalive int       `json:"keepalive"` // client ping interval in seconds (default 15)
-	Crypto    CryptoCfg `json:"crypto"`
+	Keepalive int `json:"keepalive"` // client ping interval in seconds (default 15)
+	// DeadAfterSecs (client) is the per-tunnel self-heal deadline: the carrier is declared dead — and the
+	// client re-establishes / fails over — if no authenticated inbound frame arrives within this many
+	// seconds. It sets the read-deadline ceiling (b.idle for tcp/ws/xhttp; the stale window for udp/raw/
+	// flux), so an operator can make a tunnel heal faster than the default (~3×keepalive ping-loss, 60s
+	// idle backstop). 0 = use the default formula. Clamped to >=2×keepalive so a healthy pinging link is
+	// never mis-reaped, so for a very short window lower Keepalive too.
+	DeadAfterSecs int       `json:"dead_after_secs"`
+	Crypto        CryptoCfg `json:"crypto"`
 
 	// Obfs turns on anti-DPI framing: the constant magic byte is dropped, the
 	// frame type is folded into the AEAD-sealed plaintext, random padding and
@@ -401,6 +408,9 @@ func (c *Config) validate() error {
 	}
 	if c.BindIP != "" && net.ParseIP(c.BindIP) == nil {
 		return errors.New("bind_ip must be a valid IP address")
+	}
+	if c.DeadAfterSecs != 0 && (c.DeadAfterSecs < 10 || c.DeadAfterSecs > 300) {
+		return errors.New("dead_after_secs must be 0 (default) or between 10 and 300")
 	}
 	switch c.Transport {
 	case "", "udp", "tcp":
