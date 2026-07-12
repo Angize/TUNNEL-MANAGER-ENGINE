@@ -428,11 +428,15 @@ func (c *rotationController) success() {
 	c.destRot = 0
 	if c.dst != nil {
 		c.dst.succeeded()
-		c.dst.pinApplied(c.dst.current())
+		if c.dst.isPinned() { // current() returns the pinned endpoint (no cur movement) only while pinned
+			c.dst.pinApplied(c.dst.current())
+		}
 	}
 	if c.src != nil {
 		c.src.succeeded()
-		c.src.pinApplied(c.src.current())
+		if c.src.isPinned() {
+			c.src.pinApplied(c.src.current())
+		}
 	}
 }
 

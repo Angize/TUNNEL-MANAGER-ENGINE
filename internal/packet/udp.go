@@ -63,6 +63,7 @@ type UDP struct {
 	// rotation-induced ReadFromUDP error (reload the new conn and keep going) from a real socket death.
 	conn      atomic.Pointer[net.UDPConn]
 	rebindGen atomic.Int64
+	rebindMu  sync.Mutex // serializes rebindSourceTo so a proactive rotation and a pin-poll adopt can't race the swap (double-close / socket leak)
 	dev       *tun.Device
 	keepalive time.Duration
 	obfs      bool
@@ -202,6 +203,8 @@ func (b *UDP) rebindSourceTo(addr string) (string, bool) {
 	if ip == nil {
 		return "", false
 	}
+	b.rebindMu.Lock() // serialize the load/store/gen-bump/close so a concurrent rebind can't leak or double-close
+	defer b.rebindMu.Unlock()
 	nc, err := net.ListenUDP("udp", &net.UDPAddr{IP: ip}) // fresh socket on the new source (ephemeral port)
 	if err != nil {
 		log.Printf("core/udp: source rebind to %s failed: %v", host, err)
