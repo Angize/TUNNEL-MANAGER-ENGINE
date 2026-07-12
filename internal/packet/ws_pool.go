@@ -483,7 +483,13 @@ func (p *wsPool) retestResult(kind, key string, success bool) {
 		p.failRetestLocked(r)
 	}
 	p.mu.Unlock()
-	p.writeStatus()
+	if success {
+		// A background probe recovered a sidelined edge/SNI (suspect|dead -> healthy). Emit a discrete
+		// heal event so the operator sees the self-heal in the log, not just a silent status-file flip.
+		p.event("heal", "retest", kind+":"+key) // event() also writes the status file
+	} else {
+		p.writeStatus()
+	}
 }
 
 // failRetestLocked reschedules a tracked entry after a FAILED retest. A suspect walks the

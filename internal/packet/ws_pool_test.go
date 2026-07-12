@@ -154,6 +154,32 @@ func TestSuspectBackoffThenDead(t *testing.T) {
 	}
 }
 
+// A successful background retest that heals a sidelined edge must emit a discrete "heal"/"retest"
+// event (so the recovery is visible in the panel log), while a FAILED retest must not.
+func TestRetestHealEmitsEvent(t *testing.T) {
+	p, _ := clockPool([]string{"a", "b"}, snis("x"), true, "")
+	p.markSuspect("ip", "a", "test") // emits a burn event
+	base := len(p.events)
+	p.retestResult("ip", "a", false) // failed retest — no heal event
+	if len(p.events) != base {
+		t.Fatalf("a failed retest must not emit an event, got %+v", p.events[base:])
+	}
+	p.retestResult("ip", "a", true) // heals — must emit heal/retest
+	if len(p.events) != base+1 {
+		t.Fatalf("a successful retest must emit exactly one event, got %+v", p.events[base:])
+	}
+	ev := p.events[len(p.events)-1]
+	if ev.Kind != "heal" || ev.Code != "retest" || ev.Detail != "ip:a" {
+		t.Fatalf("want heal/retest/ip:a, got %+v", ev)
+	}
+	// retestResult on a cleared (already-healthy) entry is a no-op — no duplicate heal.
+	n := len(p.events)
+	p.retestResult("ip", "a", true)
+	if len(p.events) != n {
+		t.Fatalf("retest on an already-healthy entry must be silent, got %+v", p.events[n:])
+	}
+}
+
 // ANY successful retest clears the record back to healthy (in rotation again).
 func TestSuccessfulRetestHealsToHealthy(t *testing.T) {
 	p, _ := clockPool([]string{"a", "b"}, snis("x"), true, "")
@@ -210,7 +236,7 @@ func TestStatusSnapshotStates(t *testing.T) {
 		t.Fatalf("status file not written: %v", err)
 	}
 	var st struct {
-		Active     string `json:"active"`
+		Active     string   `json:"active"`
 		BurnedIPs  []string `json:"burned_ips"`
 		BurnedSNIs []string `json:"burned_snis"`
 		Health     []struct {
@@ -348,7 +374,7 @@ func TestPinOneShot(t *testing.T) {
 
 func TestAutoBurnOffNoTracking(t *testing.T) {
 	p := newWSPool([]string{"a", "b"}, snis("x"), false, "") // manual-only
-	p.markSuspect("ip", "a", "test")                                 // must NOT track
+	p.markSuspect("ip", "a", "test")                         // must NOT track
 	if p.ipHealth["a"] != nil {
 		t.Fatalf("autoBurn=off must not sideline an entry, got %#v", p.ipHealth["a"])
 	}
