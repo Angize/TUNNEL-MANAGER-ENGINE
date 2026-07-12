@@ -73,11 +73,56 @@ func TestTLSToEdgeUsesChromeFingerprintALPNh1(t *testing.T) {
 	}
 }
 
-// applyChromeH1 must succeed against the current pinned Chrome parrot (guards a uTLS bump that
-// might drop the version or the ALPN extension).
-func TestApplyChromeH1Succeeds(t *testing.T) {
-	uc := utls.UClient(&chWriteConn{}, &utls.Config{ServerName: "x"}, utls.HelloCustom)
-	if err := applyChromeH1(uc); err != nil {
-		t.Fatalf("applyChromeH1 failed on the pinned Chrome parrot: %v", err)
+// The grpc/stream xhttp carrier passes alpn=nil to uEdgeHandshake so the ClientHello keeps Chrome's
+// h2 (the edge must negotiate HTTP/2). Verify the emitted hello is still Chrome (GREASE) and offers
+// h2 in ALPN.
+func TestUEdgeHandshakeH2ALPN(t *testing.T) {
+	cc := &chWriteConn{}
+	_, _ = uEdgeHandshake(cc, "cdn.example.com", nil, nil) // fails on read; inspect the ClientHello
+	if len(cc.hello) == 0 {
+		t.Fatal("no ClientHello was written")
 	}
+	if greaseCount(cc.hello) < 2 {
+		t.Fatal("expected the Chrome fingerprint (GREASE) on the grpc/h2 path")
+	}
+	// Chrome's ALPN vector: the h2 entry immediately followed by http/1.1.
+	alpnH2 := []byte{0x02, 'h', '2', 0x08, 'h', 't', 't', 'p', '/', '1', '.', '1'}
+	if !bytes.Contains(cc.hello, alpnH2) {
+		t.Fatal("grpc/h2 path must offer h2 in ALPN so the edge negotiates HTTP/2")
+	}
+}
+
+// chromeSpec must build against the current pinned Chrome parrot (guards a uTLS bump that might
+// drop the version or the ALPN extension) and honor the ALPN override / passthrough.
+func TestChromeSpecALPN(t *testing.T) {
+	// Override to http/1.1 only.
+	h1, err := chromeSpec([]string{"http/1.1"})
+	if err != nil {
+		t.Fatalf("chromeSpec(http/1.1) failed on the pinned Chrome parrot: %v", err)
+	}
+	assertALPN(t, h1, []string{"http/1.1"})
+	// nil keeps Chrome's default [h2, http/1.1] for the grpc carrier.
+	h2, err := chromeSpec(nil)
+	if err != nil {
+		t.Fatalf("chromeSpec(nil) failed: %v", err)
+	}
+	assertALPN(t, h2, []string{"h2", "http/1.1"})
+}
+
+func assertALPN(t *testing.T, spec utls.ClientHelloSpec, want []string) {
+	t.Helper()
+	for _, ext := range spec.Extensions {
+		if a, ok := ext.(*utls.ALPNExtension); ok {
+			if len(a.AlpnProtocols) != len(want) {
+				t.Fatalf("ALPN = %v, want %v", a.AlpnProtocols, want)
+			}
+			for i := range want {
+				if a.AlpnProtocols[i] != want[i] {
+					t.Fatalf("ALPN = %v, want %v", a.AlpnProtocols, want)
+				}
+			}
+			return
+		}
+	}
+	t.Fatal("no ALPN extension in the Chrome spec")
 }

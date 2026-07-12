@@ -39,6 +39,8 @@ import (
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 const xhttpUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -251,19 +253,6 @@ func (b *TCP) xhttpEdge() (dialAddr, host string, ech []byte, path string, err e
 	return dialAddr, host, ech, path, nil
 }
 
-// xhttpClientTLS builds the client TLS config for the edge: SNI = the fronting host, with ECH
-// when configured. xhTLS (test-only) overrides it wholesale.
-func (b *TCP) xhttpClientTLS(host string, ech []byte) *tls.Config {
-	if b.xhTLS != nil {
-		return b.xhTLS
-	}
-	cfg := &tls.Config{ServerName: host}
-	if len(ech) > 0 {
-		cfg.EncryptedClientHelloConfigList = ech
-	}
-	return cfg
-}
-
 // establishXHTTP (client) opens a fresh xhttp session to the edge and returns a net.Conn over it.
 // Two upstream styles share the same fronting (TLS+ECH mirror wss) and the same pool rotation
 // (each attempt uses the pool's current IP × SNI; a failure burns the offending IP or SNI):
@@ -283,10 +272,10 @@ func (b *TCP) establishXHTTP() (net.Conn, string, string, error) {
 	// periodically, and once the config we hold goes stale EVERY edge rejects ECH ("tls: server
 	// rejected ECH") until a rebuild — the exact production stall. The rejection carries a fresh
 	// RetryConfigList; redial ONCE with it BEFORE we blame the edge, so the fleet heals from the
-	// clock with no panel rebuild. errors.As reaches the *tls.ECHRejectionError through the
-	// http.Client.Do error chain (verified for both HTTP/1.1 packet-up and HTTP/2 grpc).
+	// clock with no panel rebuild. errors.As reaches the *utls.ECHRejectionError (uTLS does the
+	// edge handshake) through the http.Client.Do / http2 error chain — for both packet-up and grpc.
 	if err != nil && b.wsTLS && len(ech) > 0 {
-		var echErr *tls.ECHRejectionError
+		var echErr *utls.ECHRejectionError
 		if errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
 			ech = echErr.RetryConfigList
 			log.Printf("core/xhttp: ECH self-heal for %s (%s) — stale key rejected, retrying with fresh key %s",
@@ -320,35 +309,88 @@ func (b *TCP) establishXHTTP() (net.Conn, string, string, error) {
 // down by the dialXHTTP* helper (ctx cancelled, pipes/bodies closed).
 func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net.Conn, error) {
 	single := b.xhMode == "stream" || b.xhMode == "grpc" // one full-duplex request (both need h2)
-	tr := &http.Transport{
-		// Always dial the fixed edge, regardless of the request URL host, so the Host/SNI stays
-		// the fronting domain while we connect to a specific (clean) CDN IP.
-		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			c, err := b.dialer(10 * time.Second).DialContext(ctx, "tcp", dialAddr)
+	h2 := single && b.wsTLS                              // grpc/stream over wss ride HTTP/2 to the edge
+
+	// rawDial always targets the fixed edge, regardless of the request URL host, so the Host/SNI
+	// stays the fronting domain while we connect to a specific (clean) CDN IP.
+	rawDial := func(ctx context.Context) (net.Conn, error) {
+		return b.dialer(10*time.Second).DialContext(ctx, "tcp", dialAddr)
+	}
+
+	var rt http.RoundTripper
+	var closeIdle func()
+	if b.wsTLS && b.xhTLS == nil {
+		// Production TLS: uTLS with a Chrome fingerprint (see uEdgeHandshake), same as the ws
+		// carrier — the xhttp handshake must not look like Go's crypto/tls either. packet-up rides
+		// http/1.1 (force that ALPN); grpc/stream ride h2 (keep Chrome's [h2, http/1.1] so the edge
+		// picks h2). We do the TLS ourselves via DialTLSContext so the transport never runs its own.
+		var alpn []string
+		if !h2 {
+			alpn = []string{"http/1.1"}
+		}
+		dialTLS := func(ctx context.Context) (net.Conn, error) {
+			c, err := rawDial(ctx)
 			if err != nil {
 				return nil, err
 			}
-			if b.wsTLS { // the transport does TLS on this conn -> split its ClientHello SNI when enabled
-				c = b.fragWrap(c, host)
+			uc, err := uEdgeHandshake(b.fragWrap(c, host), host, ech, alpn) // split the ClientHello SNI when enabled
+			if err != nil {
+				c.Close()
+				return nil, err
 			}
-			return c, nil
-		},
-		// packet-up rides HTTP/1.1 (each POST is a complete request); stream-one and grpc are
-		// full-duplex and need HTTP/2 to the edge so upstream frames flush per-write, not buffer.
-		ForceAttemptHTTP2:   single && b.wsTLS,
-		MaxIdleConns:        16,
-		MaxIdleConnsPerHost: 8, // the streaming GET holds one conn; the packet-up POSTs reuse the rest
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: handshakeTimeout,
+			return uc, nil
+		}
+		if h2 {
+			// x/net/http2 speaks h2 directly over the uTLS conn: it only reads TLS state / *tls.Conn
+			// via guarded assertions, so a *utls.UConn is accepted (it just skips those extras).
+			h2t := &http2.Transport{
+				DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+					return dialTLS(ctx)
+				},
+			}
+			rt, closeIdle = h2t, h2t.CloseIdleConnections
+		} else {
+			tr := &http.Transport{
+				DialTLSContext:      func(ctx context.Context, _, _ string) (net.Conn, error) { return dialTLS(ctx) },
+				MaxIdleConns:        16,
+				MaxIdleConnsPerHost: 8, // the streaming GET holds one conn; the packet-up POSTs reuse the rest
+				IdleConnTimeout:     90 * time.Second,
+			}
+			rt, closeIdle = tr, tr.CloseIdleConnections
+		}
+	} else {
+		// No TLS (plain http), or a test that overrides the edge TLS wholesale (xhTLS). The
+		// transport runs its own TLS (Go's) on a raw-dialed conn.
+		tr := &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				c, err := rawDial(ctx)
+				if err != nil {
+					return nil, err
+				}
+				if b.wsTLS {
+					c = b.fragWrap(c, host)
+				}
+				return c, nil
+			},
+			ForceAttemptHTTP2:   h2,
+			MaxIdleConns:        16,
+			MaxIdleConnsPerHost: 8,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: handshakeTimeout,
+		}
+		if b.wsTLS {
+			tr.TLSClientConfig = b.xhTLS
+		}
+		rt, closeIdle = tr, tr.CloseIdleConnections
 	}
+
 	scheme := "http"
 	if b.wsTLS {
 		scheme = "https"
-		tr.TLSClientConfig = b.xhttpClientTLS(host, ech)
 	}
 	sid := randSID()
 	base := scheme + "://" + host + xhttpPath(path)
-	hc := &http.Client{Transport: tr}
+	hc := &http.Client{Transport: rt}
 	ctx, cancel := context.WithCancel(context.Background())
 	setHdr := func(r *http.Request) {
 		r.Header.Set("User-Agent", xhttpUA)
@@ -362,9 +404,9 @@ func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net
 	var err error
 	switch b.xhMode {
 	case "grpc", "stream":
-		conn, _, err = b.dialXHTTPGrpc(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
+		conn, _, err = b.dialXHTTPGrpc(hc, closeIdle, ctx, cancel, base, sid, dialAddr, host, setHdr)
 	default:
-		conn, _, err = b.dialXHTTPPacket(hc, tr, ctx, cancel, base, sid, dialAddr, host, setHdr)
+		conn, _, err = b.dialXHTTPPacket(hc, closeIdle, ctx, cancel, base, sid, dialAddr, host, setHdr)
 	}
 	return conn, err
 }
@@ -479,7 +521,7 @@ func (g *grpcDeframingReader) Close() error {
 
 // dialXHTTPGrpc (grpc) is stream-one dressed as a gRPC call: one full-duplex POST with
 // Content-Type application/grpc and gRPC message framing on both directions.
-func (b *TCP) dialXHTTPGrpc(hc *http.Client, tr *http.Transport, ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
+func (b *TCP) dialXHTTPGrpc(hc *http.Client, closeIdle func(), ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
 	pr, pw := io.Pipe()
 	req, err := http.NewRequestWithContext(ctx, "POST", base+"?s="+sid, pr)
 	if err != nil {
@@ -509,13 +551,13 @@ func (b *TCP) dialXHTTPGrpc(hc *http.Client, tr *http.Transport, ctx context.Con
 		w:  &grpcFramingWriter{w: pw},          // Write -> framed -> pipe -> request body (upstream)
 		ra: strAddr(dialAddr), la: strAddr("xhttp-client"),
 	}
-	conn.closeFn = func() { cancel(); pw.Close(); resp.Body.Close(); tr.CloseIdleConnections() }
+	conn.closeFn = func() { cancel(); pw.Close(); resp.Body.Close(); closeIdle() }
 	return conn, dialAddr, nil
 }
 
 // dialXHTTPPacket (packet-up) opens the long-lived downstream GET and starts the packet-up
 // upstream sender for a fresh session, returning a net.Conn over the pair.
-func (b *TCP) dialXHTTPPacket(hc *http.Client, tr *http.Transport, ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
+func (b *TCP) dialXHTTPPacket(hc *http.Client, closeIdle func(), ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
 	greq, _ := http.NewRequestWithContext(ctx, "GET", base+"?s="+sid, nil)
 	setHdr(greq)
 	gresp, err := doWithHeaderTimeout(hc, greq, xhttpEstablishTimeout)
@@ -535,7 +577,7 @@ func (b *TCP) dialXHTTPPacket(hc *http.Client, tr *http.Transport, ctx context.C
 		r:  gresp.Body,
 		ra: strAddr(dialAddr), la: strAddr("xhttp-client"),
 	}
-	conn.closeFn = func() { cancel(); gresp.Body.Close(); tr.CloseIdleConnections() }
+	conn.closeFn = func() { cancel(); gresp.Body.Close(); closeIdle() }
 	conn.up = newXhUp(ctx, hc, urlFor, setHdr, func() { conn.Close() })
 	return conn, dialAddr, nil
 }

@@ -41,8 +41,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/crypto/chacha20"
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/crypto/chacha20"
 
 	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/crypto"
 	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/tlscover"
@@ -343,8 +343,8 @@ type TCP struct {
 	// core frames directly over these requests (the HTTP layer replaces the WS upgrade),
 	// the server must NOT run wsServerHandshake on an xhttp conn — see handleServerConn.
 	xhttp      bool
-	xhMode     string       // client: "stream" (single full-duplex request) else packet-up
-	xhTLS      *tls.Config  // test-only: overrides the client edge TLS config (nil in production)
+	xhMode     string                      // client: "stream" (single full-duplex request) else packet-up
+	xhTLS      *tls.Config                 // test-only: overrides the client edge TLS config (nil in production)
 	httpSrv    atomic.Pointer[http.Server] // server: the xhttp endpoint (nil otherwise); atomic — written by runXHTTPServer's goroutine, read by Close
 	xhMu       sync.Mutex
 	xhSessions map[string]*xhttpSession
@@ -840,25 +840,11 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 	var err error
 	healed := false // set once we redial with a fresh RetryConfigList
 	for attempt := 0; attempt < 2; attempt++ {
-		// uTLS with a Chrome fingerprint: the ClientHello matches a real Chrome on the wire, so a
-		// censor cannot fingerprint-block us by the distinctive Go crypto/tls JA3 — a gap ECH does
-		// NOT close (ECH hides the SNI, not the TLS fingerprint). ALPN is forced to http/1.1 (Chrome
-		// offers h2 too; if the edge picked h2 our raw HTTP/1.1 WebSocket upgrade would break), which
-		// changes only the ALPN values, not the extension set, so the JA3 still matches Chrome. When
-		// ech is set, uTLS injects real ECH in place of Chrome's GREASE-ECH — Chrome fingerprint AND
-		// hidden SNI together; a stale key still surfaces as a *utls.ECHRejectionError with a fresh
-		// RetryConfigList, driving the self-heal below.
-		ucfg := &utls.Config{ServerName: host}
-		if len(ech) > 0 {
-			ucfg.EncryptedClientHelloConfigList = ech
-		}
-		uc := utls.UClient(b.fragWrap(conn, host), ucfg, utls.HelloCustom) // split the ClientHello's SNI when enabled
-		if err = applyChromeH1(uc); err == nil {
-			conn.SetDeadline(time.Now().Add(handshakeTimeout))
-			err = uc.Handshake()
-		}
+		var uc net.Conn
+		// ALPN forced to http/1.1: the WebSocket upgrade that follows (wsClientHandshake) is
+		// HTTP/1.1, so the edge must not pick h2.
+		uc, err = uEdgeHandshake(b.fragWrap(conn, host), host, ech, []string{"http/1.1"}) // split the ClientHello's SNI when enabled
 		if err == nil {
-			conn.SetDeadline(time.Time{})
 			if healed && live { // live self-heal: persist the fresh key and surface it (pool or single-edge)
 				b.noteECHSelfHeal(host, ech)
 			}
@@ -871,7 +857,7 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 			log.Printf("core/ws: ECH self-heal for %s (%s) — stale key rejected, retrying with fresh key %s",
 				host, dialAddr, base64.StdEncoding.EncodeToString(ech))
 			healed = true
-			if conn, err = b.dialer(10 * time.Second).Dial("tcp", dialAddr); err != nil {
+			if conn, err = b.dialer(10*time.Second).Dial("tcp", dialAddr); err != nil {
 				return nil, err
 			}
 			continue
@@ -881,24 +867,54 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 	return nil, err
 }
 
-// applyChromeH1 applies a current-Chrome ClientHello fingerprint to uc, with ALPN forced to
-// http/1.1 only. Chrome offers [h2, http/1.1]; if the CDN edge negotiated h2 our raw HTTP/1.1
-// WebSocket upgrade (wsClientHandshake) would break, so we drop h2 from the ALPN VALUES — the
-// extension SET is unchanged, so the JA3 still matches Chrome. UTLSIdToSpec returns a freshly
-// built spec each call, so mutating its ALPN does not disturb the shared parrot. The spec keeps
-// Chrome's GREASE-ECH placeholder, which uTLS replaces with real ECH when the config carries an
-// ECHConfigList.
-func applyChromeH1(uc *utls.UConn) error {
+// uEdgeHandshake performs one client-side uTLS handshake to a CDN edge over conn, presenting a
+// current-Chrome ClientHello so our JA3 matches a real browser's — Go's crypto/tls does not, a gap
+// ECH cannot close (ECH hides the SNI, not the fingerprint). ServerName=host is the SNI; when ech
+// is set uTLS injects the real Encrypted ClientHello in place of Chrome's GREASE-ECH, keeping BOTH
+// the fingerprint and the hidden SNI. A stale ECH key surfaces as a *utls.ECHRejectionError with a
+// fresh RetryConfigList for the caller's self-heal. Shared by the ws (tlsToEdge) and xhttp carriers.
+func uEdgeHandshake(conn net.Conn, host string, ech []byte, alpn []string) (net.Conn, error) {
+	cfg := &utls.Config{ServerName: host}
+	if len(ech) > 0 {
+		cfg.EncryptedClientHelloConfigList = ech
+	}
+	uc := utls.UClient(conn, cfg, utls.HelloCustom)
+	spec, err := chromeSpec(alpn)
+	if err != nil {
+		return nil, err
+	}
+	if err = uc.ApplyPreset(&spec); err != nil {
+		return nil, err
+	}
+	conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	if err = uc.Handshake(); err != nil {
+		return nil, err
+	}
+	conn.SetDeadline(time.Time{})
+	return uc, nil
+}
+
+// chromeSpec returns a freshly built current-Chrome ClientHelloSpec. When alpn is non-nil it
+// overrides Chrome's ALPN VALUES (Chrome offers [h2, http/1.1]) — we force ["http/1.1"] for the
+// WebSocket/packet-up carriers so the edge does not pick h2, and pass nil for the grpc carrier to
+// keep Chrome's h2. Only the ALPN values change, not the extension SET, so the JA3 still matches
+// Chrome (the ApplicationSettings extension keeps its authentic h2; only ALPN drives negotiation).
+// UTLSIdToSpec builds a fresh spec each call, so mutating its ALPN cannot disturb a shared parrot;
+// the spec keeps Chrome's GREASE-ECH placeholder, which uTLS replaces with real ECH when a config
+// carries an ECHConfigList.
+func chromeSpec(alpn []string) (utls.ClientHelloSpec, error) {
 	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
 	if err != nil {
-		return err
+		return spec, err
 	}
-	for _, ext := range spec.Extensions {
-		if alpn, ok := ext.(*utls.ALPNExtension); ok {
-			alpn.AlpnProtocols = []string{"http/1.1"}
+	if alpn != nil {
+		for _, ext := range spec.Extensions {
+			if a, ok := ext.(*utls.ALPNExtension); ok {
+				a.AlpnProtocols = alpn
+			}
 		}
 	}
-	return uc.ApplyPreset(&spec)
+	return spec, nil
 }
 
 // establishWS opens one WebSocket connection: it picks the current pool edge (or the
@@ -919,7 +935,7 @@ func (b *TCP) establishWS() (net.Conn, string, string, error) {
 		host = dialAddr
 	}
 	sniEnt := wsSNIEntry{host: host, ech: ech, path: path} // for failure attribution / probes
-	conn, err := b.dialer(10 * time.Second).Dial("tcp", dialAddr)
+	conn, err := b.dialer(10*time.Second).Dial("tcp", dialAddr)
 	if err != nil {
 		b.attributeFailure(dialAddr, sniEnt) // differential probe: IP vs SNI vs transient
 		return nil, dialAddr, "", err
@@ -1259,7 +1275,7 @@ func (b *TCP) dialCarrier() (net.Conn, string, string, error) {
 		}
 		return c, edge, combo, nil
 	}
-	c, err := b.dialer(10 * time.Second).Dial("tcp", b.addr)
+	c, err := b.dialer(10*time.Second).Dial("tcp", b.addr)
 	if err != nil {
 		log.Printf("core/tcp: dial %s failed: %v", b.addr, err)
 		return nil, b.addr, "", err
@@ -1397,7 +1413,7 @@ func (b *TCP) dialLoopWarm() {
 		cc := conn
 		b.curConn.Store(&cc)
 		if b.pool != nil {
-			b.pool.setActive(combo)                                 // publish the live active edge + flush the status file
+			b.pool.setActive(combo)                                          // publish the live active edge + flush the status file
 			b.pool.pinApplied(label, strings.TrimPrefix(combo, label+" · ")) // a pin that targeted this edge is now satisfied
 		}
 		startReader(cf)
