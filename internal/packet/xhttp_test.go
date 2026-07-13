@@ -83,6 +83,56 @@ func echoXHTTP() *httptest.Server {
 	return httptest.NewServer(mux)
 }
 
+// TestXHTTPProbeUsesRealEstablish locks in the xhttp probe fix: probeEdgeFull must run a REAL xhttp
+// session (which validates the origin's HTTP 200), not a TLS-only reachability check. A CDN
+// terminates TLS for any of its anycast IPs, so a dead origin behind it completes TCP+TLS yet 502s
+// the actual xhttp establish — the old TLS-only probe passed that edge (falsely healing it on retest
+// and defeating the manual-pin auto-release, which read the block as "transient"). The real-establish
+// probe must fail it. packet-up mode over plain http isolates exactly this: front reachable, origin dead.
+func TestXHTTPProbeUsesRealEstablish(t *testing.T) {
+	good := echoXHTTP()
+	defer good.Close()
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway) // reachable front (TCP+TLS OK), dead origin (502 on establish)
+	}))
+	defer bad.Close()
+
+	probe := func(addr string) bool {
+		b := &TCP{addr: addr, ws: true, xhttp: true, wsPath: "/", wsTLS: false}
+		return b.probeEdgeFull(addr, wsSNIEntry{path: "/"})
+	}
+	if !probe(good.Listener.Addr().String()) {
+		t.Fatal("a working xhttp origin must probe healthy")
+	}
+	if probe(bad.Listener.Addr().String()) {
+		t.Fatal("a 502-origin behind a reachable front must probe DEAD (a TLS-only probe would wrongly pass it)")
+	}
+}
+
+// TestXHTTPGrpcProbeHealthyOnRealOrigin proves the same real-establish probe reports healthy for a
+// LIVE grpc origin — the exact carrier the operator runs — so the fix doesn't over-burn a good grpc edge.
+func TestXHTTPGrpcProbeHealthyOnRealOrigin(t *testing.T) {
+	const psk = "e2e-shared-pre-shared-key-1234567890"
+	srvDev, _ := tunPair(t, "xhgprobe")
+	srv, err := ListenXHTTP("127.0.0.1:0", srvDev, time.Second, false, true, psk, "aes-256-gcm")
+	if err != nil {
+		t.Fatalf("ListenXHTTP: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", srv.xhttpHandler)
+	ts := httptest.NewUnstartedServer(mux)
+	ts.EnableHTTP2 = true
+	ts.StartTLS()
+	go srv.Run()
+	t.Cleanup(func() { ts.Close(); srv.Close() })
+
+	b := &TCP{addr: ts.Listener.Addr().String(), ws: true, xhttp: true, xhMode: "grpc", wsPath: "/",
+		wsTLS: true, xhTLS: &tls.Config{InsecureSkipVerify: true}}
+	if !b.probeEdgeFull(ts.Listener.Addr().String(), wsSNIEntry{path: "/"}) {
+		t.Fatal("a real grpc xhttp origin must probe healthy")
+	}
+}
+
 func TestXHTTPCarrierRoundTrip(t *testing.T) {
 	srv := echoXHTTP()
 	defer srv.Close()
