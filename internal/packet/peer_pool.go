@@ -331,6 +331,23 @@ func (p *PeerPool) pinApplied(addr string) {
 	}
 }
 
+// pinLanded releases a live manual pin because the carrier just handshook successfully — a pin is
+// "jump here and keep trying until connected", so a success IS the landing. Single-locked so it can't
+// race the pin's own TTL expiry between a check and the clear (the isPinned()+pinApplied(current())
+// two-call form could), and it needs no current() call: while pinned, current() forces the pinned
+// endpoint, so a success is by definition on it. No-op when no pin is in force.
+func (p *PeerPool) pinLanded() {
+	p.mu.Lock()
+	changed := p.pinnedLocked()
+	if changed {
+		p.pinKey, p.pinUntil = "", 0
+	}
+	p.mu.Unlock()
+	if changed {
+		p.writeStatus()
+	}
+}
+
 // pinnedLocked reports whether a manual pin is still in its force window. Caller holds p.mu.
 func (p *PeerPool) pinnedLocked() bool { return p.pinKey != "" && p.now() < p.pinUntil }
 
@@ -442,15 +459,11 @@ func (c *rotationController) success() (dstHealed, srcHealed string) {
 	c.destRot = 0
 	if c.dst != nil {
 		dstHealed = c.dst.succeeded()
-		if c.dst.isPinned() { // current() returns the pinned endpoint (no cur movement) only while pinned
-			c.dst.pinApplied(c.dst.current())
-		}
+		c.dst.pinLanded() // atomically release a pin that has now landed (no-op when unpinned)
 	}
 	if c.src != nil {
 		srcHealed = c.src.succeeded()
-		if c.src.isPinned() {
-			c.src.pinApplied(c.src.current())
-		}
+		c.src.pinLanded()
 	}
 	return
 }

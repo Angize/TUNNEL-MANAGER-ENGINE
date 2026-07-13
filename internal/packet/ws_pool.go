@@ -179,7 +179,7 @@ func (p *wsPool) dataFailure(ip string) {
 	if recentGood && hasAlt {
 		p.dataFail[ip]++
 		if p.dataFail[ip] >= dataFailThreshold && p.ipHealth[ip] == nil {
-			p.ipHealth[ip] = &healthRec{state: stateSuspect, nextRetest: p.now() + suspectBackoff[2]}
+			p.ipHealth[ip] = &healthRec{state: stateSuspect, nextRetest: p.now() + suspectStep(2)}
 			p.dataFail[ip] = 0
 			burned = true
 		}
@@ -708,6 +708,12 @@ func (p *wsPool) writeStatus() {
 	if p.statusPath == "" {
 		return
 	}
+	// Hold writeMu across BOTH the snapshot and the file write, so two concurrent writers can't snapshot
+	// in one order and win the write in the reverse order — an older snapshot must never overwrite a
+	// newer file (writes are change-driven; there is no periodic re-write to self-correct a stale one).
+	// p.mu is always released before any caller reaches writeStatus, so writeMu→p.mu never inverts.
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	p.mu.Lock()
 	health := make([]healthStatus, 0, len(p.ips)+len(p.snis))
 	burnedIPs, burnedSNIs := []string{}, []string{}
@@ -742,8 +748,7 @@ func (p *wsPool) writeStatus() {
 	}{Active: p.active, BurnedIPs: burnedIPs, BurnedSNIs: burnedSNIs, Health: health, Events: evs, PinIP: p.pinIP, PinSNI: p.pinSNI, TS: time.Now().Unix()}
 	p.mu.Unlock()
 	if data, err := json.Marshal(st); err == nil {
-		p.writeMu.Lock() // serialize writers: the shared ".tmp" path must not be raced by concurrent writeStatus() calls
-		defer p.writeMu.Unlock()
+		// writeMu already held across the snapshot above (serializes writers AND orders snapshot->write).
 		tmp := p.statusPath + ".tmp"
 		if os.WriteFile(tmp, data, 0o644) == nil {
 			_ = os.Rename(tmp, p.statusPath) // atomic replace so a reader never sees a half file

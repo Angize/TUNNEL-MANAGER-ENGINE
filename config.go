@@ -603,6 +603,24 @@ func (c *Config) validate() error {
 			}
 		}
 	}
+	if len(c.PeerSrcIPs) > 0 {
+		// peer_src_ips is the SERVER's copy of the client's source pool (raw/flux only). Validate it like
+		// src_ips so a typo fails the config load loudly instead of being silently dropped in
+		// SetPeerSources — a dropped source would re-strand the tunnel on the client's next rotation.
+		if c.Role != "server" {
+			return errors.New("peer_src_ips is a server-side view of the client's source pool")
+		}
+		switch c.Transport {
+		case "raw", "flux":
+		default:
+			return errors.New("peer_src_ips is only for the raw/flux transports (udp/tcp re-learn the source on their own)")
+		}
+		for _, e := range c.PeerSrcIPs {
+			if err := validatePoolEndpoint("peer_src_ips", e, false); err != nil {
+				return err
+			}
+		}
+	}
 	if c.PeerRotateSecs < 0 {
 		return errors.New("peer_rotate_secs must be >= 0 (0 = rotate only on a dead peer)")
 	}

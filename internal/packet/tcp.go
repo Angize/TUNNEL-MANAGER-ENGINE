@@ -1356,14 +1356,13 @@ func (b *TCP) dialLoop() {
 			b.pool.setActive(combo)
 		} else {
 			// Direct pp/sp: we just connected on the current endpoints, so release any operator pin that
-			// has now landed (a pin behaves as "jump here and keep trying until connected"). Guard on
-			// isPinned so current() is consulted only while a pin forces it (it then returns the pinned
-			// endpoint with no cur movement); in the no-pin steady state this is a cheap skip.
-			if b.pp != nil && b.pp.isPinned() {
-				b.pp.pinApplied(b.pp.current())
+			// has now landed (a pin behaves as "jump here and keep trying until connected"). pinLanded is
+			// single-locked and a no-op when no pin is in force — no TOCTOU between the check and clear.
+			if b.pp != nil {
+				b.pp.pinLanded()
 			}
-			if b.sp != nil && b.sp.isPinned() {
-				b.sp.pinApplied(b.sp.current())
+			if b.sp != nil {
+				b.sp.pinLanded()
 			}
 		}
 		// Proactive rotation: after b.rotate, advance the pool and drop this connection
