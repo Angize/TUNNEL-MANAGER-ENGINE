@@ -601,7 +601,8 @@ func (b *UDP) deliver(pkt []byte, addr *net.UDPAddr) {
 	if len(pkt) < 2 || pkt[0] != magic {
 		return
 	}
-	if b.pp == nil { // a pooled client owns its peer (mirror the crypto path); a server always learns it
+	b.lastRx.Store(time.Now().UnixNano()) // liveness: the peer is answering (clear mode has no session to prove it)
+	if b.pp == nil {                      // a pooled client owns its peer (mirror the crypto path); a server always learns it
 		b.learnPeer(addr)
 	}
 	b.dispatch(pkt[1], iff(pkt[1] == typeData, pkt[2:], nil), addr)
@@ -766,6 +767,16 @@ func (b *UDP) clientLoop() {
 			b.ci.Store(nil)
 			log.Print("core: no reply from the peer's session — re-handshaking (peer likely restarted)")
 			b.st.down("stale", "udp") // precise reason for the panel log (nil-safe when off)
+		}
+		// Clear mode (no crypto) has no handshake whose failure would drive failover, so a dead pool
+		// endpoint would otherwise strand the tunnel forever. Use receive-staleness instead: the peer
+		// pongs our keepalive pings, so once it stops answering (lastRx ages past the dead window) burn
+		// and advance the pool. Guarded on lastRx!=0 (a baseline reply seen) so a fresh tunnel or an idle
+		// one that just pinged never false-fails. Only when a pool is wired.
+		if !b.cryptoOn && rc.active() && b.sessionStale() {
+			rc.fail(b.rotatePeerUDP, b.rotateSourceUDP)
+			b.lastRx.Store(time.Now().UnixNano()) // reset the baseline so the jumped-to endpoint gets a full window
+			b.st.down("stale", "udp")
 		}
 		if b.sealer() == nil && b.cryptoOn {
 			b.sendInit()

@@ -97,6 +97,14 @@ type Config struct {
 	// separate from PeerStatusPath so the panel can show and drive both the source and destination pools.
 	// Empty = the source pool has no panel-facing status / manual pin (it still rotates and self-heals).
 	SrcStatusPath string `json:"src_status_path"`
+	// PeerSrcIPs (SERVER, raw/flux only) is the client's SOURCE pool — the set of IPs the client may send
+	// FROM once its source rotates. raw/flux servers see every host on the wire and pre-filter incoming
+	// frames by the learned peer source; without this the server would drop a rotated client source before
+	// crypto and never re-bind to it (stranding the tunnel until a rebuild). Listing the client's known
+	// sources lets a rotated-but-expected source reach crypto (which authenticates it) while still dropping
+	// unrelated hosts pre-crypto. Empty = strict single-source filter (non-pool tunnels). udp/tcp bind a
+	// socket per source and re-learn naturally, so they don't need this.
+	PeerSrcIPs []string `json:"peer_src_ips"`
 	// BindIP is the source IP the client dials FROM (its own node IP). On a host with
 	// several IPs the kernel would otherwise egress from the primary IP; binding pins the
 	// outbound socket to this node's registered IP so the peer/CDN sees the expected source.
@@ -591,6 +599,24 @@ func (c *Config) validate() error {
 		}
 		for _, e := range c.SrcIPs {
 			if err := validatePoolEndpoint("src_ips", e, false); err != nil {
+				return err
+			}
+		}
+	}
+	if len(c.PeerSrcIPs) > 0 {
+		// peer_src_ips is the SERVER's copy of the client's source pool (raw/flux only). Validate it like
+		// src_ips so a typo fails the config load loudly instead of being silently dropped in
+		// SetPeerSources — a dropped source would re-strand the tunnel on the client's next rotation.
+		if c.Role != "server" {
+			return errors.New("peer_src_ips is a server-side view of the client's source pool")
+		}
+		switch c.Transport {
+		case "raw", "flux":
+		default:
+			return errors.New("peer_src_ips is only for the raw/flux transports (udp/tcp re-learn the source on their own)")
+		}
+		for _, e := range c.PeerSrcIPs {
+			if err := validatePoolEndpoint("peer_src_ips", e, false); err != nil {
 				return err
 			}
 		}

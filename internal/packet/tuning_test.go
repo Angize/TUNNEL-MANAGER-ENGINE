@@ -60,6 +60,20 @@ func TestApplyTuning(t *testing.T) {
 		t.Errorf("idleFor(2s)=%v want 30s (floor)", got)
 	}
 
+	// Regression: a SHORT custom suspect_backoff must not panic the fixed-index caller (ws_pool used a
+	// literal suspectBackoff[2]). suspectStep clamps to the last element instead of indexing out of range.
+	ApplyTuning(TuningInput{SuspectBackoff: []int64{7}})
+	if got := suspectStep(2); got != 7 { // len==1 -> clamped to [0]
+		t.Errorf("suspectStep(2) on a 1-element schedule = %d, want 7 (clamped)", got)
+	}
+	if got := suspectStep(0); got != 7 {
+		t.Errorf("suspectStep(0) = %d, want 7", got)
+	}
+	ApplyTuning(TuningInput{SuspectBackoff: []int64{5, 10, 20}})
+	if got := suspectStep(2); got != 20 {
+		t.Errorf("suspectStep(2) = %d, want 20", got)
+	}
+
 	// Out-of-range values clamp instead of taking effect verbatim.
 	ApplyTuning(TuningInput{PinTTLSecs: 999999, ProbeTimeoutSecs: 999999, DataFailThreshold: -3})
 	if pinTTL != 3600 {

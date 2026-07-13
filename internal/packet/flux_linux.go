@@ -59,6 +59,7 @@ type Flux struct {
 
 	localIP  atomic.Pointer[net.IPAddr] // our source IP toward the peer
 	peer     atomic.Pointer[net.IPAddr] // current known peer (server learns it)
+	srcAllow map[string]struct{}        // server pool: the client's known source IPs (4-byte keys) it may rotate across; set once before Run, then read-only
 	session  atomic.Pointer[sealerBox]
 	curShape atomic.Pointer[fluxShape] // this epoch's shape (refreshed each second by rotateWatcher)
 	rp       replayGuard
@@ -69,14 +70,15 @@ type Flux struct {
 	lastRx   atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
 	logEp    atomic.Int64 // last epoch whose rotation was logged (rotation visibility)
 
-	antiLeak  atomic.Pointer[func()] // anti-ICMP cleanup, written from the receive goroutine, read in Close -> atomic
-	leakOnce  sync.Once              // installs antiLeak exactly once (the server learns the peer late)
-	sendMu    sync.RWMutex           // senders RLock around the raw-fd Sendto; Close takes the write lock before closing it
-	sendDown  bool                   // set under sendMu.Lock in Close: no more Sendto on the (about-to-be-closed) raw fd
-	desync    desyncCfg              // client-only fake-packet desync (decoys emitted before each handshake); zero value = off
-	inj       *l2inject              // AF_PACKET injector for bad-checksum decoys (IP_HDRINCL repairs the checksum); nil unless a badsum/both mode is on
-	closeCh   chan struct{}
-	closeOnce sync.Once
+	antiLeak   atomic.Pointer[func()] // anti-ICMP cleanup for the CURRENT peer; swapped on each re-scope, read in Close
+	leakMu     sync.Mutex             // serializes anti-leak re-scoping (rotate/pin/learnPeer) vs Close
+	antiLeakIP net.IP                 // the IP the current anti-leak rule is scoped to (guarded by leakMu); nil = none
+	sendMu     sync.RWMutex           // senders RLock around the raw-fd Sendto; Close takes the write lock before closing it
+	sendDown   bool                   // set under sendMu.Lock in Close: no more Sendto on the (about-to-be-closed) raw fd
+	desync     desyncCfg              // client-only fake-packet desync (decoys emitted before each handshake); zero value = off
+	inj        *l2inject              // AF_PACKET injector for bad-checksum decoys (IP_HDRINCL repairs the checksum); nil unless a badsum/both mode is on
+	closeCh    chan struct{}
+	closeOnce  sync.Once
 
 	st *coreStatus // client-only: precise self-heal event ring written to the status file (nil = off)
 	pp *PeerPool   // client-only: destination-IP rotation pool (nil = single fixed peer, no rotation)
@@ -241,7 +243,7 @@ func DialFlux(peerIP string, dev *tun.Device, ka, rotate time.Duration, obfs, cr
 	if lip := routeLocalIP(ip); lip != nil {
 		f.localIP.Store(&net.IPAddr{IP: lip})
 	}
-	f.installAntiLeak(ip) // the peer is known up front — suppress kernel ICMP for its frames now
+	f.setAntiLeak(ip) // the peer is known up front — suppress kernel ICMP for its frames now
 	return f, nil
 }
 
@@ -278,9 +280,14 @@ func (f *Flux) Close() error {
 	if f.fecEnc != nil {
 		f.fecEnc.Close() // stop the FEC flush timer before the raw fd is closed (else a late Sendto hits a reused fd)
 	}
+	// closeCh is already closed (closeOnce above), so any setAntiLeak that now acquires leakMu bails
+	// out; taking leakMu here orders us after an in-flight re-scope so we remove whatever rule it left.
+	f.leakMu.Lock()
 	if p := f.antiLeak.Load(); p != nil && *p != nil {
 		(*p)()
 	}
+	f.antiLeak.Store(nil)
+	f.leakMu.Unlock()
 	// Block new sends and wait for any in-flight Sendto to finish BEFORE closing the raw fd,
 	// so a sibling goroutine (clientLoop / rotateWatcher / FEC emit) can't Sendto on a closed
 	// fd number that has since been reused by another socket.
@@ -299,15 +306,38 @@ func (f *Flux) Close() error {
 	return nil
 }
 
-// installAntiLeak drops just THIS carrier's inbound frames from the peer in the raw
-// PREROUTING chain, so the kernel does not answer our exotic protocol / unbound UDP
-// port with an ICMP unreachable. AF_PACKET taps every frame before that chain runs,
-// so flux still receives everything. The rules are scoped to the carrier's own
-// protocol/ports (NOT all traffic from the peer) so a co-located tunnel to the same
-// peer — e.g. a raw/bip link on proto 253 — is not collaterally dropped. Best-effort,
-// installed exactly once (the server learns the peer late).
-func (f *Flux) installAntiLeak(peer net.IP) {
-	f.leakOnce.Do(func() { fn := addFluxDrop(peer, f.carrier); f.antiLeak.Store(&fn) })
+// setAntiLeak scopes the raw-PREROUTING DROP rule to `peer` so the kernel does not answer this
+// carrier's exotic protocol / unbound UDP port with an ICMP unreachable. AF_PACKET taps every frame
+// before that chain runs, so flux still receives everything. The rule is scoped to the carrier's own
+// protocol/ports (NOT all traffic from the peer) so a co-located tunnel to the same peer — e.g. a
+// raw/bip link on proto 253 — is not collaterally dropped.
+//
+// Unlike a one-shot install, this RE-SCOPES on demand: an IP-rotation pool changes the peer (the
+// client's destination, or the client source a server follows), and a rule left on the OLD peer would
+// let the kernel ICMP-leak on the NEW one. Called per authenticated frame (learnPeer) and up front on
+// dial, it is idempotent — a no-op while the peer is unchanged — and on a change it removes the old
+// rule before adding the new one. Best-effort; a failed iptables call only means the kernel may leak.
+func (f *Flux) setAntiLeak(peer net.IP) {
+	v4 := peer.To4()
+	if v4 == nil {
+		return
+	}
+	f.leakMu.Lock()
+	defer f.leakMu.Unlock()
+	select {
+	case <-f.closeCh:
+		return // shutting down: don't install a rule Close won't clean up
+	default:
+	}
+	if f.antiLeakIP != nil && f.antiLeakIP.Equal(v4) {
+		return // already scoped to this peer — no iptables churn on every frame
+	}
+	if old := f.antiLeak.Load(); old != nil && *old != nil {
+		(*old)() // remove the rule scoped to the PREVIOUS peer before re-scoping
+	}
+	fn := addFluxDrop(v4, f.carrier)
+	f.antiLeak.Store(&fn)
+	f.antiLeakIP = append(net.IP(nil), v4...)
 }
 
 func (f *Flux) sealer() Sealer {
@@ -577,8 +607,10 @@ func (f *Flux) netToTun() error {
 			}
 		}
 		src := &net.IPAddr{IP: append(net.IP(nil), pkt[12:16]...)}
-		if peer := f.peer.Load(); peer != nil && !src.IP.Equal(peer.IP) {
-			continue // only the peer's frames are ours (AF_PACKET sees all hosts)
+		if peer := f.peer.Load(); peer != nil && !src.IP.Equal(peer.IP) && !f.srcAllowed(src.IP) {
+			// only the peer's frames are ours (AF_PACKET sees all hosts); a pooled server ALSO admits the
+			// client's other known source IPs so a source rotation reaches crypto and learnPeer re-binds.
+			continue
 		}
 		if f.fecDec != nil {
 			// netToTun is the sole reader, so rxSrc is stable for the whole input()
@@ -668,7 +700,7 @@ func (f *Flux) learnPeer(addr *net.IPAddr) {
 			f.localIP.Store(&net.IPAddr{IP: lip})
 		}
 	}
-	f.installAntiLeak(addr.IP)
+	f.setAntiLeak(addr.IP)
 }
 
 // openWith tries to open one datagram under a specific session sealer, touching no
@@ -787,6 +819,38 @@ func (f *Flux) SetPeerPool(pp *PeerPool) {
 	if f.isClient {
 		f.pp = pp
 	}
+}
+
+// SetPeerSources (SERVER) records the client's known SOURCE-pool IPs so the receive filter admits a
+// rotated-but-expected client source (which then authenticates via crypto and re-binds the peer),
+// instead of dropping it as an unrelated host. Call before Run(); no-op on the client / empty list.
+func (f *Flux) SetPeerSources(ips []string) {
+	if f.isClient || len(ips) == 0 {
+		return
+	}
+	m := make(map[string]struct{}, len(ips))
+	for _, s := range ips {
+		if ip := parseIP4(hostOnly(s)); ip != nil {
+			m[string(ip.To4())] = struct{}{}
+		}
+	}
+	if len(m) > 0 {
+		f.srcAllow = m
+	}
+}
+
+// srcAllowed reports whether ip is one of the client's known pool sources (server only). Empty set
+// (non-pool tunnel, or the client) => false, so the strict single-source filter is unchanged there.
+func (f *Flux) srcAllowed(ip net.IP) bool {
+	if len(f.srcAllow) == 0 {
+		return false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	_, ok := f.srcAllow[string(v4)]
+	return ok
 }
 
 // SetSourcePool (client) wires a source-IP rotation pool: the crafted-header source IP the client

@@ -122,6 +122,20 @@ func ApplyTuning(t TuningInput) {
 	}
 }
 
+// suspectStep returns the i-th suspect backoff step, clamped to the LAST element when the (now
+// config-tunable) schedule is shorter than i+1. Callers that reference a fixed index must use this so
+// a short custom suspect_backoff (e.g. [30]) can't index out of range and panic the core. ApplyTuning
+// only ever installs a non-empty schedule, so len>=1 and the clamp always yields a valid element.
+func suspectStep(i int) int64 {
+	if n := len(suspectBackoff); i >= n {
+		i = n - 1
+	}
+	if i < 0 {
+		return 0
+	}
+	return suspectBackoff[i]
+}
+
 func tclamp64(v, lo, hi int64) int64 {
 	if v < lo {
 		return lo
