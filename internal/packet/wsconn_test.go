@@ -87,6 +87,25 @@ func TestWSConnStreamsAcrossReads(t *testing.T) {
 	}
 }
 
+// TestWSConnRejectsMalformedFrames locks in the hardening: a hostile/broken peer that sends a
+// reserved opcode or an oversized control frame must DROP the connection (error), not be silently
+// skipped or echoed back as a big pong.
+func TestWSConnRejectsMalformedFrames(t *testing.T) {
+	check := func(name string, frame []byte) {
+		a, b := net.Pipe()
+		defer a.Close()
+		defer b.Close()
+		rc := &wsConn{Conn: b, r: bufio.NewReader(b), client: true} // reads server->client (unmasked) frames
+		go func() { _, _ = a.Write(frame); a.Close() }()
+		buf := make([]byte, 256)
+		if _, err := rc.Read(buf); err == nil {
+			t.Fatalf("%s: Read returned nil error, want the connection dropped", name)
+		}
+	}
+	check("reserved opcode 0x3", []byte{0x83, 0x00})                            // FIN|0x3, unmasked, 0-length
+	check("oversized ping", append([]byte{0x89, 126, 0x00, 200}, make([]byte, 200)...)) // FIN|0x9, 16-bit len=200 (>125)
+}
+
 // A non-WebSocket request (a probe/scanner/browser) must get a 404 and errNotWS,
 // so the port looks like an ordinary idle web endpoint, not a tunnel.
 func TestWSServerRejectsNonWS(t *testing.T) {
