@@ -707,6 +707,13 @@ func (p *wsPool) selectEntry(kind, key string) bool {
 	p.mu.Unlock()
 	if ok {
 		p.writeStatus()
+		if kind == "ip" {
+			// Clearing an IP's burn just raised the healthy-IP count and may have crossed the "can it
+			// still rotate?" boundary back up. succeeded()/retestResult() reassess here too; selectEntry
+			// must as well, or a "restored" event is never emitted and rotDegraded stays stuck true —
+			// which then swallows the NEXT degraded/restored transition. (Idempotent: no-op if unmoved.)
+			p.reassessRotation()
+		}
 	}
 	return ok
 }

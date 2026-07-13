@@ -1340,6 +1340,13 @@ func (b *TCP) dialLoop() {
 		}
 		log.Printf("core/tcp: connected to %s", label)
 		connectedAt := time.Now()
+		// Clear a STALE manual-switch flag before this connection's death is ever accounted. rotate1
+		// sets manualSwitch unconditionally, but during an outage (no live curConn to drop) the flag is
+		// set with no death to consume it; left pending it would mask the NEXT genuine death as a clean
+		// switch (no down/up, bad edge not burned). A pin/rotate that drops THIS carrier re-sets it
+		// during the connection's life, so only the stale one is wiped. (Cleared before curConn.Store
+		// so a rotate1 that actually drops this carrier — only possible after the store — always wins.)
+		b.manualSwitch.Store(false)
 		b.cur.Store(cf)
 		cc := conn
 		b.curConn.Store(&cc) // expose the live conn so RotateIP/RotateSNI can drop it
@@ -1349,6 +1356,11 @@ func (b *TCP) dialLoop() {
 			// field and logs the auto-switch off its change). setActive is the single writer of the
 			// active edge — current() no longer touches it, so a standby dial can't corrupt it.
 			b.pool.setActive(combo)
+			// A pin that targeted this edge has now LANDED — release it so a healthy pin does not freeze
+			// rotation for the whole pinTTL window (current() forces the pinned edge, and the rotation
+			// timer skips every beat while isPinned()). The warm loop already does this on connect; the
+			// non-warm loop must too. No-op when no pin is in force (single-locked, no TOCTOU).
+			b.pool.pinApplied(label, strings.TrimPrefix(combo, label+" · "))
 		} else {
 			// Direct pp/sp: we just connected on the current endpoints, so release any operator pin that
 			// has now landed (a pin behaves as "jump here and keep trying until connected"). pinLanded is
@@ -1397,7 +1409,8 @@ func (b *TCP) dialLoop() {
 			// anyway would drop a healthy connection every interval for nothing (cf. the datagram guard).
 			rot = time.AfterFunc(iv, func() {
 				if (b.pp != nil && b.pp.isPinned()) || (b.sp != nil && b.sp.isPinned()) {
-					return // an operator pin freezes proactive rotation until it lands or its TTL lapses
+					rot.Reset(iv) // an operator pin freezes rotation for its window — re-arm, never freeze for the life of the conn
+					return
 				}
 				moved := false
 				if b.pp != nil {
@@ -1411,6 +1424,8 @@ func (b *TCP) dialLoop() {
 				if moved {
 					rotated.Store(true)
 					c.Close()
+				} else {
+					rot.Reset(iv) // every other endpoint burned this beat — re-arm so rotation resumes once one heals
 				}
 			})
 		}
@@ -1643,6 +1658,12 @@ func (b *TCP) dialLoopWarm() {
 				}
 				select {
 				case ready <- warmConn{cf, conn, label, combo}:
+					// The channel is buffered, so this send can succeed AFTER the manager has already
+					// exited and run its one-shot drain — leaking this conn's fd. Re-check: if Close has
+					// fired, nobody will drain us, so close it here.
+					if b.closed.Load() {
+						conn.Close()
+					}
 				case <-b.closeCh:
 					conn.Close()
 				}
@@ -1683,6 +1704,11 @@ func (b *TCP) dialLoopWarm() {
 		if old != nil {
 			old.conn.Close() // retire the old edge; its reader reports an (ignored) exit
 		}
+		// A promotion supersedes any pending manual-switch intent (e.g. a RotateIP whose induced exit
+		// was swallowed as a retired conn because this promote ran first). Clear it so it can't later
+		// mask the promoted carrier's genuine death as a deliberate switch. No-op on the failover path
+		// (that branch already consumed the flag).
+		b.manualSwitch.Store(false)
 		return true
 	}
 	// dialActiveBlocking establishes a fresh active with a short retry backoff, used at startup
@@ -1729,6 +1755,10 @@ func (b *TCP) dialLoopWarm() {
 				}
 				select {
 				case activeReady <- warmConn{cf, conn, label, combo}:
+					// Buffered send can win the race against Close's one-shot drain — see requestStandby.
+					if b.closed.Load() {
+						conn.Close()
+					}
 				case <-b.closeCh:
 					conn.Close()
 				}
@@ -1827,6 +1857,9 @@ func (b *TCP) dialLoopWarm() {
 				// is already re-dialing the active onto current()'s PINNED edge. Adopting it as active
 				// would land the operator on the wrong edge ("I pinned it but it didn't switch"). Hold it
 				// as the standby instead and let the pinned active land; rotation promotes it later.
+				b.manualSwitch.Store(false) // symmetric with the activeReady adopt: consume a manual flag left
+				//                             pending by a mid-outage RotateIP (no live conn to drop) so it
+				//                             cannot mask this fresh active's next genuine death as a switch.
 				log.Printf("core/tcp: adopting ready standby as active during outage")
 				setActive(wc.cf, wc.conn, wc.label, wc.combo)
 				requestStandby()

@@ -558,7 +558,11 @@ func (b *TCP) dialXHTTPGrpc(hc *http.Client, closeIdle func(), ctx context.Conte
 // dialXHTTPPacket (packet-up) opens the long-lived downstream GET and starts the packet-up
 // upstream sender for a fresh session, returning a net.Conn over the pair.
 func (b *TCP) dialXHTTPPacket(hc *http.Client, closeIdle func(), ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
-	greq, _ := http.NewRequestWithContext(ctx, "GET", base+"?s="+sid, nil)
+	greq, err := http.NewRequestWithContext(ctx, "GET", base+"?s="+sid, nil)
+	if err != nil { // a malformed host/path would otherwise nil-deref inside doWithHeaderTimeout's goroutine
+		cancel()
+		return nil, dialAddr, err
+	}
 	setHdr(greq)
 	gresp, err := doWithHeaderTimeout(hc, greq, xhttpEstablishTimeout)
 	if err != nil {

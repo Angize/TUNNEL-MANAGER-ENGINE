@@ -212,6 +212,48 @@ func TestWarmStandbyManualPinRebuildsStandby(t *testing.T) {
 	waitFor(t, 5*time.Second, "standby rebuilt after the pin", func() bool { return cli.standby.Load() != nil })
 }
 
+// TestNonWarmPinReleasesOnLanding proves the NON-warm client loop releases a manual pin the instant
+// the carrier lands on the pinned edge (pinApplied), instead of holding it for the whole pinTTL. A
+// lingering pin freezes rotation (current() forces the edge and the rotation timer skips every beat)
+// even after a healthy pin has landed — the warm loop already released on connect; the non-warm loop
+// must too.
+func TestNonWarmPinReleasesOnLanding(t *testing.T) {
+	const psk = "nonwarm-pin-release-psk-abcdefghij"
+	const cipher = "aes-256-gcm"
+	srvDev, _ := tunPair(t, "nwpsrv")
+	cliDev, _ := tunPair(t, "nwpcli")
+	ka := time.Second
+	addr := freeTCPPort(t)
+	srv, err := ListenWS(addr, srvDev, ka, false, true, psk, cipher)
+	if err != nil {
+		t.Fatalf("ListenWS: %v", err)
+	}
+	go srv.Run()
+	t.Cleanup(func() { srv.Close() })
+
+	pool := newWSPool([]string{addr}, snis("front-a", "front-b"), true, "")
+	cli := &TCP{dev: cliDev, cryptoOn: true, cipher: cipher, keepalive: ka, psk: psk,
+		ws: true, wsTLS: false, pool: pool, warmStandby: false, // NON-warm: the standard dialLoop
+		idle: idleFor(ka), isClient: true, addr: "pool", closeCh: make(chan struct{})}
+	go cli.Run()
+	t.Cleanup(func() { cli.Close() })
+
+	waitFor(t, 5*time.Second, "active up", func() bool { return cli.cur.Load() != nil })
+
+	target := "front-b"
+	if poolActive(pool) == addr+" · front-b" {
+		target = "front-a"
+	}
+	cli.SelectEdge("sni", target) // pin the other SNI; the carrier re-dials onto it
+
+	// Once it lands on the pinned edge, pinApplied must clear the pin — it must NOT linger to pinTTL.
+	waitFor(t, 5*time.Second, "pin released on landing", func() bool {
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+		return pool.pinSNI == "" && pool.pinUntil == 0 && pool.active == addr+" · "+target
+	})
+}
+
 // TestWarmStandbyFailover drives the full make-before-break client against a real in-process
 // ListenWS server over a two-edge pool (two SNIs fronting one origin). It asserts that the client
 // warms a standby, that traffic flows both ways over the active, and that killing the active
