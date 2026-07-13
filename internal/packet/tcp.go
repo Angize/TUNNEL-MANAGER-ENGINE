@@ -313,8 +313,9 @@ type TCP struct {
 	sniMode  string // "split" (in-order) | "disorder" (low-TTL head, desyncs a reassembling DPI)
 	splitTTL int    // disorder head-segment TTL (0 = default)
 
-	// probeFn lets tests substitute a deterministic reachability oracle for probeEdge (which
-	// does a real TCP+TLS dial). nil in production -> the differential prober uses probeEdge.
+	// probeFn lets tests substitute a deterministic reachability oracle for the real network probe.
+	// nil in production -> the differential prober uses probeEdgeFull (a full ws-upgrade / xhttp-grpc
+	// establish, so a CDN that terminates TLS for a dead origin isn't read as reachable).
 	probeFn func(ip string, sni wsSNIEntry) bool
 
 	// manualSwitch marks the NEXT carrier drop as operator-initiated (a pin / manual rotate via
@@ -1081,38 +1082,32 @@ const (
 	verdictSNIGuilty                     // a healthy IP proved the SNI the culprit
 )
 
-// probeEdge does a quick TCP dial + TLS handshake to (ip, sni) — presenting that SNI with its
-// ECH — then closes: NO WebSocket upgrade, NO data. It reports only whether the edge completes
-// a TLS session for that SNI, which is exactly the signal the health FSM needs. Used by both
-// the differential failure probe and the retest scheduler. (Pool clients always run wss, so a
-// TLS probe is a valid reachability test for ws and xhttp edges alike.)
-func (b *TCP) probeEdge(ip string, sni wsSNIEntry) bool {
-	conn, err := b.dialer(probeTimeout).Dial("tcp", ip)
-	if err != nil {
-		return false
-	}
-	host := sni.host
-	if host == "" {
-		host = ip
-	}
-	tc, err := b.tlsToEdge(conn, ip, host, sni.ech, false) // probe: don't emit a self-heal event
-	if err != nil {
-		return false
-	}
-	tc.Close()
-	return true
-}
-
 // probeEdgeFull is a higher-fidelity reachability probe than probeEdge: it completes the FULL
 // client control path to (ip, sni) — TCP + (wss TLS+ECH) + WebSocket UPGRADE — then closes, with
 // no data and no pool-state changes. Because a LIVE success requires the upgrade (not just TLS),
 // using this for retests/attribution stops a broken ws/origin path (TLS completes, upgrade 502s
 // — the steady state of a dead origin behind a CDN that terminates TLS for anyone) from being
 // mislabeled "reachable" the way a TLS-only probe would, and from falsely healing a suspect.
-// For xhttp edges (no ws upgrade) it falls back to the TLS-only probeEdge.
 func (b *TCP) probeEdgeFull(ip string, sni wsSNIEntry) bool {
 	if b.xhttp {
-		return b.probeEdge(ip, sni)
+		// The SAME reasoning as the ws upgrade check applies to xhttp/grpc — even more so, since a CDN
+		// terminates TLS for ANY of its anycast IPs, so a TLS-only probe (probeEdge) reports "reachable"
+		// for a blocked edge whose real xhttp/grpc path to the origin is dead or 502s. Using TLS-only
+		// here would falsely HEAL a dead xhttp edge on retest AND defeat the manual-pin auto-release
+		// (attribution would read a genuine block as transient — the reproduce step "succeeds" on TLS —
+		// so it never burns and the pin hangs the whole window). So run a REAL establish: open an
+		// xhttp/grpc session (which validates the origin's 200, not just the TLS front) and tear it
+		// straight down. dialXHTTPOnce cleans up everything it allocated on both success and error.
+		host := sni.host
+		if host == "" {
+			host = ip
+		}
+		conn, err := b.dialXHTTPOnce(ip, host, sni.ech, sni.path)
+		if err != nil {
+			return false
+		}
+		conn.Close()
+		return true
 	}
 	conn, err := b.dialer(probeTimeout).Dial("tcp", ip)
 	if err != nil {
