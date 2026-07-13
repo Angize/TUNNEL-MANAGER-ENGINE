@@ -97,6 +97,14 @@ type Config struct {
 	// separate from PeerStatusPath so the panel can show and drive both the source and destination pools.
 	// Empty = the source pool has no panel-facing status / manual pin (it still rotates and self-heals).
 	SrcStatusPath string `json:"src_status_path"`
+	// PeerSrcIPs (SERVER, raw/flux only) is the client's SOURCE pool — the set of IPs the client may send
+	// FROM once its source rotates. raw/flux servers see every host on the wire and pre-filter incoming
+	// frames by the learned peer source; without this the server would drop a rotated client source before
+	// crypto and never re-bind to it (stranding the tunnel until a rebuild). Listing the client's known
+	// sources lets a rotated-but-expected source reach crypto (which authenticates it) while still dropping
+	// unrelated hosts pre-crypto. Empty = strict single-source filter (non-pool tunnels). udp/tcp bind a
+	// socket per source and re-learn naturally, so they don't need this.
+	PeerSrcIPs []string `json:"peer_src_ips"`
 	// BindIP is the source IP the client dials FROM (its own node IP). On a host with
 	// several IPs the kernel would otherwise egress from the primary IP; binding pins the
 	// outbound socket to this node's registered IP so the peer/CDN sees the expected source.

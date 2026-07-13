@@ -324,6 +324,17 @@ func main() {
 			log.Printf("tnl-core: source pool: %d source IPs rotate=%ds auto_burn=%v", len(cfg.SrcIPs), cfg.PeerRotateSecs, cfg.PeerAutoBurn)
 		}
 	}
+	// Pooled server (raw/flux): the client rotates its SOURCE IP, but these carriers see every host on the
+	// wire and pre-filter incoming frames by the learned peer source. Give the server the client's known
+	// source pool so a rotated source still reaches crypto (which authenticates it) and learnPeer re-binds
+	// — otherwise a source rotation strands the server on the stale source until a rebuild. udp/tcp bind a
+	// socket per source and re-learn naturally, so they don't implement this.
+	if cfg.Role == "server" && len(cfg.PeerSrcIPs) > 0 {
+		if s, ok := b.(interface{ SetPeerSources([]string) }); ok {
+			s.SetPeerSources(cfg.PeerSrcIPs)
+			log.Printf("tnl-core: pooled server follows client source rotation across %d source IPs", len(cfg.PeerSrcIPs))
+		}
+	}
 	defer b.Close()
 
 	// Clean shutdown removes the TUN (via defers) on SIGINT/SIGTERM.

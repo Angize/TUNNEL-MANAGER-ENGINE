@@ -59,6 +59,7 @@ type Flux struct {
 
 	localIP  atomic.Pointer[net.IPAddr] // our source IP toward the peer
 	peer     atomic.Pointer[net.IPAddr] // current known peer (server learns it)
+	srcAllow map[string]struct{}        // server pool: the client's known source IPs (4-byte keys) it may rotate across; set once before Run, then read-only
 	session  atomic.Pointer[sealerBox]
 	curShape atomic.Pointer[fluxShape] // this epoch's shape (refreshed each second by rotateWatcher)
 	rp       replayGuard
@@ -577,8 +578,10 @@ func (f *Flux) netToTun() error {
 			}
 		}
 		src := &net.IPAddr{IP: append(net.IP(nil), pkt[12:16]...)}
-		if peer := f.peer.Load(); peer != nil && !src.IP.Equal(peer.IP) {
-			continue // only the peer's frames are ours (AF_PACKET sees all hosts)
+		if peer := f.peer.Load(); peer != nil && !src.IP.Equal(peer.IP) && !f.srcAllowed(src.IP) {
+			// only the peer's frames are ours (AF_PACKET sees all hosts); a pooled server ALSO admits the
+			// client's other known source IPs so a source rotation reaches crypto and learnPeer re-binds.
+			continue
 		}
 		if f.fecDec != nil {
 			// netToTun is the sole reader, so rxSrc is stable for the whole input()
@@ -787,6 +790,38 @@ func (f *Flux) SetPeerPool(pp *PeerPool) {
 	if f.isClient {
 		f.pp = pp
 	}
+}
+
+// SetPeerSources (SERVER) records the client's known SOURCE-pool IPs so the receive filter admits a
+// rotated-but-expected client source (which then authenticates via crypto and re-binds the peer),
+// instead of dropping it as an unrelated host. Call before Run(); no-op on the client / empty list.
+func (f *Flux) SetPeerSources(ips []string) {
+	if f.isClient || len(ips) == 0 {
+		return
+	}
+	m := make(map[string]struct{}, len(ips))
+	for _, s := range ips {
+		if ip := parseIP4(hostOnly(s)); ip != nil {
+			m[string(ip.To4())] = struct{}{}
+		}
+	}
+	if len(m) > 0 {
+		f.srcAllow = m
+	}
+}
+
+// srcAllowed reports whether ip is one of the client's known pool sources (server only). Empty set
+// (non-pool tunnel, or the client) => false, so the strict single-source filter is unchanged there.
+func (f *Flux) srcAllowed(ip net.IP) bool {
+	if len(f.srcAllow) == 0 {
+		return false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	_, ok := f.srcAllow[string(v4)]
+	return ok
 }
 
 // SetSourcePool (client) wires a source-IP rotation pool: the crafted-header source IP the client

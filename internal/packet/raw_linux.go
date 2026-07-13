@@ -64,16 +64,17 @@ type Raw struct {
 	fixedPeer net.IP
 	antiLeak  func() // removes the kernel anti-leak (iptables) rule on Close
 
-	localIP atomic.Pointer[net.IPAddr] // our source IP toward the peer (for TCP/UDP checksums)
-	peer    atomic.Pointer[net.IPAddr] // current known peer (server learns it)
-	session atomic.Pointer[sealerBox]
-	rp      replayGuard
-	pend    *sealerBox // server: session staged by a recent init, promoted only once a frame opens under it
-	pendRp  replayGuard
-	hsCache initCache // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
-	ci      atomic.Pointer[crypto.Ephemeral]
-	seq     atomic.Uint32
-	lastRx  atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
+	localIP  atomic.Pointer[net.IPAddr] // our source IP toward the peer (for TCP/UDP checksums)
+	peer     atomic.Pointer[net.IPAddr] // current known peer (server learns it)
+	srcAllow map[string]struct{}        // server pool: the client's known source IPs (4-byte keys) it may rotate across; set once before Run, then read-only
+	session  atomic.Pointer[sealerBox]
+	rp       replayGuard
+	pend     *sealerBox // server: session staged by a recent init, promoted only once a frame opens under it
+	pendRp   replayGuard
+	hsCache  initCache // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
+	ci       atomic.Pointer[crypto.Ephemeral]
+	seq      atomic.Uint32
+	lastRx   atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
 
 	fecEnc *fecEncoder                // non-nil when FEC is on: buffers data frames into RS blocks on send
 	fecDec *fecDecoder                // non-nil when FEC is on: reassembles + reconstructs blocks on receive
@@ -645,8 +646,9 @@ func (r *Raw) netToTun() error {
 			return err
 		}
 		if !r.pinnedPeer() { // a forged source can't be filtered by — the AEAD authenticates
-			if peer := r.peer.Load(); peer != nil && !addr.IP.Equal(peer.IP) {
-				continue // only the peer's packets are ours (raw sockets see all)
+			if peer := r.peer.Load(); peer != nil && !addr.IP.Equal(peer.IP) && !r.srcAllowed(addr.IP) {
+				continue // only the peer's packets are ours (raw sockets see all); a pooled server also
+				// admits the client's other known source IPs so a source rotation reaches crypto and re-binds
 			}
 		}
 		r.handleRaw(buf[:n], addr)
@@ -900,6 +902,38 @@ func (r *Raw) SetPeerPool(pp *PeerPool) {
 	if r.isClient {
 		r.pp = pp
 	}
+}
+
+// SetPeerSources (SERVER) records the client's known SOURCE-pool IPs so the receive filter admits a
+// rotated-but-expected client source (which then authenticates via crypto and re-binds the peer),
+// instead of dropping it as an unrelated host. Call before Run(); no-op on the client / empty list.
+func (r *Raw) SetPeerSources(ips []string) {
+	if r.isClient || len(ips) == 0 {
+		return
+	}
+	m := make(map[string]struct{}, len(ips))
+	for _, s := range ips {
+		if ip := parseIP4(hostOnly(s)); ip != nil {
+			m[string(ip.To4())] = struct{}{}
+		}
+	}
+	if len(m) > 0 {
+		r.srcAllow = m
+	}
+}
+
+// srcAllowed reports whether ip is one of the client's known pool sources (server only). Empty set
+// (non-pool tunnel, or the client) => false, so the strict single-source filter is unchanged there.
+func (r *Raw) srcAllowed(ip net.IP) bool {
+	if len(r.srcAllow) == 0 {
+		return false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	_, ok := r.srcAllow[string(v4)]
+	return ok
 }
 
 // SetSourcePool (client) wires a source-IP rotation pool: the crafted-header source the client sends
