@@ -178,18 +178,23 @@ func (p *wsPool) dataFailure(ip string) {
 			break
 		}
 	}
+	unpinned := false
 	if recentGood && hasAlt {
 		p.dataFail[ip]++
 		if p.dataFail[ip] >= dataFailThreshold && p.ipHealth[ip] == nil {
 			p.ipHealth[ip] = &healthRec{state: stateSuspect, nextRetest: p.now() + suspectStep(2)}
 			p.dataFail[ip] = 0
 			burned = true
+			unpinned = p.releasePinLocked("ip", ip) // a pinned edge proven data-dead: release so we recover now
 		}
 	}
 	p.mu.Unlock()
 	if burned {
 		p.event("burn", "throttle", "ip:"+ip) // handshake-OK-but-data-dead: throttled/blackholed
-		p.reassessRotation()                  // this burn may have left only one healthy edge -> rotation paused
+		if unpinned {
+			p.event("pool", "pin_dropped", "ip:"+ip) // pinned edge proven blocked -> pin auto-released, recover now
+		}
+		p.reassessRotation() // this burn may have left only one healthy edge -> rotation paused
 	}
 }
 
@@ -430,14 +435,45 @@ func (p *wsPool) markSuspect(kind, key, reason string) {
 	if fresh {
 		m[key] = &healthRec{state: stateSuspect, nextRetest: p.now() + suspectBackoff[0]}
 	}
+	// This burn is a DIFFERENTIALLY-PROVEN block (attributeFailure only reaches here on a
+	// verdictIP/SNIGuilty — a transient failure returns verdictTransient and never burns). If the
+	// proven-blocked edge is the one the operator just pinned, drop the pin so current() stops
+	// forcing the dead edge for the rest of pinTTL and the tunnel recovers on a healthy edge NOW,
+	// instead of hanging the whole force window on an edge we already KNOW is down.
+	unpinned := p.releasePinLocked(kind, key)
 	p.mu.Unlock()
 	if fresh {
 		p.event("burn", reason, kind+":"+key) // only log the transition into suspect, not repeats
+	}
+	if unpinned {
+		p.event("pool", "pin_dropped", kind+":"+key) // pinned edge proven blocked -> pin auto-released, recover now
 	}
 	p.writeStatus()
 	if fresh && kind == "ip" {
 		p.reassessRotation()
 	}
+}
+
+// releasePinLocked drops a manual pin whose target edge has just been PROVEN blocked, so current()
+// stops forcing the dead edge for the rest of pinTTL and the tunnel recovers on a healthy edge at
+// once. A pin still rides out a TRANSIENT outage — that path returns verdictTransient and never
+// burns, so it never reaches here — so only a differentially-proven block ends the pin. Releases
+// only the axis that was burned: an IP-pin held around a guilty SNI (and vice-versa) is untouched,
+// since current() then heals the free axis while keeping the pinned one. Caller holds the lock.
+func (p *wsPool) releasePinLocked(kind, key string) bool {
+	released := false
+	if kind == "ip" && p.pinIP != "" && p.pinIP == key {
+		p.pinIP = ""
+		released = true
+	}
+	if kind == "sni" && p.pinSNI != "" && p.pinSNI == key {
+		p.pinSNI = ""
+		released = true
+	}
+	if released && p.pinIP == "" && p.pinSNI == "" {
+		p.pinUntil = 0
+	}
+	return released
 }
 
 // reassessRotation emits a ONE-SHOT event when the pool crosses the "can it still rotate its IP axis?"
