@@ -1377,6 +1377,13 @@ func (b *TCP) dialLoop() {
 		// keeps the same edge — the timer is stopped before that path runs.
 		var rot *time.Timer
 		var rotated atomic.Bool
+		// timerLive gates the rotation callback's SELF re-arm. A pinned/no-move beat re-arms via
+		// rot.Reset, which races the rot.Stop() below when this connection dies on the same beat: Stop
+		// can run first (sees the timer fired, no-op) and then the callback re-arms, leaving a stray
+		// timer firing spurious rotations. Clearing timerLive BEFORE Stop makes any post-teardown fire
+		// return at once without advancing or re-arming, so a leaked beat self-terminates immediately.
+		var timerLive atomic.Bool
+		timerLive.Store(true)
 		if b.pool != nil && b.rotate > 0 {
 			c := conn
 			// Arm the rotation timer regardless of the CURRENT pin state and re-check the pin when it
@@ -1387,6 +1394,9 @@ func (b *TCP) dialLoop() {
 			// Now the pin only freezes rotation for its OWN window: while still pinned at fire time, skip
 			// this beat and re-arm; once the pin has cleared, rotate normally.
 			rot = time.AfterFunc(b.rotate, func() {
+				if !timerLive.Load() {
+					return // this connection is being torn down — do not advance or re-arm
+				}
 				if b.pool.isPinned() {
 					rot.Reset(b.rotate) // still pinned — hold rotation off, but keep checking (never freeze)
 					return
@@ -1408,6 +1418,9 @@ func (b *TCP) dialLoop() {
 			// is burned (the common "one IP got filtered" steady state) rotateOnce() can't move; closing
 			// anyway would drop a healthy connection every interval for nothing (cf. the datagram guard).
 			rot = time.AfterFunc(iv, func() {
+				if !timerLive.Load() {
+					return // this connection is being torn down — do not advance or re-arm
+				}
 				if (b.pp != nil && b.pp.isPinned()) || (b.sp != nil && b.sp.isPinned()) {
 					rot.Reset(iv) // an operator pin freezes rotation for its window — re-arm, never freeze for the life of the conn
 					return
@@ -1429,7 +1442,8 @@ func (b *TCP) dialLoop() {
 				}
 			})
 		}
-		b.serve(cf) // blocks until this connection dies
+		b.serve(cf)          // blocks until this connection dies
+		timerLive.Store(false) // disable the callback's re-arm before stopping, so a racing beat can't re-arm
 		if rot != nil {
 			rot.Stop()
 		}

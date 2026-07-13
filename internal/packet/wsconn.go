@@ -49,6 +49,11 @@ func (c *wsConn) Read(p []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		// A control frame (close/ping/pong) MUST carry <=125 bytes (RFC 6455 §5.5); a larger one is a
+		// malformed/hostile peer — drop the connection rather than echo a big pong or trust it.
+		if opcode >= 0x8 && len(payload) > 125 {
+			return 0, errDesync
+		}
 		switch opcode {
 		case 0x0, 0x1, 0x2: // continuation / text / binary — data
 			c.rbuf = payload
@@ -57,6 +62,8 @@ func (c *wsConn) Read(p []byte) (int, error) {
 		case 0x9: // ping -> pong
 			_ = c.writeWSFrame(0xA, payload)
 		case 0xA: // pong — ignore
+		default: // reserved/unknown opcode (0x3-0x7, 0xB-0xF) — a conforming peer never sends these
+			return 0, errDesync
 		}
 	}
 	n := copy(p, c.rbuf)
