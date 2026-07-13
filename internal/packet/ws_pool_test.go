@@ -164,13 +164,17 @@ func TestRetestHealEmitsEvent(t *testing.T) {
 	if len(p.events) != base {
 		t.Fatalf("a failed retest must not emit an event, got %+v", p.events[base:])
 	}
-	p.retestResult("ip", "a", true) // heals — must emit heal/retest
-	if len(p.events) != base+1 {
-		t.Fatalf("a successful retest must emit exactly one event, got %+v", p.events[base:])
+	// Heals "a": emits heal/retest AND — because it restores the 2nd healthy IP of this 2-IP pool —
+	// a pool/restored event (rotation can resume). Order: the heal first, then the pool transition.
+	p.retestResult("ip", "a", true)
+	if len(p.events) != base+2 {
+		t.Fatalf("a successful retest that also un-degrades the pool must emit heal + pool/restored, got %+v", p.events[base:])
 	}
-	ev := p.events[len(p.events)-1]
-	if ev.Kind != "heal" || ev.Code != "retest" || ev.Detail != "ip:a" {
+	if ev := p.events[base]; ev.Kind != "heal" || ev.Code != "retest" || ev.Detail != "ip:a" {
 		t.Fatalf("want heal/retest/ip:a, got %+v", ev)
+	}
+	if ev := p.events[base+1]; ev.Kind != "pool" || ev.Code != "restored" {
+		t.Fatalf("want pool/restored once the recovery restored rotation, got %+v", ev)
 	}
 	// retestResult on a cleared (already-healthy) entry is a no-op — no duplicate heal.
 	n := len(p.events)

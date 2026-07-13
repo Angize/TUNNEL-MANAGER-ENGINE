@@ -14,6 +14,7 @@ import (
 	"errors"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -76,25 +77,26 @@ type healthRec struct {
 // is snapshotted to statusPath. The pool is network-free (unit-testable): the prober and the
 // retest scheduler live in tcp.go and drive the FSM through these pure methods.
 type wsPool struct {
-	mu         sync.Mutex
-	writeMu    sync.Mutex // serializes the status file write+rename so concurrent writers don't race the shared .tmp
-	ips        []string
-	snis       []wsSNIEntry
-	ipHealth   map[string]*healthRec // absent == healthy
-	sniHealth  map[string]*healthRec // absent == healthy
-	i, j       int                   // current ip / sni index
-	autoBurn   bool
-	statusPath string
-	active     string
-	dataFail   map[string]int // per-IP count of consecutive short-lived (data-plane-fault) sessions
-	lastGood   int64          // unix time of the last SUSTAINED session on any edge (outage guard)
-	events     []coreEvent    // rolling ring of core-observed events (down/burn) for the panel log
-	evSeq      int64          // monotonic sequence so the panel can consume each event exactly once
-	wasDown    bool           // a genuine carrier down is pending its matching "up" (down/reconnect pairing)
-	pinIP      string         // operator-pinned IP: current() forces it until pinUntil (one-shot jump)
-	pinSNI     string         // operator-pinned SNI: current() forces it until pinUntil
-	pinUntil   int64          // unix time the pin is honoured until; after it, normal rotation resumes
-	now        func() int64   // injectable clock (unix seconds); overridden in tests
+	mu          sync.Mutex
+	writeMu     sync.Mutex // serializes the status file write+rename so concurrent writers don't race the shared .tmp
+	ips         []string
+	snis        []wsSNIEntry
+	ipHealth    map[string]*healthRec // absent == healthy
+	sniHealth   map[string]*healthRec // absent == healthy
+	i, j        int                   // current ip / sni index
+	autoBurn    bool
+	statusPath  string
+	active      string
+	rotDegraded bool           // true once the healthy-IP count fell below 2 (rotation paused); drives the degraded/restored event
+	dataFail    map[string]int // per-IP count of consecutive short-lived (data-plane-fault) sessions
+	lastGood    int64          // unix time of the last SUSTAINED session on any edge (outage guard)
+	events      []coreEvent    // rolling ring of core-observed events (down/burn) for the panel log
+	evSeq       int64          // monotonic sequence so the panel can consume each event exactly once
+	wasDown     bool           // a genuine carrier down is pending its matching "up" (down/reconnect pairing)
+	pinIP       string         // operator-pinned IP: current() forces it until pinUntil (one-shot jump)
+	pinSNI      string         // operator-pinned SNI: current() forces it until pinUntil
+	pinUntil    int64          // unix time the pin is honoured until; after it, normal rotation resumes
+	now         func() int64   // injectable clock (unix seconds); overridden in tests
 }
 
 // pinTTL (manual-pin force window, dead-pin self-release cap) is an operator-tunable package var,
@@ -187,6 +189,7 @@ func (p *wsPool) dataFailure(ip string) {
 	p.mu.Unlock()
 	if burned {
 		p.event("burn", "throttle", "ip:"+ip) // handshake-OK-but-data-dead: throttled/blackholed
+		p.reassessRotation()                  // this burn may have left only one healthy edge -> rotation paused
 	}
 }
 
@@ -432,6 +435,42 @@ func (p *wsPool) markSuspect(kind, key, reason string) {
 		p.event("burn", reason, kind+":"+key) // only log the transition into suspect, not repeats
 	}
 	p.writeStatus()
+	if fresh && kind == "ip" {
+		p.reassessRotation()
+	}
+}
+
+// reassessRotation emits a ONE-SHOT event when the pool crosses the "can it still rotate its IP axis?"
+// boundary. IP rotation needs >=2 HEALTHY ip endpoints; when a burn/dead leaves only one, the tunnel
+// silently stops switching edges (current() keeps returning the sole healthy IP), which reads in the
+// log as "rotation stopped". Surface that transition ("degraded") and its recovery ("restored") so the
+// operator knows WHY the rotation log went quiet. No-op for a single-ip pool (it never rotated) or when
+// the boundary has not moved since the last call. Call after any ip-health transition; it is idempotent.
+func (p *wsPool) reassessRotation() {
+	p.mu.Lock()
+	if len(p.ips) < 2 {
+		p.mu.Unlock()
+		return
+	}
+	healthy := 0
+	for _, ip := range p.ips {
+		if p.ipHealth[ip] == nil {
+			healthy++
+		}
+	}
+	degraded := healthy < 2
+	if degraded == p.rotDegraded {
+		p.mu.Unlock()
+		return
+	}
+	p.rotDegraded = degraded
+	p.mu.Unlock()
+	detail := strconv.Itoa(healthy) + "/" + strconv.Itoa(len(p.ips))
+	if degraded {
+		p.event("pool", "degraded", detail) // only one healthy edge left — rotation is paused
+	} else {
+		p.event("pool", "restored", detail) // a second edge recovered — rotation can resume
+	}
 }
 
 // succeeded clears the health records for a combo that just connected: a live success proves
@@ -444,6 +483,7 @@ func (p *wsPool) succeeded(ip, host string) {
 	p.mu.Unlock()
 	if changed {
 		p.writeStatus()
+		p.reassessRotation()
 	}
 }
 
@@ -469,6 +509,9 @@ func (p *wsPool) retestResult(kind, key string, success bool) {
 		p.event("heal", "retest", kind+":"+key) // event() also writes the status file
 	} else {
 		p.writeStatus()
+	}
+	if kind == "ip" {
+		p.reassessRotation() // a recovered/dead ip may have crossed the "can still rotate" boundary
 	}
 }
 
