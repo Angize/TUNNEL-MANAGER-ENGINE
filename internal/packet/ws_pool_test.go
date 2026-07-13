@@ -341,8 +341,9 @@ func TestSelectEntryPinsAndClears(t *testing.T) {
 
 // TestPinOneShot locks down the fix: a pin is a ONE-SHOT exact jump. Within its short window it
 // FORCES exactly the chosen edge (no drift onto a neighbour — the reported "pin #3 -> #2" bug —
-// even across advance()/a suspect partner/a fresh burn); after the window it clears and normal
-// rotation resumes (it does NOT lock forever).
+// even across advance()/a suspect partner); after the window it clears and normal rotation resumes
+// (it does NOT lock forever). A PROVEN burn of the pinned edge itself is covered separately by
+// TestPinReleasesOnProvenBlock (it self-releases so the tunnel recovers now, not after pinTTL).
 func TestPinOneShot(t *testing.T) {
 	p, now := clockPool([]string{"a", "b", "c"}, snis("x", "y"), true, "")
 	p.markSuspect("sni", "x", "test") // messy partner axis
@@ -353,7 +354,9 @@ func TestPinOneShot(t *testing.T) {
 	if !p.isPinned() {
 		t.Fatal("pool should report pinned right after selectEntry")
 	}
-	// Within the window: current() forces c every time, across rotation attempts and a fresh burn.
+	// Within the window: current() forces c every time, across rotation attempts — the pin does not
+	// drift onto a neighbour just because advance()/advanceIP() stepped the index or the partner axis
+	// is suspect. (Burning a DIFFERENT edge must also not move it off c.)
 	for i := 0; i < 6; i++ {
 		if ip, _, ok := p.current(); !ok || ip != "c" {
 			t.Fatalf("pin must force ip=c on dial %d, got %q ok=%v", i, ip, ok)
@@ -361,18 +364,74 @@ func TestPinOneShot(t *testing.T) {
 		p.advance()
 		p.advanceIP()
 	}
-	p.markSuspect("ip", "c", "test")
+	p.markSuspect("ip", "b", "test") // burning a non-pinned edge must not disturb the pin
 	if ip, _, _ := p.current(); ip != "c" {
-		t.Fatalf("within the pin window a suspect mark must not override the pin, got %q", ip)
+		t.Fatalf("a burn of a non-pinned edge must not override the pin, got %q", ip)
 	}
-	// After the window the pin expires and rotation resumes: c is suspect, so current() must move
-	// off it to a healthy edge (proving it is no longer forced / not sticky-forever).
+	// It is not sticky-forever: without a land, the pin self-releases once pinTTL lapses (c was never
+	// burned, so this exercises pure time-expiry — the proven-block release path is TestPinReleasesOnProvenBlock).
 	*now += pinTTL + 1
 	if p.isPinned() {
-		t.Fatal("pin must expire after pinTTL")
+		t.Fatal("pin must no longer be honoured after pinTTL")
 	}
-	if ip, _, _ := p.current(); ip == "c" {
-		t.Fatalf("after the pin expires a suspect edge must not be forced; got %q", ip)
+	p.current() // the expired pin is lazily cleared on the next selection
+	if p.pinIP != "" || p.pinUntil != 0 {
+		t.Fatalf("expired pin not cleared: pinIP=%q pinUntil=%d", p.pinIP, p.pinUntil)
+	}
+}
+
+// TestPinReleasesOnProvenBlock locks in the pin-safety fix: pinning an edge that turns out to be
+// genuinely blocked must not hang the tunnel for the whole pinTTL. When a differential probe PROVES
+// the pinned edge blocked (markSuspect — the attributeFailure path), the pin self-releases at once
+// so current() falls back to a healthy edge immediately. This is the "I pinned 172, it was really
+// blocked, the tunnel dropped for 30s and never landed" report.
+func TestPinReleasesOnProvenBlock(t *testing.T) {
+	p, _ := clockPool([]string{"a", "b"}, snis("x"), true, "")
+	if !p.selectEntry("ip", "b") { // operator jumps onto b
+		t.Fatal("selectEntry should find b")
+	}
+	if ip, _, _ := p.current(); ip != "b" {
+		t.Fatalf("pin must force b, got %q", ip)
+	}
+	// The dial onto b fails and the differential probe proves b blocked -> markSuspect("ip","b").
+	p.markSuspect("ip", "b", "ip_blocked")
+	if p.isPinned() {
+		t.Fatal("a proven block of the pinned edge must release the pin, not hold it for pinTTL")
+	}
+	if p.pinIP != "" || p.pinUntil != 0 {
+		t.Fatalf("pin state not cleared: pinIP=%q pinUntil=%d", p.pinIP, p.pinUntil)
+	}
+	// Recovery is immediate: current() now returns the healthy edge a, not the blocked pinned b.
+	if ip, _, ok := p.current(); !ok || ip != "a" {
+		t.Fatalf("after the pin released, current() must fall back to healthy a, got %q ok=%v", ip, ok)
+	}
+	// The auto-release is surfaced to the operator as a pool/pin_dropped event.
+	got := 0
+	p.mu.Lock()
+	for _, e := range p.events {
+		if e.Kind == "pool" && e.Code == "pin_dropped" {
+			got++
+		}
+	}
+	p.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("want exactly one pool/pin_dropped event, got %d", got)
+	}
+}
+
+// TestPinHeldOnGuiltyPartnerAxis proves the release is axis-precise: an IP-pin must SURVIVE a burn
+// of a guilty SNI (the free axis), so current() keeps the pinned IP and just heals the SNI around it.
+func TestPinHeldOnGuiltyPartnerAxis(t *testing.T) {
+	p, _ := clockPool([]string{"a", "b"}, snis("x", "y"), true, "")
+	if !p.selectEntry("ip", "b") {
+		t.Fatal("selectEntry should find b")
+	}
+	p.markSuspect("sni", "x", "sni_blocked") // the SNI is guilty, not the pinned IP
+	if !p.isPinned() || p.pinIP != "b" {
+		t.Fatalf("burning the free (SNI) axis must not release an IP pin: pinIP=%q pinned=%v", p.pinIP, p.isPinned())
+	}
+	if ip, sni, _ := p.current(); ip != "b" || sni.host == "x" {
+		t.Fatalf("current() must keep pinned ip=b and heal off the guilty sni x, got ip=%q sni=%q", ip, sni.host)
 	}
 }
 
