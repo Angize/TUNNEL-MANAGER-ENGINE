@@ -1370,9 +1370,24 @@ func (b *TCP) dialLoop() {
 		// keeps the same edge — the timer is stopped before that path runs.
 		var rot *time.Timer
 		var rotated atomic.Bool
-		if b.pool != nil && b.rotate > 0 && !b.pool.isPinned() { // a pin freezes the edge: no auto-rotation
+		if b.pool != nil && b.rotate > 0 {
 			c := conn
-			rot = time.AfterFunc(b.rotate, func() { rotated.Store(true); b.pool.advance(); c.Close() })
+			// Arm the rotation timer regardless of the CURRENT pin state and re-check the pin when it
+			// FIRES. A pin is applied by re-dialing onto the chosen edge, so isPinned() is true at THIS
+			// connection's setup; gating the ARM on it (the old behaviour) suppressed the timer for the
+			// whole connection — and because the pin lands and clears mid-connection while the timer is
+			// only armed once, rotation stayed frozen for the life of a healthy (never-dying) connection.
+			// Now the pin only freezes rotation for its OWN window: while still pinned at fire time, skip
+			// this beat and re-arm; once the pin has cleared, rotate normally.
+			rot = time.AfterFunc(b.rotate, func() {
+				if b.pool.isPinned() {
+					rot.Reset(b.rotate) // still pinned — hold rotation off, but keep checking (never freeze)
+					return
+				}
+				rotated.Store(true)
+				b.pool.advance()
+				c.Close()
+			})
 		} else if (b.pp != nil && b.pp.rotate > 0) || (b.sp != nil && b.sp.rotate > 0) {
 			c := conn
 			iv := time.Duration(0) // fire on whichever pool has the (longer) rotate interval set
