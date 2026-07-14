@@ -86,6 +86,11 @@ const (
 var (
 	errDesync      = errors.New("core/tcp: stream desync")
 	errPingTimeout = errors.New("core/tcp: keepalive pings unanswered")
+	// errFrameTooBig means a single packet does not fit the frame's uint16 length ceiling — a property
+	// of THIS packet (e.g. a GSO-coalesced super-packet larger than the TUN MTU), not a dead carrier.
+	// The carrier stays up and the packet is dropped, so the same packet can't poison the tunnel by
+	// re-closing it on every reconnect.
+	errFrameTooBig = errors.New("core/tcp: frame exceeds max size")
 )
 
 // connFramer wraps a stream connection and owns the seal<->frame transform in
@@ -174,7 +179,7 @@ func (cf *connFramer) writeFrame(typ byte, payload []byte) error {
 			return err
 		}
 		if len(sealed) > maxFrame {
-			return io.ErrShortWrite
+			return errFrameTooBig
 		}
 		out := make([]byte, 2+len(sealed))
 		var lb [2]byte
@@ -200,7 +205,7 @@ func (cf *connFramer) writeFrame(typ byte, payload []byte) error {
 	}
 	n := 2 + len(sealed)
 	if n > maxFrame {
-		return io.ErrShortWrite
+		return errFrameTooBig
 	}
 	out := make([]byte, 2+n)
 	binary.BigEndian.PutUint16(out[0:2], uint16(n))
@@ -2088,6 +2093,14 @@ func (b *TCP) tunLoop() {
 			continue // no live peer connection yet
 		}
 		if err := cf.writeFrame(typeData, buf[:n]); err != nil {
+			if errors.Is(err, errFrameTooBig) {
+				// A single packet too large to frame (a GSO/jumbo super-packet past the TUN MTU): DROP it
+				// and keep the carrier. Closing here would re-read the same packet after reconnect and
+				// close again — a poison packet that flaps the tunnel forever. The peer's L4 retransmits a
+				// correctly-sized segment; a proper TUN MTU stops this arising at all.
+				log.Printf("core/tcp: dropping oversize packet (%d bytes) — too large to frame", n)
+				continue
+			}
 			b.onConnErr(cf, err)
 		}
 	}
