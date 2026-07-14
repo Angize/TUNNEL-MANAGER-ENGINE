@@ -24,6 +24,43 @@ func clockPool(ips []string, snis []wsSNIEntry, autoBurn bool, statusPath string
 	return p, &now
 }
 
+// TestWSPoolStandbyNeverCollidesWithActive checks the warm-standby edge selection: however many times the
+// standby is rebuilt (a CDN reaps the idle standby, over and over), it is always aimed at a DIFFERENT IP
+// than the live active edge — so a proactive rotation always moves to a real, distinct edge instead of
+// silently promoting onto the active's own edge. Regression for the "rotation silently stopped / both
+// edges ended up the same" report across the ws-family carriers (ws, xhttp-grpc, xhttp-packet-up).
+func TestWSPoolStandbyNeverCollidesWithActive(t *testing.T) {
+	p := newWSPool([]string{"a", "b"}, snis("x"), true, "")
+	standbyIP := func() string { // mimic warmEstablish(standby): aim, then read the edge via current()
+		p.aimStandby()
+		ip, _, ok := p.current()
+		if !ok {
+			t.Fatal("current() returned not-ok on a healthy 2-IP pool")
+		}
+		return ip
+	}
+	for _, active := range []string{"a", "b"} {
+		p.setActive(activeLabel(active, "x"))
+		for round := 0; round < 20; round++ { // the CDN keeps reaping + rebuilding the idle standby
+			if got := standbyIP(); got == active {
+				t.Fatalf("active=%s: standby collided with the active edge on rebuild %d", active, round)
+			}
+		}
+	}
+	// Three IPs: the standby must still never be the active, and should still be a healthy edge.
+	p3 := newWSPool([]string{"a", "b", "c"}, snis("x"), true, "")
+	for _, active := range []string{"a", "b", "c"} {
+		p3.setActive(activeLabel(active, "x"))
+		for round := 0; round < 12; round++ {
+			p3.aimStandby()
+			ip, _, ok := p3.current()
+			if !ok || ip == active {
+				t.Fatalf("3-IP active=%s: standby landed on the active (%q) on rebuild %d", active, ip, round)
+			}
+		}
+	}
+}
+
 func TestPoolRotatesAllCombos(t *testing.T) {
 	p := newWSPool([]string{"a", "b"}, snis("x", "y"), true, "")
 	seen := map[string]bool{}

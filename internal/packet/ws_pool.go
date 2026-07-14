@@ -15,6 +15,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -400,6 +401,35 @@ func (p *wsPool) advance() {
 	p.mu.Lock()
 	p.stepLocked()
 	p.mu.Unlock()
+}
+
+// aimStandby positions the rotation cursor for the WARM STANDBY dial: onto a HEALTHY edge whose IP
+// differs from the LIVE ACTIVE edge's IP, so the standby is always built on a DIFFERENT edge than the
+// active and can never collide with it. It replaces a blind advance() for the standby path: the shared
+// cursor is NOT anchored to the active edge, so after a standby reconnect (a CDN reaps the idle standby)
+// or a dial-failure advance, a plain step can walk the standby onto the ACTIVE's own IP. Proactive
+// rotation then "promotes" that standby to the SAME edge — no real switch, and setActive sees no change
+// so the panel logs nothing (the "rotation silently stopped" report) while edge diversity is lost.
+// Anchoring to "not the active IP" fixes it at the source. Falls back to a plain step when there is no
+// distinct healthy IP (single-IP pool, or every other IP burned) so the SNI axis still varies where it can.
+func (p *wsPool) aimStandby() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.ips) == 0 || len(p.snis) == 0 {
+		return
+	}
+	activeIP := p.active // p.active is "ip · sni"; take the IP before the separator
+	if k := strings.Index(activeIP, " · "); k >= 0 {
+		activeIP = activeIP[:k]
+	}
+	for off := 1; off <= len(p.ips); off++ {
+		idx := (p.i + off) % len(p.ips)
+		if ip := p.ips[idx]; ip != activeIP && p.ipHealth[ip] == nil {
+			p.i = idx // a healthy edge on a DIFFERENT IP than the active — the standby's home
+			return
+		}
+	}
+	p.stepLocked() // no distinct healthy IP available — degrade to a plain step (still varies the SNI axis)
 }
 
 // advanceIP / advanceSNI rotate a single dimension (manual "rotate now, IP only" /
