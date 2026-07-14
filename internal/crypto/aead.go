@@ -134,6 +134,14 @@ func aeadFactory(name string) (mk func(key []byte) (cipher.AEAD, error), keyLen 
 // s→c; server the reverse), so the two ends of a tunnel interoperate. This is the
 // pre-handshake / no-forward-secrecy path; sealerFromKeys is used once an
 // ephemeral session is negotiated (see handshake.go).
+//
+// VALIDATION/BOOTSTRAP ONLY — do NOT seal live traffic with this. The keys are a
+// pure function of the PSK, so the send counter restarts from 0 every run: two
+// processes (or one after a restart) would reuse (key, nonce) pairs and void the
+// AEAD's confidentiality/integrity. It exists solely to fail fast on a bad
+// cipher/PSK at startup (main.go keeps only s.Name and drops the sealer). All real
+// frames go through SessionSealer, whose keys are salted by a fresh per-session
+// ephemeral so no two sessions — and no restart — ever share a keystream.
 func NewSealer(cipherName, psk string, isClient bool) (*Sealer, error) {
 	name := ResolveCipher(cipherName)
 	_, keyLen, err := aeadFactory(name)

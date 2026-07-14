@@ -349,7 +349,17 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Transport == "flux" {
 		if c.FluxRotateSecs == 0 {
-			c.FluxRotateSecs = 600
+			// Honor the tuned global default (flux_rotate_default_secs) when the tunnel leaves the epoch
+			// length unset; fall back to 600 when the knob is unset/invalid. Resolving it to a concrete
+			// value HERE (not leaving 0 for the carrier's defaultFluxRotate) keeps both ends computing the
+			// same epoch and avoids a divide-by-zero in fluxEpochAt. Both ends share the global tuning.
+			d := int64(600)
+			if c.Tuning != nil && c.Tuning.FluxRotateDefSecs > 0 {
+				if d = c.Tuning.FluxRotateDefSecs; d > 86400 {
+					d = 86400
+				}
+			}
+			c.FluxRotateSecs = int(d)
 		}
 		if c.FluxCarrier == "" {
 			c.FluxCarrier = "udp"
@@ -426,9 +436,16 @@ func (c *Config) validate() error {
 		if c.Listen == "" {
 			return errors.New("server role requires \"listen\"")
 		}
-		for _, la := range c.ListenIPs { // pooled server: each bind must be a valid host:port
-			if _, _, err := net.SplitHostPort(la); err != nil {
+		for _, la := range c.ListenIPs { // pooled server: each bind must be a valid IP:port (we bind these directly)
+			host, port, err := net.SplitHostPort(la)
+			if err != nil {
 				return fmt.Errorf("listen_ips entry %q must be host:port: %w", la, err)
+			}
+			if net.ParseIP(host) == nil {
+				return fmt.Errorf("listen_ips entry %q has a non-IP host (each bind must be a literal IP)", la)
+			}
+			if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+				return fmt.Errorf("listen_ips entry %q has an invalid port", la)
 			}
 		}
 	case "client":

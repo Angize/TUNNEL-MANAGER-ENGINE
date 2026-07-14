@@ -405,3 +405,94 @@ func TestRotationControllerCouplesSource(t *testing.T) {
 		t.Fatalf("source-only fail should advance the source once, got %d", n)
 	}
 }
+
+// TestRotationControllerPinAutoReleasesOnProvenBlock checks R1: a manual pin on an endpoint that stays
+// blocked auto-releases after pinFailRelease proven-dead rounds so the tunnel recovers instead of freezing
+// on it for the whole pinTTL — and a success in between resets the count so a real transient never
+// releases a good pin.
+func TestRotationControllerPinAutoReleasesOnProvenBlock(t *testing.T) {
+	clk := int64(1000)
+	dst := NewPeerPool([]string{"d0", "d1"}, true, 0, "")
+	dst.now = func() int64 { return clk }
+	rc := newRotationController(dst, nil)
+	if !dst.selectEntry("d1") {
+		t.Fatal("selectEntry d1 failed")
+	}
+	moves := 0
+	rotDst := func(bool) { moves++ }
+	rotSrc := func(bool) {}
+
+	// The rounds before the release threshold are absorbed: the pin holds and no failover happens.
+	for i := 0; i < pinFailRelease-1; i++ {
+		rc.fail(rotDst, rotSrc)
+		if !dst.isPinned() {
+			t.Fatalf("pin must survive proven-dead round %d (< pinFailRelease)", i)
+		}
+		if moves != 0 {
+			t.Fatalf("no failover while the pin is held, got moves=%d", moves)
+		}
+	}
+	// A live success resets the counter AND lands (clears) the pin. Re-pin and confirm the release count
+	// restarts from zero — accumulated rounds from a prior pin must never leak into a fresh one.
+	rc.success()
+	if dst.isPinned() {
+		t.Fatal("success() lands the pin, so it must clear it")
+	}
+	if !dst.selectEntry("d1") {
+		t.Fatal("re-pin d1 failed")
+	}
+	moves = 0
+	for i := 0; i < pinFailRelease-1; i++ {
+		rc.fail(rotDst, rotSrc)
+		if !dst.isPinned() {
+			t.Fatalf("the count must restart after success; the re-pin must survive round %d", i)
+		}
+		if moves != 0 {
+			t.Fatalf("no failover while the re-pin is held, got moves=%d", moves)
+		}
+	}
+	// The pinFailRelease-th consecutive proven-dead round releases the pin AND fails over in the same call.
+	rc.fail(rotDst, rotSrc)
+	if dst.isPinned() {
+		t.Fatal("a pin on a proven-blocked endpoint must auto-release at pinFailRelease")
+	}
+	if moves != 1 {
+		t.Fatalf("the releasing round must also fail over off the blocked endpoint, got moves=%d", moves)
+	}
+}
+
+// TestPeerPoolExpirePinFlushesStatus checks P1: when a pin's TTL lapses, the status file the panel reads
+// is flushed so it stops showing a pin the dataplane no longer honours.
+func TestPeerPoolExpirePinFlushesStatus(t *testing.T) {
+	dir := t.TempDir()
+	sp := dir + "/core-x.peerpool"
+	clk := int64(1000)
+	p := NewPeerPool([]string{"a", "b"}, true, 0, sp)
+	p.now = func() int64 { return clk }
+	p.selectEntry("b") // pins b and writes the status file with pin=b
+	readPin := func() string {
+		data, err := os.ReadFile(sp)
+		if err != nil {
+			t.Fatalf("status read: %v", err)
+		}
+		var st struct {
+			Pin string `json:"pin"`
+		}
+		if err := json.Unmarshal(data, &st); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return st.Pin
+	}
+	if readPin() != "b" {
+		t.Fatalf("status should show pinned b, got %q", readPin())
+	}
+	p.expirePinIfLapsed() // still within TTL -> no change
+	if readPin() != "b" {
+		t.Fatalf("pin within its TTL must stay in the status file, got %q", readPin())
+	}
+	clk += pinTTL + 1 // TTL lapses
+	p.expirePinIfLapsed()
+	if readPin() != "" {
+		t.Fatalf("status must clear the pin once its TTL lapses, got %q", readPin())
+	}
+}

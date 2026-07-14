@@ -348,6 +348,39 @@ func (p *PeerPool) pinLanded() {
 	}
 }
 
+// releasePin drops a manual pin whose endpoint has been PROVEN blocked (repeated failovers that never
+// landed), so current() stops forcing the dead endpoint for the rest of pinTTL and the tunnel recovers on
+// a live endpoint at once. A transient outage never reaches here — it heals before the fail threshold —
+// so only a decisively-blocked pin ends this way. Writes the status file so the panel reflects the
+// released pin immediately. No-op when no pin is set.
+func (p *PeerPool) releasePin() {
+	p.mu.Lock()
+	changed := p.pinKey != ""
+	if changed {
+		p.pinKey, p.pinUntil = "", 0
+	}
+	p.mu.Unlock()
+	if changed {
+		p.writeStatus()
+	}
+}
+
+// expirePinIfLapsed clears — and flushes to the status file — a pin whose TTL has just lapsed with no
+// landing. current() also drops a lapsed pin, but it runs under the hot lock and cannot write the status
+// file, so without this the panel keeps showing a pin the dataplane no longer honours until the next
+// unrelated status write. Writes ONLY on the expiry transition, so it is a no-op on the steady 1s tick.
+func (p *PeerPool) expirePinIfLapsed() {
+	p.mu.Lock()
+	lapsed := p.pinKey != "" && p.now() >= p.pinUntil
+	if lapsed {
+		p.pinKey, p.pinUntil = "", 0
+	}
+	p.mu.Unlock()
+	if lapsed {
+		p.writeStatus()
+	}
+}
+
 // pinnedLocked reports whether a manual pin is still in its force window. Caller holds p.mu.
 func (p *PeerPool) pinnedLocked() bool { return p.pinKey != "" && p.now() < p.pinUntil }
 
@@ -405,6 +438,7 @@ func (p *PeerPool) readSelectCmd() (key string, ok bool) {
 type rotationController struct {
 	dst, src *PeerPool
 	destRot  int
+	pinFails int // consecutive proven-dead rounds while a pin is in force -> auto-release at pinFailRelease
 	rotate   time.Duration
 	rotateAt time.Time
 }
@@ -435,7 +469,25 @@ func (c *rotationController) pinned() bool {
 // operator pin is in force it is a no-op — current() forces the pinned endpoint until it lands or lapses.
 func (c *rotationController) fail(rotDst, rotSrc func(proactive bool)) {
 	if c.pinned() {
-		return
+		// A pinned endpoint proven blocked auto-releases so the tunnel recovers NOW instead of freezing on
+		// it for the rest of pinTTL — the datagram/direct analogue of the ws pool's releasePinLocked. Each
+		// call here is already a proven-dead round (peerFailThreshold retransmits, or a full clear-mode
+		// staleness window, with no session), so a transient blip never reaches even one round; only after
+		// pinFailRelease decisive rounds do we drop the pin and fall through to normal failover this call.
+		c.pinFails++
+		if c.pinFails < pinFailRelease {
+			return
+		}
+		c.pinFails = 0
+		if c.dst != nil {
+			c.dst.releasePin()
+		}
+		if c.src != nil {
+			c.src.releasePin()
+		}
+		// pins cleared — fall through and burn+advance off the blocked endpoint this round
+	} else {
+		c.pinFails = 0 // not pinned -> reset so a later pin starts its release count fresh
 	}
 	if c.dst != nil {
 		rotDst(false)
@@ -457,6 +509,7 @@ func (c *rotationController) fail(rotDst, rotSrc func(proactive bool)) {
 // (empty when nothing healed), so the carrier can surface a discrete heal event.
 func (c *rotationController) success() (dstHealed, srcHealed string) {
 	c.destRot = 0
+	c.pinFails = 0 // a live success (the pin landed, or the endpoint healed) resets the release count
 	if c.dst != nil {
 		dstHealed = c.dst.succeeded()
 		c.dst.pinLanded() // atomically release a pin that has now landed (no-op when unpinned)
@@ -496,11 +549,13 @@ func (c *rotationController) pollPins(applyDst, applySrc func()) {
 		if key, ok := c.dst.readSelectCmd(); ok && c.dst.selectEntry(key) {
 			applyDst()
 		}
+		c.dst.expirePinIfLapsed() // flush the status file the moment a lapsed pin stops being honoured
 	}
 	if c.src != nil {
 		if key, ok := c.src.readSelectCmd(); ok && c.src.selectEntry(key) {
 			applySrc()
 		}
+		c.src.expirePinIfLapsed()
 	}
 }
 

@@ -165,6 +165,73 @@ func TestWSEdgeIPsValidated(t *testing.T) {
 	}
 }
 
+// TestListenIPsValidated checks that a pooled server's listen_ips must each be a literal IP:port —
+// a hostname, a missing port, or an out-of-range port is rejected at load (we bind these directly).
+func TestListenIPsValidated(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Role: "server", Mode: "packet", Profile: "core", Transport: "udp",
+			Listen: "0.0.0.0:9000", TunAddr: "10.200.0.1/24",
+			Crypto: CryptoCfg{Enabled: true, PSK: "a-sufficiently-long-preshared-key"},
+		}
+	}
+	c := base()
+	c.ListenIPs = []string{"203.0.113.9:9000", "198.51.100.7:9000"}
+	if err := c.validate(); err != nil {
+		t.Errorf("valid ip:port listen_ips rejected: %v", err)
+	}
+	c = base()
+	c.ListenIPs = []string{"host.example.com:9000"} // hostname — a bind needs a literal IP
+	if err := c.validate(); err == nil {
+		t.Error("listen_ips with a hostname was accepted")
+	}
+	c = base()
+	c.ListenIPs = []string{"203.0.113.9"} // missing the port
+	if err := c.validate(); err == nil {
+		t.Error("listen_ips without a port was accepted")
+	}
+	c = base()
+	c.ListenIPs = []string{"203.0.113.9:70000"} // port out of range
+	if err := c.validate(); err == nil {
+		t.Error("listen_ips with an out-of-range port was accepted")
+	}
+}
+
+// TestFluxRotateHonoursTunedDefault checks that a flux tunnel with no explicit epoch length resolves
+// FluxRotateSecs from the tuned global default (bounded), and falls back to 600 when the knob is unset.
+func TestFluxRotateHonoursTunedDefault(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Role: "client", Mode: "packet", Profile: "core", Transport: "flux",
+			Peer: "203.0.113.9:9000", TunAddr: "10.200.0.2/24",
+			Crypto: CryptoCfg{Enabled: true, PSK: "a-sufficiently-long-preshared-key"},
+		}
+	}
+	c := base() // no tuning -> default 600
+	c.applyDefaults()
+	if c.FluxRotateSecs != 600 {
+		t.Errorf("unset flux rotate should default to 600, got %d", c.FluxRotateSecs)
+	}
+	c = base()
+	c.Tuning = &TuningCfg{FluxRotateDefSecs: 1200}
+	c.applyDefaults()
+	if c.FluxRotateSecs != 1200 {
+		t.Errorf("flux rotate should honour the tuned default 1200, got %d", c.FluxRotateSecs)
+	}
+	c = base()
+	c.Tuning = &TuningCfg{FluxRotateDefSecs: 999999} // absurd -> clamped to the 86400 ceiling
+	c.applyDefaults()
+	if c.FluxRotateSecs != 86400 {
+		t.Errorf("an over-large tuned flux default should clamp to 86400, got %d", c.FluxRotateSecs)
+	}
+	c = base()
+	c.FluxRotateSecs = 42 // an explicit value is never overridden by the default
+	c.applyDefaults()
+	if c.FluxRotateSecs != 42 {
+		t.Errorf("an explicit flux rotate must be preserved, got %d", c.FluxRotateSecs)
+	}
+}
+
 // validUDP is a minimal valid udp-transport client config to mutate in peer-pool tests.
 func validUDP() *Config {
 	return &Config{

@@ -317,7 +317,10 @@ func main() {
 	// destination pool (same rotate/auto-burn settings). raw/flux swap the crafted-header source, udp
 	// rebinds its socket, tcp re-dials with a new LocalAddr. Only the direct carriers implement it. The
 	// source pool doesn't own a status file (the destination pool writes the panel-facing status).
-	if cfg.Role == "client" && len(cfg.SrcIPs) >= 2 {
+	// >=1 (not >=2): a LONE src_ip is a fixed source that supersedes bind_ip (per the field doc) — it
+	// wires a 1-entry pool that seeds the source and never rotates. Without this a single src_ip was
+	// silently ignored and the kernel picked the default egress IP. A >=2 pool rotates as before.
+	if cfg.Role == "client" && len(cfg.SrcIPs) >= 1 {
 		if s, ok := b.(interface{ SetSourcePool(*packet.PeerPool) }); ok {
 			sp := packet.NewPeerPool(cfg.SrcIPs, cfg.PeerAutoBurn, time.Duration(cfg.PeerRotateSecs)*time.Second, cfg.SrcStatusPath)
 			s.SetSourcePool(sp)

@@ -124,6 +124,13 @@ func (b *UDP) SetPeerPool(pp *PeerPool) {
 // to ride out a slow handshake / brief loss, short enough to fail over from a blocked IP quickly.
 const peerFailThreshold = 12
 
+// pinFailRelease is how many proven-dead rounds (each already peerFailThreshold retransmits, or a full
+// clear-mode staleness window, of no session) a manual pin absorbs before it auto-releases so the tunnel
+// recovers instead of freezing on a blocked endpoint for the rest of pinTTL. The direct/datagram analogue
+// of the ws pool's releasePinLocked. Two rounds keeps a real transient (which heals before even one round)
+// from ever releasing a good pin, while still recovering well inside a manual pick's useful window.
+const pinFailRelease = 2
+
 // rotatePeerUDP points the client at the next pool endpoint: burn+advance (proactive=false) or a
 // timed rotate (proactive=true). It resolves the endpoint and swaps b.peer, then clears the session
 // so the next loop re-handshakes against the new destination. No-op when the pool did not move.
