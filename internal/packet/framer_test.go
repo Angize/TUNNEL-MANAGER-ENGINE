@@ -3,6 +3,7 @@ package packet
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"testing"
@@ -10,6 +11,21 @@ import (
 
 	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/crypto"
 )
+
+// TestWriteFrameOversizeIsDroppable locks in the poison-packet fix: a single packet too large to fit
+// the uint16 frame ceiling must return the distinct errFrameTooBig (so tunLoop DROPS it and keeps the
+// carrier), not a generic write error (which would close the carrier and re-drop the same packet on
+// every reconnect). Checked for both the obfs and non-obfs framers.
+func TestWriteFrameOversizeIsDroppable(t *testing.T) {
+	for _, obfs := range []bool{false, true} {
+		client, _, done := cfPair(t, obfs, "framer-oversize-psk-1234567890")
+		big := make([]byte, maxFrame) // sealing adds the AEAD tag + 2-byte length -> over maxFrame
+		if err := client.writeFrame(typeData, big); !errors.Is(err, errFrameTooBig) {
+			t.Fatalf("obfs=%v: oversize writeFrame err = %v, want errFrameTooBig", obfs, err)
+		}
+		done()
+	}
+}
 
 func errfmt(format string, a ...any) error { return fmt.Errorf(format, a...) }
 

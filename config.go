@@ -549,6 +549,14 @@ func (c *Config) validate() error {
 			if len(c.WSEdgeIPs) == 0 || len(c.WSEdgeSNIs) == 0 {
 				return errors.New("ws edge pool needs at least one edge IP and one SNI")
 			}
+			// Every edge is dialed directly as "ip:port" with no DNS step, exactly like the other
+			// rotation pools — so validate the literal IP+port here instead of letting a malformed/
+			// hostname entry reach the data plane and silently burn the edge.
+			for _, e := range c.WSEdgeIPs {
+				if err := validatePoolEndpoint("ws_edge_ips", e, true); err != nil {
+					return err
+				}
+			}
 			for _, s := range c.WSEdgeSNIs {
 				if s.Host == "" {
 					return errors.New("ws edge pool: an SNI entry has no host")

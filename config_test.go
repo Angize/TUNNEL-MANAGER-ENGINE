@@ -138,6 +138,33 @@ func TestWSPoolNoHost(t *testing.T) {
 	}
 }
 
+// TestWSEdgeIPsValidated locks in that ws_edge_ips are validated as literal ip:port like every other
+// rotation pool — a hostname or a portless entry must be rejected at config load, not silently reach
+// the data plane (where the pool dials the raw string with no DNS and the edge just burns).
+func TestWSEdgeIPsValidated(t *testing.T) {
+	base := func() *Config {
+		return &Config{
+			Role: "client", Mode: "packet", Profile: "core", Transport: "ws",
+			Peer: "203.0.113.9", TunAddr: "10.200.0.2/24", WSTLS: true,
+			WSEdgeSNIs: []WSSNI{{Host: "cdn.example.com"}},
+			Crypto:     CryptoCfg{Enabled: true, PSK: "a-sufficiently-long-preshared-key"},
+		}
+	}
+	if c := base(); func() bool { c.WSEdgeIPs = []string{"104.16.0.1:443", "104.17.0.1:443"}; return c.validate() != nil }() {
+		t.Error("valid ip:port ws_edge_ips rejected")
+	}
+	c := base()
+	c.WSEdgeIPs = []string{"cdn.example.com:443"} // hostname — the pool dials IPs directly, no DNS
+	if err := c.validate(); err == nil {
+		t.Error("ws_edge_ips with a hostname was accepted")
+	}
+	c = base()
+	c.WSEdgeIPs = []string{"104.16.0.1"} // missing the port
+	if err := c.validate(); err == nil {
+		t.Error("ws_edge_ips without a port was accepted")
+	}
+}
+
 // validUDP is a minimal valid udp-transport client config to mutate in peer-pool tests.
 func validUDP() *Config {
 	return &Config{
