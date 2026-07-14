@@ -60,6 +60,13 @@ const (
 	fecKeepBlocks = 64                        // receiver: how many recent blocks to retain
 	fecMaxBytes   = 64 << 20                  // receiver: cap total bytes buffered across live blocks (anti-amplification)
 
+	// fecMaxCodecs caps the number of DISTINCT (n,k) Reed-Solomon codecs the decoder caches. A real
+	// encoder uses one fixed (n,k) (or a tiny handful), but fecDecoder.input runs BEFORE peer auth, so
+	// an unauthenticated peer can spray unique (n,k) block headers; each cached codec pins a k×n
+	// GF(256) matrix that fecMaxBytes does NOT budget, so an unbounded cache is a memory-exhaustion
+	// DoS (~32k valid pairs -> hundreds of MB). 64 covers any legitimate config with wide headroom.
+	fecMaxCodecs = 64
+
 	// fecMaxShardLen caps the shard length a peer may declare in a block header. A real
 	// shard is one sealed frame ([len:2]+ciphertext) zero-padded to the block's largest
 	// shard, so it is MTU-bounded — well under this even for jumbo frames. Rejecting a
@@ -204,6 +211,13 @@ func (d *fecDecoder) codec(n, k int) *fecCodec {
 	key := n<<8 | k
 	if c := d.codecs[key]; c != nil {
 		return c
+	}
+	// Refuse to cache a new codec past the cap: input runs pre-auth, so a hostile peer could otherwise
+	// spray unique (n,k) headers and pin an unbounded set of GF(256) matrices (unbudgeted by
+	// fecMaxBytes). A legit encoder needs only a tiny fixed set, so this never rejects real traffic; a
+	// refusal just skips FEC recovery for that block (the caller nil-checks and returns) — best-effort.
+	if len(d.codecs) >= fecMaxCodecs {
+		return nil
 	}
 	c, err := newFECCodec(n, k)
 	if err != nil {

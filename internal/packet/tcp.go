@@ -2098,10 +2098,15 @@ func (b *TCP) readLoop(cf *connFramer) error {
 		if err != nil {
 			return err
 		}
-		cf.unanswered.Store(0) // any inbound frame proves the peer is alive -> reset ping-loss
 		if cf.sealer != nil && !cf.rp.ok(session, seq) {
-			continue // authenticated but replayed -> ignore, keep the connection
+			// Authenticated but replayed/duplicate -> ignore and keep the connection, but do NOT credit
+			// it as liveness: a replay can be a stale network duplicate or an on-path re-injection of a
+			// captured frame, so resetting ping-loss here would let an attacker (or a lossy path) keep a
+			// silently black-holed carrier pinned "alive" and defeat the fast ping-loss self-heal. Only a
+			// FRESH (non-replayed) frame proves the live peer is still answering.
+			continue
 		}
+		cf.unanswered.Store(0) // a fresh inbound frame proves the peer is alive -> reset ping-loss
 		b.handleFrame(cf, typ, payload)
 	}
 }
