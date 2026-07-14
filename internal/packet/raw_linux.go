@@ -75,6 +75,9 @@ type Raw struct {
 	ci       atomic.Pointer[crypto.Ephemeral]
 	seq      atomic.Uint32
 	lastRx   atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
+	// peerAnswered gates the clear-mode heal: set when the CURRENT endpoint replies, cleared on
+	// rotation, so a just-jumped-to (unproven) endpoint's burn is never falsely cleared. Mirrors UDP.
+	peerAnswered atomic.Bool
 
 	fecEnc *fecEncoder                // non-nil when FEC is on: buffers data frames into RS blocks on send
 	fecDec *fecDecoder                // non-nil when FEC is on: reassembles + reconstructs blocks on receive
@@ -728,6 +731,8 @@ func (r *Raw) deliver(body []byte, addr *net.IPAddr) {
 	if len(body) < 2 || body[0] != magic {
 		return
 	}
+	r.lastRx.Store(time.Now().UnixNano()) // liveness: the peer is answering (clear mode has no session to prove it)
+	r.peerAnswered.Store(true)            // this endpoint has replied since we pointed at it -> safe to heal its burn
 	r.learnPeer(addr)
 	r.dispatch(body[1], iff(body[1] == typeData, body[2:], nil), addr)
 }
@@ -1005,6 +1010,11 @@ func (r *Raw) rotatePeerRaw(proactive bool) {
 	r.peer.Store(&net.IPAddr{IP: ip})
 	r.session.Store(nil)
 	r.ci.Store(nil)
+	// Give the jumped-to endpoint a FRESH staleness window and mark it unproven, so a proactive jump
+	// onto a dead endpoint fails over within the dead window instead of stranding (clear mode), and its
+	// burn isn't healed until it actually replies. Mirrors rotatePeerUDP.
+	r.lastRx.Store(time.Now().UnixNano())
+	r.peerAnswered.Store(false)
 	log.Printf("raw: rotated destination to %s", addr)
 	r.st.down("peer-rotate", "raw")
 }
@@ -1072,12 +1082,24 @@ func (r *Raw) clientLoop() {
 	if rc.active() {
 		go r.pinPollLoop(rc)
 	}
+	// Seed the staleness baseline NOW (clear mode). Without it, sessionStale() returns false while
+	// lastRx==0, so a clear-mode failover-only pool whose first endpoint is dead never fires. Mirrors UDP.
+	r.lastRx.Store(time.Now().UnixNano())
 	for {
 		if r.cryptoOn && r.sealer() != nil && r.sessionStale() {
 			r.session.Store(nil) // server likely restarted — drop the dead session so we re-handshake
 			r.ci.Store(nil)
 			log.Print("raw: no reply from the peer's session — re-handshaking (peer likely restarted)")
 			r.st.down("stale", "raw") // precise reason for the panel log (nil-safe when off)
+		}
+		// Clear mode has no handshake whose failure would drive failover, so a dead pool endpoint would
+		// otherwise strand the tunnel forever. Use receive-staleness: the peer pongs our pings, so once it
+		// stops answering (lastRx ages past the dead window) burn and advance the pool. Mirrors UDP.
+		if !r.cryptoOn && rc.active() && r.sessionStale() {
+			rc.fail(r.rotatePeerRaw, r.rotateSourceRaw)
+			r.lastRx.Store(time.Now().UnixNano()) // fresh window even if the pool couldn't move (single endpoint / source-only)
+			r.peerAnswered.Store(false)           // stale -> the current endpoint is no longer proven answering
+			r.st.down("stale", "raw")
 		}
 		if r.cryptoOn && r.sealer() == nil {
 			r.sendInit()
@@ -1086,7 +1108,11 @@ func (r *Raw) clientLoop() {
 				failN = 0
 			}
 		} else {
-			if failN > 0 {
+			// Heal transient burns on endpoints proving themselves. Crypto signals via a completed
+			// handshake (failN>0); clear mode has no handshake, so use the data plane (peerAnswered set
+			// when the CURRENT endpoint replies, cleared on rotation) so a just-jumped-to endpoint's burn
+			// is never falsely cleared. Mirrors UDP.
+			if failN > 0 || (!r.cryptoOn && rc.active() && r.peerAnswered.Load()) {
 				dh, sh := rc.success()
 				if dh != "" {
 					r.st.event("heal", "peer-retest", dh) // burned destination IP recovered
