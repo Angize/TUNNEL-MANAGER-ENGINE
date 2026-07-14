@@ -1016,6 +1016,14 @@ func (f *Flux) clientLoop() {
 			failN = 0
 			f.send(typePing, nil, f.peer.Load())
 			rc.proactive(f.rotatePeerFlux, f.rotateSourceFlux, time.Now())
+			if f.cryptoOn && f.sealer() == nil {
+				// A proactive DESTINATION rotation just cleared the crypto session — loop back NOW to send
+				// the re-handshake init immediately, instead of first sleeping the 1s retransmit interval
+				// below, so the rotation gap is ~1 RTT rather than ~1s (matters for live streams). Clear
+				// mode has no session/handshake so this never fires there; a duplicated init is harmless
+				// (the server dedups via the init cache).
+				continue
+			}
 		}
 		wait := jitter(f.keepalive)
 		if f.cryptoOn && f.sealer() == nil {

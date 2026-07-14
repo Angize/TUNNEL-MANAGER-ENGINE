@@ -1458,9 +1458,11 @@ func (b *TCP) dialLoop() {
 		// ourselves — an operator pin/rotate, or a scheduled proactive rotation — is NOT a failure
 		// and is not logged as "down". A genuine death records a precise core-observed "down" reason
 		// and updates data-plane health (short session -> throttle fault + move off; sustained -> ok).
+		deliberate := false // a proactive rotation / operator pin that WE induced — re-dial at once, no backoff
 		if b.pool != nil && !b.closed.Load() {
 			cause := b.takeLastErr()
 			if b.manualSwitch.Swap(false) || rotated.Load() {
+				deliberate = true
 				b.pool.dataSuccess(label) // deliberate, healthy switch — confirm the edge was fine
 			} else {
 				b.pool.down(classifyErr(cause), label) // arms the paired "up" the next reconnect emits
@@ -1478,6 +1480,7 @@ func (b *TCP) dialLoop() {
 			// dests cycle). A death after a healthy lifetime is an ordinary drop (server restart): keep
 			// the endpoints and clear stale burns.
 			if rotated.Load() {
+				deliberate = true
 				succeedBoth()
 			} else if time.Since(connectedAt) < minLiveness {
 				burnDest()
@@ -1485,8 +1488,15 @@ func (b *TCP) dialLoop() {
 				succeedBoth()
 			}
 		}
-		if b.sleep(1 * time.Second) {
-			return
+		// Only back off before re-dialing on a GENUINE drop. A deliberate, healthy rotation (proactive
+		// timer or operator pin) re-dials immediately, so the switch gap is just the reconnect+handshake
+		// (~1 RTT) instead of reconnect + a fixed 1s — which a live stream would feel every rotation. A
+		// re-dialed edge that then dies for real hits this backoff on its NEXT (non-deliberate) drop, so
+		// a bad edge still can't be hammered.
+		if !deliberate {
+			if b.sleep(1 * time.Second) {
+				return
+			}
 		}
 	}
 }

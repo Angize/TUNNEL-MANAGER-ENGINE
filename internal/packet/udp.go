@@ -827,6 +827,13 @@ func (b *UDP) clientLoop() {
 			failN = 0
 			b.send(typePing, nil, b.peer.Load())
 			rc.proactive(b.rotatePeerUDP, b.rotateSourceUDP, time.Now()) // moving target on both sides
+			if b.cryptoOn && b.sealer() == nil {
+				// A proactive DESTINATION rotation just cleared the crypto session — loop back NOW to send
+				// the re-handshake init immediately, instead of first sleeping the 1s retransmit interval
+				// below, so the rotation gap is ~1 RTT rather than ~1s (matters for live streams). Clear
+				// mode has no session/handshake so this never fires there; a duplicated init is harmless.
+				continue
+			}
 		}
 		wait := b.keepalive
 		if b.sealer() == nil && b.cryptoOn {

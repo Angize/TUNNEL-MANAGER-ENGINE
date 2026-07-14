@@ -1098,6 +1098,13 @@ func (r *Raw) clientLoop() {
 			failN = 0
 			r.send(typePing, nil, r.peer.Load())
 			rc.proactive(r.rotatePeerRaw, r.rotateSourceRaw, time.Now())
+			if r.cryptoOn && r.sealer() == nil {
+				// A proactive DESTINATION rotation just cleared the crypto session — loop back NOW to send
+				// the re-handshake init immediately, instead of first sleeping the 1s retransmit interval
+				// below, so the rotation gap is ~1 RTT rather than ~1s (matters for live streams). Clear
+				// mode has no session/handshake so this never fires there; a duplicated init is harmless.
+				continue
+			}
 		}
 		wait := jitter(r.keepalive)
 		if r.cryptoOn && r.sealer() == nil {
