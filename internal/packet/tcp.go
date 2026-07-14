@@ -1557,9 +1557,12 @@ func (b *TCP) handshakeAndPrime(conn net.Conn) (*connFramer, error) {
 // advance is true it rotates the pool first, so a standby lands on a different edge than the
 // active. On success the pool status file is flushed (as dialLoop does on connect). On a
 // transport failure the pool is advanced so the next attempt tries a different combo.
-func (b *TCP) warmEstablish(advance bool) (*connFramer, net.Conn, string, string, error) {
-	if advance && b.pool != nil {
-		b.pool.advance()
+func (b *TCP) warmEstablish(standby bool) (*connFramer, net.Conn, string, string, error) {
+	if standby && b.pool != nil {
+		// Aim the standby at a DIFFERENT edge than the LIVE active (never collide), instead of a blind
+		// advance() a standby reconnect could walk onto the active's own edge — which turns a proactive
+		// rotation into a silent no-op switch onto the same edge and loses edge diversity.
+		b.pool.aimStandby()
 	}
 	conn, label, combo, err := b.dialCarrier()
 	if err != nil {
