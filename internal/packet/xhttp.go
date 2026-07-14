@@ -317,6 +317,37 @@ func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net
 		return b.dialer(10*time.Second).DialContext(ctx, "tcp", dialAddr)
 	}
 
+	// Track every underlying TCP conn this attempt dials so teardown can FORCE them shut. The h2
+	// path is the leak that matters: x/net/http2 multiplexes the whole session over ONE conn and,
+	// when we cancel the session's request on rotation, it only sends RST_STREAM — the TCP conn (its
+	// fd + reader/writer goroutines) stays open. We set no IdleConnTimeout on the h2 transport and
+	// never reuse it, and CloseIdleConnections races the async stream teardown (the stream count may
+	// not be 0 yet at the instant we call it), so the retired conn can linger until the far side
+	// happens to close it — or forever. Over hours of proactive rotation that accumulates fds and
+	// goroutines until a new standby dial can no longer be made: rotation silently stops while the
+	// already-open active conn keeps the tunnel up. Force-closing the raw conn on teardown is what
+	// actually releases it. (Harmless for the http/1.1 packet-up path too — those conns are already
+	// idle-reaped, and Close on an already-closed conn is a no-op error we ignore.)
+	var dialedMu sync.Mutex
+	var dialed []net.Conn
+	track := func(c net.Conn) net.Conn {
+		if c != nil {
+			dialedMu.Lock()
+			dialed = append(dialed, c)
+			dialedMu.Unlock()
+		}
+		return c
+	}
+	forceClose := func() {
+		dialedMu.Lock()
+		conns := dialed
+		dialed = nil
+		dialedMu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	}
+
 	var rt http.RoundTripper
 	var closeIdle func()
 	if b.wsTLS && b.xhTLS == nil {
@@ -338,6 +369,7 @@ func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net
 				c.Close()
 				return nil, err
 			}
+			track(c) // remember the raw fd so teardown can force it shut (h2 won't on its own)
 			return uc, nil
 		}
 		if h2 {
@@ -348,7 +380,7 @@ func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net
 					return dialTLS(ctx)
 				},
 			}
-			rt, closeIdle = h2t, h2t.CloseIdleConnections
+			rt, closeIdle = h2t, func() { h2t.CloseIdleConnections(); forceClose() }
 		} else {
 			tr := &http.Transport{
 				DialTLSContext:      func(ctx context.Context, _, _ string) (net.Conn, error) { return dialTLS(ctx) },
@@ -356,7 +388,7 @@ func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net
 				MaxIdleConnsPerHost: 8, // the streaming GET holds one conn; the packet-up POSTs reuse the rest
 				IdleConnTimeout:     90 * time.Second,
 			}
-			rt, closeIdle = tr, tr.CloseIdleConnections
+			rt, closeIdle = tr, func() { tr.CloseIdleConnections(); forceClose() }
 		}
 	} else {
 		// No TLS (plain http), or a test that overrides the edge TLS wholesale (xhTLS). The
@@ -370,7 +402,7 @@ func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net
 				if b.wsTLS {
 					c = b.fragWrap(c, host)
 				}
-				return c, nil
+				return track(c), nil
 			},
 			ForceAttemptHTTP2:   h2,
 			MaxIdleConns:        16,
@@ -381,7 +413,7 @@ func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net
 		if b.wsTLS {
 			tr.TLSClientConfig = b.xhTLS
 		}
-		rt, closeIdle = tr, tr.CloseIdleConnections
+		rt, closeIdle = tr, func() { tr.CloseIdleConnections(); forceClose() }
 	}
 
 	scheme := "http"
@@ -407,6 +439,13 @@ func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net
 		conn, _, err = b.dialXHTTPGrpc(hc, closeIdle, ctx, cancel, base, sid, dialAddr, host, setHdr)
 	default:
 		conn, _, err = b.dialXHTTPPacket(hc, closeIdle, ctx, cancel, base, sid, dialAddr, host, setHdr)
+	}
+	if err != nil {
+		// A FAILED establish (dial ok but header timeout / non-200 / write error) has cancelled the
+		// ctx but does not own a closeFn, so nothing would force-close a conn it already dialed — that
+		// is the same h2 leak, just on the failure path (a repeatedly-failing edge would bleed fds).
+		// Reap it here; on success closeFn owns this instead.
+		closeIdle()
 	}
 	return conn, err
 }

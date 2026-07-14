@@ -36,6 +36,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -664,6 +665,7 @@ func (b *TCP) Run() error {
 	go b.tunLoop()
 	if b.isClient {
 		go b.keepaliveLoop()
+		go b.diagLoop() // low-rate goroutine-count heartbeat so a slow session leak is visible in the log
 		if b.pool != nil {
 			go b.retestLoop() // background health retests with exponential backoff
 		} else if b.pp != nil || b.sp != nil {
@@ -1930,10 +1932,23 @@ func (b *TCP) dialLoopWarm() {
 			// one rotates once the standby has warmed (never drop the only live carrier). An operator
 			// pin freezes the edge, so proactive rotation is skipped entirely while pinned.
 			if b.pool != nil && b.pool.isPinned() {
+				// Pinned: rotation is intentionally frozen until the pin lands or lapses. Log it so a
+				// "rotation stopped" report can be told apart from a genuine stall (this branch used to
+				// be silent, which is exactly why a quiet rotation looked like a hang).
+				log.Printf("core/tcp: proactive rotation skipped — edge is pinned")
 				continue
 			}
 			if promote() {
 				log.Printf("core/tcp: proactive rotation — promoted warm standby")
+				requestStandby()
+			} else {
+				// No warm standby was ready to promote, so this tick is a no-op. This branch used to be
+				// SILENT — the sole reason a stalled rotation left no trace in the log and looked like a
+				// hang. Log the exact state, and (belt-and-suspenders) make sure a standby build is
+				// actually in flight: requestStandby() self-guards, so if one is already building this is
+				// a no-op, but if the state ever wedged with no standby and no build pending, this
+				// self-heals it instead of freezing rotation for good.
+				log.Printf("core/tcp: proactive rotation skipped — no warm standby ready (building=%v); ensuring a rebuild", standbyBuilding)
 				requestStandby()
 			}
 		}
@@ -2115,6 +2130,24 @@ func (b *TCP) tunLoop() {
 				continue
 			}
 			b.onConnErr(cf, err)
+		}
+	}
+}
+
+// diagLoop (client) emits a low-rate heartbeat of the process goroutine count. A carrier session
+// that is retired on rotation but not fully reaped (its reader, packet-up workers, or an underlying
+// h2 conn left dangling) shows up here as a steadily climbing number in journald — turning an
+// "it worked for hours then rotation just stopped" report into a measurable trend instead of a
+// guess. One line every few minutes is negligible log volume and never touches the data path.
+func (b *TCP) diagLoop() {
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-b.closeCh:
+			return
+		case <-t.C:
+			log.Printf("core/tcp: health — goroutines=%d", runtime.NumGoroutine())
 		}
 	}
 }
