@@ -29,9 +29,11 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -44,6 +46,7 @@ import (
 
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/crypto/chacha20"
+	"golang.org/x/crypto/cryptobyte"
 
 	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/crypto"
 	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/tlscover"
@@ -993,8 +996,22 @@ func (b *TCP) tlsToEdge(conn net.Conn, dialAddr, host string, ech []byte, live b
 // fresh RetryConfigList for the caller's self-heal. Shared by the ws (tlsToEdge) and xhttp carriers.
 func uEdgeHandshake(conn net.Conn, host string, ech []byte, alpn []string) (net.Conn, error) {
 	cfg := &utls.Config{ServerName: host}
+	var echPub string
 	if len(ech) > 0 {
 		cfg.EncryptedClientHelloConfigList = ech
+		echPub = echPublicName(ech) // the SNI the edge presents a cert for when it REJECTS our ECH
+		if echPub != "" {
+			// G1 self-heal on ECH REJECTION-with-cert-mismatch. When our ECH key is stale, the edge
+			// completes the OUTER handshake against the ECH public-name cert (e.g. cloudflare-ech.com),
+			// not `host`. uTLS's default reject path verifies THAT cert against `host`, fails with
+			// "certificate is valid for cloudflare-ech.com", and returns BEFORE it can surface the fresh
+			// RetryConfigList the rejection carries — so the core never sees the fresh key and stalls
+			// until a panel rebuild. We ACCEPT the outer cert at this hook so uTLS proceeds, stores the
+			// outer peer certs, and returns *utls.ECHRejectionError with the fresh key. We can't verify
+			// here — uTLS calls this hook BEFORE it populates ConnectionState.PeerCertificates — so the
+			// real authentication happens just below, once Handshake returns and the certs are readable.
+			cfg.EncryptedClientHelloRejectionVerify = func(utls.ConnectionState) error { return nil }
+		}
 	}
 	uc := utls.UClient(conn, cfg, utls.HelloCustom)
 	spec, err := chromeSpec(alpn)
@@ -1006,10 +1023,84 @@ func uEdgeHandshake(conn net.Conn, host string, ech []byte, alpn []string) (net.
 	}
 	conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	if err = uc.Handshake(); err != nil {
+		// On an ECH rejection uTLS hands back a fresh RetryConfigList (for the in-band self-heal) after
+		// completing the outer handshake against the ECH public-name cert — which we accepted unverified
+		// at the hook above. Authenticate that outer cert NOW, against the public name and chaining to
+		// system roots, before the caller redials with the fresh key: a forged/unauthenticated reject is
+		// downgraded to a plain error so the self-heal never adopts attacker-supplied ECH configs (which
+		// would let a MITM decrypt the redial's inner ClientHello and unmask the real SNI).
+		var echErr *utls.ECHRejectionError
+		if echPub != "" && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
+			if verr := verifyECHPublicName(uc.ConnectionState().PeerCertificates, echPub); verr != nil {
+				return nil, fmt.Errorf("ech-reject: outer cert not valid for %s: %w", echPub, verr)
+			}
+		}
 		return nil, err
 	}
 	conn.SetDeadline(time.Time{})
 	return uc, nil
+}
+
+// echConfigVersion is the ECHConfig version (draft-ietf-tls-esni-13, 0xfe0d) that uTLS parses; any
+// other-versioned config in the list is skipped. Kept in sync with utls' extensionEncryptedClientHello.
+const echConfigVersion uint16 = 0xfe0d
+
+// echPublicName parses an ECHConfigList and returns the public_name of its first usable config — the
+// SNI the edge presents a certificate for when it REJECTS our (stale) ECH. Empty on any parse failure
+// (the reject-verify hook is then left unset, falling back to uTLS' default behaviour). The wire layout
+// mirrors utls' parseECHConfig exactly: ECHConfigList = u16-len-prefixed configs; each config = u16
+// version + u16-len-prefixed contents; contents = config_id(u8) kem_id(u16) public_key(u16) suites(u16)
+// max_name_len(u8) public_name(u8) ... .
+func echPublicName(list []byte) string {
+	s := cryptobyte.String(list)
+	var configs cryptobyte.String
+	if !s.ReadUint16LengthPrefixed(&configs) {
+		return ""
+	}
+	for !configs.Empty() {
+		var version uint16
+		var contents cryptobyte.String
+		if !configs.ReadUint16(&version) || !configs.ReadUint16LengthPrefixed(&contents) {
+			return ""
+		}
+		if version != echConfigVersion {
+			continue // different-versioned config: skip its (already consumed) contents
+		}
+		var configID, maxNameLen uint8
+		var kemID uint16
+		var publicKey, cipherSuites, publicName cryptobyte.String
+		if !contents.ReadUint8(&configID) || !contents.ReadUint16(&kemID) ||
+			!contents.ReadUint16LengthPrefixed(&publicKey) || !contents.ReadUint16LengthPrefixed(&cipherSuites) ||
+			!contents.ReadUint8(&maxNameLen) || !contents.ReadUint8LengthPrefixed(&publicName) {
+			return ""
+		}
+		if name := string(publicName); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// verifyECHPublicName checks the OUTER (ECH-reject) certificate chains to a public root for the ECH
+// public name, so a network attacker can't feed the core forged RetryConfigs by presenting any random
+// cert. This gates the fresh-key HARVEST before the redial: without it a MITM could inject its own ECH
+// config and decrypt the redial's inner ClientHello (unmasking the real SNI). nil roots -> system roots.
+func verifyECHPublicName(certs []*x509.Certificate, publicName string) error {
+	return verifyOuterCert(certs, publicName, nil)
+}
+
+// verifyOuterCert is verifyECHPublicName with an injectable trust anchor (nil -> system roots), so the
+// chain + hostname logic is unit-testable against a throwaway CA without touching the system store.
+func verifyOuterCert(certs []*x509.Certificate, publicName string, roots *x509.CertPool) error {
+	if len(certs) == 0 {
+		return errors.New("ech-reject: no peer certificate")
+	}
+	opts := x509.VerifyOptions{Roots: roots, DNSName: publicName, Intermediates: x509.NewCertPool()}
+	for _, c := range certs[1:] {
+		opts.Intermediates.AddCert(c)
+	}
+	_, err := certs[0].Verify(opts)
+	return err
 }
 
 // chromeSpec returns a freshly built current-Chrome ClientHelloSpec. When alpn is non-nil it
