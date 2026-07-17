@@ -47,7 +47,7 @@ func TestRawProfileRoundTrip(t *testing.T) {
 					name string
 					pkt  []byte
 				}{{"with-ip", withIP}, {"no-ip", l4}} {
-					got, ok := rawDecap(name, variant.pkt)
+					got, ok := rawDecap(name, proto, variant.pkt)
 					if !ok {
 						t.Fatalf("profile %s payload#%d client=%v %s: decap failed", name, i, client, variant.name)
 					}
@@ -70,6 +70,58 @@ func TestRawProtoNumbers(t *testing.T) {
 	}
 	if _, ok := rawProtoFor("nope"); ok {
 		t.Error("rawProtoFor accepted an unknown profile")
+	}
+}
+
+func TestRawEffProto(t *testing.T) {
+	// bip may take any 1..255; everything else keeps its native number.
+	cases := []struct {
+		profile   string
+		override  int
+		want      int
+		wantOK    bool
+	}{
+		{"bip", 0, 253, true},    // unset -> native
+		{"bip", 58, 58, true},    // ICMPv6 override
+		{"bip", 255, 255, true},  // top of range
+		{"bip", 300, 253, true},  // out of range -> native
+		{"bip", -1, 253, true},   // negative -> native
+		{"gre", 58, 47, true},    // override ignored for a headered profile
+		{"udp", 99, 17, true},    // ignored
+		{"nope", 58, 0, false},   // unknown profile
+	}
+	for _, c := range cases {
+		got, ok := rawEffProto(c.profile, c.override)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("rawEffProto(%q,%d) = %d,%v want %d,%v", c.profile, c.override, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+func TestRawBipCustomProtoRoundTrip(t *testing.T) {
+	// A bip carrier on a custom protocol number (e.g. 58) stays header-less and must
+	// round-trip: the outer IPv4's protocol byte carries the custom number, and decap
+	// keys the header stripping off the profile (bip -> bare), not the number.
+	pl := []byte("the-sealed-aead-frame")
+	const custom = 58
+	l4 := rawEncap("bip", pl, testSrc, testDst, true, 0, 0, 0) // bip is bare -> l4 == pl
+	if !bytes.Equal(l4, pl) {
+		t.Fatalf("bip added a header: %x", l4)
+	}
+	for _, variant := range []struct {
+		name string
+		pkt  []byte
+	}{
+		{"with-ip", prependIP4(testSrc, testDst, custom, l4)}, // kernel included the proto-58 IPv4 header
+		{"no-ip", l4},
+	} {
+		got, ok := rawDecap("bip", custom, variant.pkt)
+		if !ok {
+			t.Fatalf("%s: bip/proto-%d decap failed", variant.name, custom)
+		}
+		if !bytes.Equal(got, pl) {
+			t.Fatalf("%s: got %x want %x", variant.name, got, pl)
+		}
 	}
 }
 
@@ -134,21 +186,21 @@ func TestRawTCPLiveFlowFields(t *testing.T) {
 
 func TestRawDecapRejectsShortCarrier(t *testing.T) {
 	// Profiles with a carrier header must reject a packet too short to hold it.
-	if _, ok := rawDecap("gre", []byte{0x00, 0x00}); ok {
+	if _, ok := rawDecap("gre", protoGRE, []byte{0x00, 0x00}); ok {
 		t.Error("gre decap accepted fewer than 4 header bytes")
 	}
-	if _, ok := rawDecap("icmp", []byte{0x08, 0x00}); ok {
+	if _, ok := rawDecap("icmp", protoICMP, []byte{0x08, 0x00}); ok {
 		t.Error("icmp decap accepted fewer than 8 header bytes")
 	}
-	if _, ok := rawDecap("tcp", bytes.Repeat([]byte{0x00}, 10)); ok {
+	if _, ok := rawDecap("tcp", protoTCP, bytes.Repeat([]byte{0x00}, 10)); ok {
 		t.Error("tcp decap accepted fewer than 20 header bytes")
 	}
 	// bip/ipip carry no header: any bytes are a valid (opaque) sealed frame.
-	if _, ok := rawDecap("bip", []byte{0x01, 0x02}); !ok {
+	if _, ok := rawDecap("bip", protoBIP, []byte{0x01, 0x02}); !ok {
 		t.Error("bip decap should accept any bytes as the frame")
 	}
 	// A real IPv4-wrapped GRE packet with no room for the GRE header is rejected.
-	if _, ok := rawDecap("gre", prependIP4(testSrc, testDst, protoGRE, []byte{0x00})); ok {
+	if _, ok := rawDecap("gre", protoGRE, prependIP4(testSrc, testDst, protoGRE, []byte{0x00})); ok {
 		t.Error("gre decap accepted an IPv4 packet too short for its GRE header")
 	}
 }

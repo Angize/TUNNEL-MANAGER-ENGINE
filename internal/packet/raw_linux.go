@@ -225,8 +225,8 @@ func newRaw(conn *net.IPConn, dev *tun.Device, ka time.Duration, obfs, cryptoOn 
 // DialRaw (client role) opens a raw socket of the profile's protocol and targets
 // peerIP. peerIP may be a plain IPv4 or an "ip:port" (the port is ignored — raw
 // IP has no ports of its own; the tcp/udp profiles carry synthetic ones).
-func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofSrc, spoofDst string, fec bool, fecData, fecParity int) (*Raw, error) {
-	proto, ok := rawProtoFor(profile)
+func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, spoofSrc, spoofDst string, fec bool, fecData, fecParity, rawProto int) (*Raw, error) {
+	proto, ok := rawEffProto(profile, rawProto)
 	if !ok {
 		return nil, fmt.Errorf("raw: unknown profile %q", profile)
 	}
@@ -277,8 +277,8 @@ func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bo
 // ListenRaw (server role) binds a raw socket of the profile's protocol and waits
 // to learn the peer from the first authenticated frame. listenIP may be empty,
 // "0.0.0.0", a plain IPv4, or an "ip:port" (the port is ignored).
-func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, realPeer, spoofDst string, fec bool, fecData, fecParity int) (*Raw, error) {
-	proto, ok := rawProtoFor(profile)
+func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile, realPeer, spoofDst string, fec bool, fecData, fecParity, rawProto int) (*Raw, error) {
+	proto, ok := rawEffProto(profile, rawProto)
 	if !ok {
 		return nil, fmt.Errorf("raw: unknown profile %q", profile)
 	}
@@ -724,7 +724,7 @@ func (r *Raw) afpacketToTun() error {
 // the common tail of both receive paths (AF_INET and AF_PACKET). Frames that do not
 // open as data are tried as handshake messages.
 func (r *Raw) handleRaw(raw []byte, addr *net.IPAddr) {
-	body, ok := rawDecap(r.profile, raw)
+	body, ok := rawDecap(r.profile, r.proto, raw)
 	if !ok {
 		return
 	}

@@ -51,6 +51,15 @@ type Config struct {
 	// sockets need CAP_NET_RAW and Linux; ipip/gre often do not cross NAT.
 	RawProfile string `json:"raw_profile"`
 
+	// RawProto overrides the outer IP protocol number for the BARE "bip" profile
+	// (Transport=="raw" && RawProfile=="bip"). bip carries no L4 header, so only the
+	// protocol number on the wire changes — 0/unset keeps bip's native 253. Set it to
+	// slip past a protocol-whitelist filter that drops TCP/UDP but passes a "known"
+	// number (e.g. 58 = ICMPv6, which the IPv4 kernel ignores so there is no local
+	// contention). Ignored for the other profiles (their number is tied to their
+	// forged header). Range 1..255.
+	RawProto int `json:"raw_proto"`
+
 	// SpoofSrc (client) forges the outer IPv4 source address of raw-transport packets
 	// so per-source/stateful egress filters can't pin the real IP. RealPeer (server)
 	// is the client's REAL IP: with a forged source the server cannot learn where to
@@ -469,6 +478,9 @@ func (c *Config) validate() error {
 	case "raw":
 		if c.RawProfile != "" && !rawProfiles[c.RawProfile] {
 			return errors.New("raw_profile must be one of bip|ipip|gre|icmp|udp|tcp")
+		}
+		if c.RawProto != 0 && (c.RawProto < 1 || c.RawProto > 255) {
+			return errors.New("raw_proto must be in 1..255 (0 = the profile's native protocol number)")
 		}
 		if !c.Crypto.Enabled {
 			return errors.New("raw transport requires crypto enabled (the AEAD both encrypts and authenticates each raw packet)")

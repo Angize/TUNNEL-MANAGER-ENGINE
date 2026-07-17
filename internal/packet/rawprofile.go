@@ -64,6 +64,22 @@ func rawProtoFor(profile string) (int, bool) {
 	return p, ok
 }
 
+// rawEffProto returns the EFFECTIVE outer IP protocol number for a carrier. The bare "bip"
+// profile may override its native 253 with any 1..255 (rawProto / config raw_proto) to slip
+// past a protocol-whitelist filter — e.g. 58 (ICMPv6), which the IPv4 kernel ignores. Every
+// other profile keeps its fixed number, since that number is tied to its forged L4 header.
+// rawProto<=0 or out of range leaves the profile's native number untouched.
+func rawEffProto(profile string, rawProto int) (int, bool) {
+	base, ok := rawProfiles[profile]
+	if !ok {
+		return 0, false
+	}
+	if profile == "bip" && rawProto >= 1 && rawProto <= 255 {
+		return rawProto, true
+	}
+	return base, true
+}
+
 // rawEncap prepends profile's carrier header to a sealed frame and returns the
 // bytes to hand the raw socket (the kernel prepends the outer IPv4 header, so we
 // do NOT include it here). src/dst are the tunnel endpoint IPs, needed for the
@@ -129,8 +145,13 @@ func rawEncap(profile string, payload []byte, src, dst net.IP, isClient bool, id
 // (version 4, with the total-length and protocol fields matching) and strips it
 // only then — otherwise the bytes already start at the carrier header. It
 // reports false on a packet too short to hold the expected carrier header.
-func rawDecap(profile string, pkt []byte) ([]byte, bool) {
-	proto := rawProfiles[profile]
+// proto is the EFFECTIVE outer IP protocol number actually on the wire (equals the
+// profile's native number unless a bip carrier overrode it via raw_proto); it is used
+// only to recognise an included IPv4 header. The carrier-header stripping keys off the
+// PROFILE (bip stays header-less whatever its number), so a custom bip proto still
+// decaps bare.
+func rawDecap(profile string, proto int, pkt []byte) ([]byte, bool) {
+	framing := rawProfiles[profile]
 	if len(pkt) >= 20 && pkt[0]>>4 == 4 {
 		ihl := int(pkt[0]&0x0f) * 4
 		total := int(binary.BigEndian.Uint16(pkt[2:4]))
@@ -144,7 +165,7 @@ func rawDecap(profile string, pkt []byte) ([]byte, bool) {
 			pkt = pkt[ihl:total] // a real IPv4 header was included; strip it (and any trailing pad)
 		}
 	}
-	switch proto {
+	switch framing {
 	case protoBIP, protoIPIP:
 		return pkt, true
 	case protoGRE:
