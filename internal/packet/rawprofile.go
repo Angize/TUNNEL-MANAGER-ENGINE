@@ -12,6 +12,7 @@
 //	icmp  proto 1    8-byte ICMP echo        [IPv4][ICMP][sealed]  (req 8 / reply 0)
 //	udp   proto 17   8-byte UDP header        [IPv4][UDP][sealed]
 //	tcp   proto 6    20-byte TCP header       [IPv4][TCP][sealed]  (PSH|ACK, live-flow seq/ack/window)
+//	esp   proto 50    8-byte ESP header       [IPv4][ESP][sealed]  (IPsec ESP: per-session SPI + incrementing seq)
 //
 // The receiver ignores the carrier header's contents (the inner AEAD tag is the
 // real integrity check); the header only has to be well formed enough to look
@@ -33,6 +34,7 @@ const (
 	protoTCP  = 6
 	protoUDP  = 17
 	protoGRE  = 47
+	protoESP  = 50
 	protoBIP  = 253 // private/experimental range: our native no-L4-header profile
 )
 
@@ -45,6 +47,7 @@ var rawProfiles = map[string]int{
 	"icmp": protoICMP,
 	"udp":  protoUDP,
 	"tcp":  protoTCP,
+	"esp":  protoESP,
 }
 
 // Fixed, plausible ports for the tcp/udp profiles (source ephemeral -> :443).
@@ -84,8 +87,9 @@ func rawEffProto(profile string, rawProto int) (int, bool) {
 // bytes to hand the raw socket (the kernel prepends the outer IPv4 header, so we
 // do NOT include it here). src/dst are the tunnel endpoint IPs, needed for the
 // TCP checksum; isClient selects the direction-dependent fields (ICMP echo
-// request vs reply); id/seq make the ICMP/TCP headers look like a live flow.
-func rawEncap(profile string, payload []byte, src, dst net.IP, isClient bool, id uint16, seq, ack uint32) []byte {
+// request vs reply); id/seq make the ICMP/TCP headers look like a live flow; spi
+// is the per-session ESP Security Parameters Index (esp profile only).
+func rawEncap(profile string, payload []byte, src, dst net.IP, isClient bool, id uint16, seq, ack, spi uint32) []byte {
 	switch rawProfiles[profile] {
 	case protoBIP, protoIPIP:
 		return payload // native / IP-in-IP: the sealed frame is the whole payload
@@ -129,11 +133,22 @@ func rawEncap(profile string, payload []byte, src, dst net.IP, isClient bool, id
 		binary.BigEndian.PutUint16(h[2:4], rawDstPort)
 		binary.BigEndian.PutUint32(h[4:8], seq)  // sequence — advances by payload bytes, like a real stream
 		binary.BigEndian.PutUint32(h[8:12], ack) // acknowledgement — a non-zero peer ISN, not the tell-tale 0
-		h[12] = 5 << 4                            // data offset = 5 words (20 bytes), no options
+		h[12] = 5 << 4                           // data offset = 5 words (20 bytes), no options
 		h[13] = 0x18                             // PSH | ACK — a data segment mid-stream
 		binary.BigEndian.PutUint16(h[14:16], rawTCPWindow)
 		copy(h[20:], payload)
 		binary.BigEndian.PutUint16(h[16:18], l4Checksum(src, dst, protoTCP, h))
+		return h
+
+	case protoESP:
+		// IPsec ESP (RFC 4303): [SPI 4B][seq 4B] then the sealed frame as the "encrypted
+		// payload". A real ESP flow keeps a constant SPI per Security Association and an
+		// incrementing sequence — spi is fixed for the session, seq advances per packet. The
+		// receiver ignores both (the inner AEAD tag is the real integrity check).
+		h := make([]byte, 8+len(payload))
+		binary.BigEndian.PutUint32(h[0:4], spi)
+		binary.BigEndian.PutUint32(h[4:8], seq)
+		copy(h[8:], payload)
 		return h
 	}
 	return payload
@@ -170,8 +185,8 @@ func rawDecap(profile string, proto int, pkt []byte) ([]byte, bool) {
 		return pkt, true
 	case protoGRE:
 		return skip(pkt, 4)
-	case protoICMP, protoUDP:
-		return skip(pkt, 8)
+	case protoICMP, protoUDP, protoESP:
+		return skip(pkt, 8) // ICMP echo / UDP / ESP (SPI+seq) all carry an 8-byte header
 	case protoTCP:
 		if len(pkt) < 20 {
 			return nil, false

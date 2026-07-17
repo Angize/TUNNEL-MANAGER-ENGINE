@@ -46,7 +46,7 @@ type Config struct {
 
 	// RawProfile selects the raw-transport encapsulation (Transport=="raw" only):
 	// "bip" (native, proto 253), "ipip" (4), "gre" (47), "icmp" (1), "udp" (17),
-	// or "tcp" (6). The sealed frame is identical across profiles; only the
+	// "tcp" (6), or "esp" (50, IPsec ESP camouflage). The sealed frame is identical across profiles; only the
 	// IP-layer carrier header — and thus how the traffic looks — changes. Raw
 	// sockets need CAP_NET_RAW and Linux; ipip/gre often do not cross NAT.
 	RawProfile string `json:"raw_profile"`
@@ -404,7 +404,7 @@ func (c *Config) applyDefaults() {
 // mirrors the map in the packet package (kept here so config validation does not
 // depend on that package).
 var rawProfiles = map[string]bool{
-	"bip": true, "ipip": true, "gre": true, "icmp": true, "udp": true, "tcp": true,
+	"bip": true, "ipip": true, "gre": true, "icmp": true, "udp": true, "tcp": true, "esp": true,
 }
 
 // validatePoolEndpoint checks one rotation-pool entry (field names it for the error). The pool swaps
@@ -477,7 +477,7 @@ func (c *Config) validate() error {
 		// ok ("" defaults to udp in applyDefaults)
 	case "raw":
 		if c.RawProfile != "" && !rawProfiles[c.RawProfile] {
-			return errors.New("raw_profile must be one of bip|ipip|gre|icmp|udp|tcp")
+			return errors.New("raw_profile must be one of bip|ipip|gre|icmp|udp|tcp|esp")
 		}
 		if c.RawProto != 0 && (c.RawProto < 1 || c.RawProto > 255) {
 			return errors.New("raw_proto must be in 1..255 (0 = the profile's native protocol number)")
