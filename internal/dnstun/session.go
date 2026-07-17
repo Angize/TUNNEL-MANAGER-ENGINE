@@ -29,20 +29,27 @@ const (
 	kindData      = 0x01
 )
 
-// SessionConfig carries the crypto parameters both ends share (from the tunnel config).
+// SessionConfig carries the crypto parameters both ends share (from the tunnel config) plus the
+// KCP MTU the transport can carry in one datagram. MTU<=0 falls back to kcpMTUDefault.
 type SessionConfig struct {
 	PSK    string
 	Cipher string
+	MTU    int
 }
 
 // peerKey is the single logical peer identity on both ends' QueuePacketConn. The tunnel is
 // point-to-point (one client ⇄ one server), so a fixed key suffices; it is never on the wire.
 var peerKey = ClientID{0xD1, 0x5C, 0xA5, 0x5E, 0x55, 0x10, 0x0A, 0x1D}
 
-// kcpMTU bounds a KCP datagram. AEAD sealing and DNS encoding wrap each datagram, so the real
-// value is derived from the DNS message budget in the carrier (Phase B); this default keeps a
-// sealed+encoded datagram comfortably inside one DNS message.
-const kcpMTU = 220
+// kcpMTUDefault bounds a KCP datagram when the caller doesn't compute one. The DNS transport
+// derives the real value from the query-name budget (codec.MaxUpstream minus AEAD/kind overhead)
+// so every KCP datagram rides exactly one DNS query.
+const kcpMTUDefault = 220
+
+// SessionOverhead is the per-datagram cost the DNS transport must subtract from the codec's
+// MaxUpstream to get the KCP MTU: the 1-byte kind prefix plus AEAD sealing (12-byte mask salt +
+// up to a 24-byte nonce + 16-byte tag). A few bytes of slack keeps xchacha (24-byte nonce) safe.
+const SessionOverhead = 1 + 12 + 24 + 16 + 3
 
 const handshakeRetxInterval = 500 * time.Millisecond
 
@@ -205,7 +212,7 @@ handshake:
 		_ = t.Close()
 		return nil, err
 	}
-	tuneSession(conn)
+	tuneSession(conn, cfg.MTU)
 	sc := &sessionConn{UDPSession: conn, qpc: qpc, t: t, sealer: sealer, done: done}
 	go sc.sendPump()
 	go sc.recvPump(inCh, nil) // client ignores any late handshake datagrams
@@ -279,17 +286,20 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 		sc.Close()
 		return nil, err
 	}
-	tuneSession(conn)
+	tuneSession(conn, cfg.MTU)
 	sc.UDPSession = conn
 	return sc, nil
 }
 
 // tuneSession applies the DNS-appropriate KCP settings: turbo mode (fast retransmit) for quick
 // recovery on a lossy channel, stream mode (the carrier frames its own packets), a small window,
-// and the small MTU befitting a DNS message's tiny effective payload.
-func tuneSession(s *kcp.UDPSession) {
+// and the MTU the transport can carry in one datagram (mtu<=0 falls back to the default).
+func tuneSession(s *kcp.UDPSession, mtu int) {
+	if mtu <= 0 {
+		mtu = kcpMTUDefault
+	}
 	s.SetStreamMode(true)
 	s.SetNoDelay(1, 20, 2, 1)
 	s.SetWindowSize(256, 256)
-	s.SetMtu(kcpMTU)
+	s.SetMtu(mtu)
 }
