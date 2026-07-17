@@ -43,6 +43,7 @@ type Raw struct {
 	profile       string
 	isClient      bool
 	icmpID        uint16 // per-process ICMP echo identifier (receiver ignores it)
+	spi           uint32 // per-session ESP Security Parameters Index (esp profile; constant like a real SA)
 
 	// IP spoofing. spoofFd is a SOCK_RAW+IP_HDRINCL socket used to build the whole IPv4
 	// header ourselves, so any of the outer addresses can be forged:
@@ -212,13 +213,17 @@ func (r *Raw) sendFakes(to *net.IPAddr) {
 }
 
 func newRaw(conn *net.IPConn, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile string, isClient bool) *Raw {
-	var idb [10]byte
+	var idb [14]byte
 	_, _ = rand.Read(idb[:])
+	spi := binary.BigEndian.Uint32(idb[10:14])
+	if spi < 256 {
+		spi += 256 // SPIs 0..255 are IANA-reserved; a real SA uses >= 256
+	}
 	return &Raw{
 		conn: conn, dev: dev, keepalive: ka, obfs: obfs, cryptoOn: cryptoOn,
 		psk: psk, cipher: cipher, profile: profile, isClient: isClient, spoofFd: -1, pktFd: -1, fakeFd: -1,
 		icmpID: binary.BigEndian.Uint16(idb[0:2]), closeCh: make(chan struct{}),
-		tcpISN: binary.BigEndian.Uint32(idb[2:6]), tcpAck: binary.BigEndian.Uint32(idb[6:10]),
+		tcpISN: binary.BigEndian.Uint32(idb[2:6]), tcpAck: binary.BigEndian.Uint32(idb[6:10]), spi: spi,
 	}
 }
 
@@ -450,7 +455,7 @@ func (r *Raw) wire(body []byte, dst net.IP) []byte {
 	} else {
 		seq = r.seq.Add(1)
 	}
-	return rawEncap(r.profile, body, r.srcIP(), dst, r.isClient, r.icmpID, seq, ack)
+	return rawEncap(r.profile, body, r.srcIP(), dst, r.isClient, r.icmpID, seq, ack, r.spi)
 }
 
 // writeOut sends one wrapped packet toward the real peer `to`. When any outer
