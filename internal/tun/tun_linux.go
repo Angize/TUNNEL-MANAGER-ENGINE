@@ -29,6 +29,7 @@ const (
 // offload_linux.go), so callers keep the simple one-packet-per-Read contract.
 type Device struct {
 	f    *os.File
+	fd   int // raw blocking fd for data-path I/O — bypasses Go's netpoller (see rawRead)
 	Name string
 
 	gso  bool
@@ -69,7 +70,7 @@ func Open(name string, mtu int, addr string, gso bool) (*Device, error) {
 		}
 	}
 
-	d := &Device{f: f, Name: real, gso: gso}
+	d := &Device{f: f, fd: int(f.Fd()), Name: real, gso: gso}
 	if gso {
 		d.rbuf = make([]byte, vnetHdrLen+65535)
 	}
@@ -88,11 +89,55 @@ func Open(name string, mtu int, addr string, gso bool) (*Device, error) {
 	return d, nil
 }
 
+// rawRead/rawWrite do blocking TUN I/O with a plain syscall, DELIBERATELY bypassing os.File and
+// Go's netpoller. A dependency's package-init can bring the netpoller up before main() opens the
+// TUN (kcp-go's SystemTimedSched starts goroutines at init); the TUN fd can then inherit a poisoned
+// pollDesc from a transient regular-file fd that failed EPOLL_CTL_ADD (EPERM), and os.File.Read
+// returns "not pollable", killing the data plane on EVERY transport. The TUN is opened blocking
+// (no O_NONBLOCK; f.Fd() keeps it blocking), so a raw syscall.Read/Write always works regardless of
+// init ordering. Same approach as wireguard-go. EINTR is retried; the fd lifetime is tied to d.f.
+func rawRead(fd int, p []byte) (int, error) {
+	for {
+		n, err := syscall.Read(fd, p)
+		if err == syscall.EINTR {
+			continue
+		}
+		return n, err
+	}
+}
+
+func rawWrite(fd int, p []byte) (int, error) {
+	for {
+		n, err := syscall.Write(fd, p)
+		if err == syscall.EINTR {
+			continue
+		}
+		return n, err
+	}
+}
+
+// rd/wr are the data-path I/O. The production device (Open) has a real fd and uses the raw,
+// netpoller-free path above; the test-only FromFile device sets fd<0 and falls back to os.File
+// (its socketpair stand-in is pollable and never hits the poisoned-pollDesc problem).
+func (d *Device) rd(p []byte) (int, error) {
+	if d.fd >= 0 {
+		return rawRead(d.fd, p)
+	}
+	return d.f.Read(p)
+}
+
+func (d *Device) wr(p []byte) (int, error) {
+	if d.fd >= 0 {
+		return rawWrite(d.fd, p)
+	}
+	return d.f.Write(p)
+}
+
 // Read returns one L3 packet into buf. With GSO enabled it serves segments from
 // the queue, refilling it by reading and splitting one kernel super-packet.
 func (d *Device) Read(buf []byte) (int, error) {
 	if !d.gso {
-		return d.f.Read(buf)
+		return d.rd(buf)
 	}
 	for len(d.q) == 0 {
 		segs, err := d.readGSO()
@@ -109,7 +154,7 @@ func (d *Device) Read(buf []byte) (int, error) {
 // readGSO reads one virtio super-packet and returns its L3 segments (one element
 // for a non-GSO packet). A runt read returns no segments so Read retries.
 func (d *Device) readGSO() ([][]byte, error) {
-	n, err := d.f.Read(d.rbuf)
+	n, err := d.rd(d.rbuf)
 	if err != nil {
 		return nil, err
 	}
@@ -138,11 +183,11 @@ func (d *Device) readGSO() ([][]byte, error) {
 // prefix; a zero header means "one complete packet, checksums done".
 func (d *Device) Write(pkt []byte) (int, error) {
 	if !d.gso {
-		return d.f.Write(pkt)
+		return d.wr(pkt)
 	}
 	out := make([]byte, vnetHdrLen+len(pkt))
 	copy(out[vnetHdrLen:], pkt)
-	n, err := d.f.Write(out)
+	n, err := d.wr(out)
 	if n -= vnetHdrLen; n < 0 {
 		n = 0
 	}
