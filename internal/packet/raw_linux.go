@@ -74,7 +74,14 @@ type Raw struct {
 	hsCache  initCache // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
 	ci       atomic.Pointer[crypto.Ephemeral]
 	seq      atomic.Uint32
-	lastRx   atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
+	// Synthetic-TCP-profile state (tcp profile only; ignored by the others): a per-session
+	// ISN and a constant peer-ISN we "acknowledge", so the forged segments carry an advancing
+	// sequence and a non-zero ACK — a live-established-flow look — instead of the tell-tale
+	// seq+1 / ack=0 that a stateful DPI flags as forged.
+	tcpISN   uint32
+	tcpAck   uint32
+	tcpBytes atomic.Uint32 // cumulative tcp-profile payload bytes; drives the realistic seq advance
+	lastRx   atomic.Int64  // unix-nano of the last authenticated frame (client staleness)
 	// peerAnswered gates the clear-mode heal: set when the CURRENT endpoint replies, cleared on
 	// rotation, so a just-jumped-to (unproven) endpoint's burn is never falsely cleared. Mirrors UDP.
 	peerAnswered atomic.Bool
@@ -205,12 +212,13 @@ func (r *Raw) sendFakes(to *net.IPAddr) {
 }
 
 func newRaw(conn *net.IPConn, dev *tun.Device, ka time.Duration, obfs, cryptoOn bool, psk, cipher, profile string, isClient bool) *Raw {
-	var idb [2]byte
+	var idb [10]byte
 	_, _ = rand.Read(idb[:])
 	return &Raw{
 		conn: conn, dev: dev, keepalive: ka, obfs: obfs, cryptoOn: cryptoOn,
 		psk: psk, cipher: cipher, profile: profile, isClient: isClient, spoofFd: -1, pktFd: -1, fakeFd: -1,
-		icmpID: binary.BigEndian.Uint16(idb[:]), closeCh: make(chan struct{}),
+		icmpID: binary.BigEndian.Uint16(idb[0:2]), closeCh: make(chan struct{}),
+		tcpISN: binary.BigEndian.Uint32(idb[2:6]), tcpAck: binary.BigEndian.Uint32(idb[6:10]),
 	}
 }
 
@@ -430,7 +438,19 @@ func (r *Raw) body(typ byte, payload []byte) ([]byte, error) {
 
 // wire wraps a framed body in the profile carrier header, ready for the socket.
 func (r *Raw) wire(body []byte, dst net.IP) []byte {
-	return rawEncap(r.profile, body, r.srcIP(), dst, r.isClient, r.icmpID, r.seq.Add(1))
+	var seq, ack uint32
+	if r.proto == protoTCP {
+		// advance the sequence by this segment's payload length (a real byte stream) and
+		// acknowledge a constant peer ISN — the synthetic flow receives nothing, so a real
+		// ACK number would stay put. tcpBytes.Add returns the post-add total; minus n yields
+		// the pre-segment offset, so concurrent sends get non-overlapping sequence ranges.
+		n := uint32(len(body))
+		seq = r.tcpISN + r.tcpBytes.Add(n) - n
+		ack = r.tcpAck
+	} else {
+		seq = r.seq.Add(1)
+	}
+	return rawEncap(r.profile, body, r.srcIP(), dst, r.isClient, r.icmpID, seq, ack)
 }
 
 // writeOut sends one wrapped packet toward the real peer `to`. When any outer

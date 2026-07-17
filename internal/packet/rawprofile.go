@@ -11,7 +11,7 @@
 //	gre   proto 47   4-byte GRE header       [IPv4][GRE][sealed]
 //	icmp  proto 1    8-byte ICMP echo        [IPv4][ICMP][sealed]  (req 8 / reply 0)
 //	udp   proto 17   8-byte UDP header        [IPv4][UDP][sealed]
-//	tcp   proto 6    20-byte TCP header       [IPv4][TCP][sealed]  (PSH|ACK)
+//	tcp   proto 6    20-byte TCP header       [IPv4][TCP][sealed]  (PSH|ACK, live-flow seq/ack/window)
 //
 // The receiver ignores the carrier header's contents (the inner AEAD tag is the
 // real integrity check); the header only has to be well formed enough to look
@@ -51,6 +51,11 @@ var rawProfiles = map[string]int{
 const (
 	rawSrcPort = 51820
 	rawDstPort = 443
+	// rawTCPWindow is the advertised window on the synthetic tcp profile. A fixed 0xffff
+	// paired with a zero ACK reads as a forged segment to a stateful DPI; a realistic,
+	// steady-state window plus a non-zero ACK (set in wire()) make it look like a live
+	// established flow instead. 64240 is a very common Linux advertised window.
+	rawTCPWindow = 0xFAF0 // 64240
 )
 
 // rawProtoFor returns the IP protocol number for a profile name.
@@ -64,7 +69,7 @@ func rawProtoFor(profile string) (int, bool) {
 // do NOT include it here). src/dst are the tunnel endpoint IPs, needed for the
 // TCP checksum; isClient selects the direction-dependent fields (ICMP echo
 // request vs reply); id/seq make the ICMP/TCP headers look like a live flow.
-func rawEncap(profile string, payload []byte, src, dst net.IP, isClient bool, id uint16, seq uint32) []byte {
+func rawEncap(profile string, payload []byte, src, dst net.IP, isClient bool, id uint16, seq, ack uint32) []byte {
 	switch rawProfiles[profile] {
 	case protoBIP, protoIPIP:
 		return payload // native / IP-in-IP: the sealed frame is the whole payload
@@ -106,10 +111,11 @@ func rawEncap(profile string, payload []byte, src, dst net.IP, isClient bool, id
 		h := make([]byte, 20+len(payload))
 		binary.BigEndian.PutUint16(h[0:2], rawSrcPort)
 		binary.BigEndian.PutUint16(h[2:4], rawDstPort)
-		binary.BigEndian.PutUint32(h[4:8], seq) // sequence number
-		h[12] = 5 << 4                          // data offset = 5 words (20 bytes), no options
-		h[13] = 0x18                            // PSH | ACK — looks like a data segment
-		binary.BigEndian.PutUint16(h[14:16], 0xffff)
+		binary.BigEndian.PutUint32(h[4:8], seq)  // sequence — advances by payload bytes, like a real stream
+		binary.BigEndian.PutUint32(h[8:12], ack) // acknowledgement — a non-zero peer ISN, not the tell-tale 0
+		h[12] = 5 << 4                            // data offset = 5 words (20 bytes), no options
+		h[13] = 0x18                             // PSH | ACK — a data segment mid-stream
+		binary.BigEndian.PutUint16(h[14:16], rawTCPWindow)
 		copy(h[20:], payload)
 		binary.BigEndian.PutUint16(h[16:18], l4Checksum(src, dst, protoTCP, h))
 		return h
