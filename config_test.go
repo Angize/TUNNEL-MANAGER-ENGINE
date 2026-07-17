@@ -356,3 +356,41 @@ func TestSrcIPsValidation(t *testing.T) {
 		t.Error("src_ips on a server was accepted")
 	}
 }
+
+// validDNSClient returns a minimal, valid dns-transport client config to mutate in tests.
+func validDNSClient() *Config {
+	return &Config{
+		Role:         "client",
+		Mode:         "packet",
+		Profile:      "core",
+		Transport:    "dns",
+		TunAddr:      "10.200.0.2/24",
+		DNSZone:      "t.example.com",
+		DNSResolvers: []string{"10.202.10.202"},
+		Crypto:       CryptoCfg{Enabled: true, PSK: "a-sufficiently-long-preshared-key"},
+	}
+}
+
+func TestDNSTransportValidation(t *testing.T) {
+	if err := validDNSClient().validate(); err != nil {
+		t.Fatalf("valid dns client rejected: %v", err)
+	}
+	// A dns server needs no peer/resolvers, just the zone and a listen address.
+	s := validDNSClient()
+	s.Role, s.DNSResolvers, s.Listen = "server", nil, ":53"
+	if err := s.validate(); err != nil {
+		t.Fatalf("valid dns server rejected: %v", err)
+	}
+	// Missing zone, missing client resolvers, and crypto-off must all be rejected.
+	for name, mut := range map[string]func(*Config){
+		"no zone":      func(c *Config) { c.DNSZone = "" },
+		"no resolvers": func(c *Config) { c.DNSResolvers = nil },
+		"crypto off":   func(c *Config) { c.Crypto.Enabled = false },
+	} {
+		c := validDNSClient()
+		mut(c)
+		if err := c.validate(); err == nil {
+			t.Errorf("%s: dns config accepted but should be rejected", name)
+		}
+	}
+}

@@ -78,6 +78,16 @@ type Config struct {
 	// crypto only; needs CAP_NET_RAW. Empty = no destination spoofing.
 	SpoofDst string `json:"spoof_dst_ip"`
 
+	// DNS-tunnel carrier (Transport=="dns"): the reliable AEAD/KCP session rides inside DNS
+	// queries/responses. DNSZone is the delegated zone whose authoritative NS is the server
+	// (e.g. "t.example.com"). DNSResolvers is the client's list of recursive resolvers to query
+	// (host or "host:port", :53 default) — typically DOMESTIC resolvers, so the client never sends
+	// a packet to the server IP and a destination whitelist can't see the tunnel. The server binds
+	// Listen (":53") as the authoritative responder. v1 uses the first resolver; multi-resolver
+	// failover/scan is a later step.
+	DNSZone      string   `json:"dns_zone"`
+	DNSResolvers []string `json:"dns_resolvers"`
+
 	Listen string `json:"listen"` // server: bind address, e.g. "0.0.0.0:9000"
 	// ListenIPs is the server-side rotation-pool bind list: one "ip:port" per SELECTED pool IP. When set
 	// (a pooled udp/tcp server), the server binds each of these instead of the single Listen/0.0.0.0, so
@@ -460,7 +470,9 @@ func (c *Config) validate() error {
 			}
 		}
 	case "client":
-		if c.Peer == "" && len(c.PeerIPs) == 0 {
+		// The dns carrier has no "peer": the client queries recursive resolvers (dns_resolvers),
+		// never the server IP — that is the whole point. Its endpoint is validated in the dns case.
+		if c.Transport != "dns" && c.Peer == "" && len(c.PeerIPs) == 0 {
 			return errors.New("client role requires \"peer\" (or a peer_ips rotation pool)")
 		}
 	default:
@@ -522,6 +534,20 @@ func (c *Config) validate() error {
 		case "", "random", "quic", "video", "webrtc":
 		default:
 			return errors.New("flux_shape must be \"random\", \"quic\", \"video\", or \"webrtc\"")
+		}
+	case "dns":
+		// DNS-tunnel carrier (last resort under a full protocol+destination whitelist). The reliable
+		// session rides inside DNS; crypto is mandatory — the handshake authenticates with the PSK and
+		// every datagram is AEAD-sealed. The server is the delegated zone's authoritative NS (binds
+		// Listen, e.g. ":53"); the client queries recursive resolvers listed in DNSResolvers.
+		if !c.Crypto.Enabled {
+			return errors.New("dns transport requires crypto enabled (the session handshake and every datagram are AEAD-authenticated)")
+		}
+		if c.DNSZone == "" {
+			return errors.New("dns transport requires dns_zone (the delegated zone whose authoritative NS is the server)")
+		}
+		if c.Role == "client" && len(c.DNSResolvers) == 0 {
+			return errors.New("dns client requires at least one dns_resolvers entry (a recursive resolver to query)")
 		}
 	case "ws":
 		// WebSocket carrier. Client-side TLS to a CDN edge needs an SNI/Host, so
@@ -600,7 +626,7 @@ func (c *Config) validate() error {
 			}
 		}
 	default:
-		return errors.New("transport must be \"udp\", \"tcp\", \"raw\", \"flux\", or \"ws\"")
+		return errors.New("transport must be \"udp\", \"tcp\", \"raw\", \"flux\", \"ws\", or \"dns\"")
 	}
 	// PeerIPs is the DESTINATION rotation pool for the direct transports. It is a client-side
 	// dial-layer feature: a server listens (it does not dial), and ws has its own edge pool, so

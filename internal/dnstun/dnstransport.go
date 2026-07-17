@@ -120,6 +120,9 @@ type dnsClient struct {
 // NewDNSClientTransport dials the resolver (host:port, typically a domestic recursive resolver on
 // :53) and starts the poll loop. codec encodes datagrams into queries under the delegated zone.
 func NewDNSClientTransport(resolverAddr string, codec *Codec) (WireTransport, error) {
+	if _, _, err := net.SplitHostPort(resolverAddr); err != nil {
+		resolverAddr = net.JoinHostPort(resolverAddr, "53") // default the resolver port to 53
+	}
 	ra, err := net.ResolveUDPAddr("udp", resolverAddr)
 	if err != nil {
 		return nil, err

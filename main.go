@@ -228,6 +228,23 @@ func main() {
 				log.Printf("tnl-core: dialing (core/ws%s%s) %s", obfsTag, tlsTag, cfg.Peer)
 			}
 		}
+	case "dns":
+		switch cfg.Role {
+		case "server":
+			b, err = packet.ListenDNS(dev, cfg.Listen, cfg.DNSZone, cfg.Crypto.PSK, cfg.Crypto.Cipher)
+			if err == nil {
+				log.Printf("tnl-core: listening (core/dns zone=%s) on %s", cfg.DNSZone, cfg.Listen)
+			}
+		case "client":
+			resolver := ""
+			if len(cfg.DNSResolvers) > 0 {
+				resolver = cfg.DNSResolvers[0] // v1 uses the first resolver; multi-resolver scan is later
+			}
+			b, err = packet.DialDNS(dev, resolver, cfg.DNSZone, cfg.Crypto.PSK, cfg.Crypto.Cipher)
+			if err == nil {
+				log.Printf("tnl-core: dialing (core/dns zone=%s via resolver %s)", cfg.DNSZone, resolver)
+			}
+		}
 	default: // "udp"
 		switch cfg.Role {
 		case "server":
