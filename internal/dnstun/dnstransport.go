@@ -18,6 +18,13 @@ import (
 var (
 	pollInterval = 40 * time.Millisecond // idle downstream-poll cadence (var so tests can lower it)
 	queryTimeout = 3 * time.Second       // per-query wait for the resolver's answer
+	// serverHold is how long the server briefly withholds a response, waiting for a downstream datagram
+	// to attach to THIS reply (a long-poll). It lets the handshake response ride the very query that
+	// carried the init — and every KCP ack ride the query that prompted it — instead of a later poll,
+	// so a session converges in far fewer round-trips. That is decisive on a lossy or answer-mangling
+	// resolver where each extra round-trip is another chance to fail. Kept well under queryTimeout and a
+	// recursive resolver's own upstream timeout. A var so tests can lower it.
+	serverHold = 150 * time.Millisecond
 )
 
 const dnsReadBuf = 1500
@@ -113,7 +120,7 @@ func buildResponse(id uint16, qname dnsmessage.Name, qtype dnsmessage.Type, answ
 }
 
 // txtResource wraps downstream character-strings as a single TXT answer record under name. TTL is
-// left at 0 so no resolver caches a downstream slot (the idle poll reuses the bare-zone name).
+// left at 0 as cache hygiene (the per-query nonce already makes every name unique, so nothing repeats).
 func txtResource(name dnsmessage.Name, txt []string) dnsmessage.Resource {
 	return dnsmessage.Resource{
 		Header: dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET},
@@ -125,42 +132,68 @@ func txtResource(name dnsmessage.Name, txt []string) dnsmessage.Resource {
 
 // dnsClient is the client-side WireTransport: it ships each outgoing datagram as a DNS query to a
 // recursive resolver and returns downstream datagrams carried back in the responses. It polls even
-// when idle so the server can push downstream data (a poll is a bare-zone query with no payload).
+// when idle so the server can push downstream data (a poll is a nonce-only query with no payload).
+//
+// The socket is UNCONNECTED (net.ListenUDP, not DialUDP): a query goes to a resolver picked
+// round-robin from resolvers, and a reply is accepted from ANY source address. Both matter on the
+// lossy, hostile paths this carrier runs on — round-robin spreads each query across every configured
+// resolver so heavy loss on one is covered by the others, and accepting replies from any source keeps
+// working with anycast / smart-DNS resolvers whose answer arrives from a different backend IP than the
+// one queried (a connected socket would drop those). Answers are matched by DNS id, not source.
 type dnsClient struct {
-	conn     *net.UDPConn
-	codec    *Codec
-	outbound chan []byte
-	inbound  chan []byte
-	closed   chan struct{}
-	pollDone chan struct{} // closed when pollLoop has fully exited
-	once     sync.Once
-	qid      atomic.Uint32
+	conn      *net.UDPConn
+	resolvers []*net.UDPAddr
+	rr        atomic.Uint32 // round-robin cursor over resolvers
+	codec     *Codec
+	outbound  chan []byte
+	inbound   chan []byte
+	closed    chan struct{}
+	pollDone  chan struct{} // closed when pollLoop has fully exited
+	once      sync.Once
+	qid       atomic.Uint32
 }
 
-// NewDNSClientTransport dials the resolver (host:port, typically a domestic recursive resolver on
-// :53) and starts the poll loop. codec encodes datagrams into queries under the delegated zone.
-func NewDNSClientTransport(resolverAddr string, codec *Codec) (WireTransport, error) {
-	if _, _, err := net.SplitHostPort(resolverAddr); err != nil {
-		// No port: default to :53. Strip any brackets first so JoinHostPort (which re-brackets a
-		// colon-bearing host) doesn't double-bracket a bare "[v6]" into an invalid "[[v6]]:53".
-		host := strings.TrimSuffix(strings.TrimPrefix(resolverAddr, "["), "]")
-		resolverAddr = net.JoinHostPort(host, "53")
+// NewDNSClientTransport resolves the recursive resolvers (each "host" or "host:port"; :53 default),
+// opens one unconnected UDP socket, and starts the poll loop. codec encodes datagrams into queries
+// under the delegated zone. At least one usable resolver is required.
+func NewDNSClientTransport(resolverAddrs []string, codec *Codec) (WireTransport, error) {
+	var resolvers []*net.UDPAddr
+	for _, ra := range resolverAddrs {
+		ra = strings.TrimSpace(ra)
+		if ra == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(ra); err != nil {
+			// No port: default to :53. Strip any brackets first so JoinHostPort (which re-brackets a
+			// colon-bearing host) doesn't double-bracket a bare "[v6]" into an invalid "[[v6]]:53".
+			host := strings.TrimSuffix(strings.TrimPrefix(ra, "["), "]")
+			ra = net.JoinHostPort(host, "53")
+		}
+		ua, err := net.ResolveUDPAddr("udp", ra)
+		if err != nil {
+			return nil, err
+		}
+		resolvers = append(resolvers, ua)
 	}
-	ra, err := net.ResolveUDPAddr("udp", resolverAddr)
+	if len(resolvers) == 0 {
+		return nil, errors.New("dns: no usable resolver configured")
+	}
+	laddr, err := net.ResolveUDPAddr("udp", ":0")
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.DialUDP("udp", nil, ra)
+	conn, err := net.ListenUDP("udp", laddr)
 	if err != nil {
 		return nil, err
 	}
 	c := &dnsClient{
-		conn:     conn,
-		codec:    codec,
-		outbound: make(chan []byte, sendQueueSize),
-		inbound:  make(chan []byte, recvQueueSize),
-		closed:   make(chan struct{}),
-		pollDone: make(chan struct{}),
+		conn:      conn,
+		resolvers: resolvers,
+		codec:     codec,
+		outbound:  make(chan []byte, sendQueueSize),
+		inbound:   make(chan []byte, recvQueueSize),
+		closed:    make(chan struct{}),
+		pollDone:  make(chan struct{}),
 	}
 	go c.pollLoop()
 	return c, nil
@@ -199,7 +232,7 @@ func (c *dnsClient) Close() error {
 }
 
 // pollLoop sends one query per iteration — a queued upstream datagram when available, otherwise a
-// bare-zone poll after pollInterval — and delivers the downstream datagram from the response.
+// nonce-only poll after pollInterval — and delivers the downstream datagram from the response.
 func (c *dnsClient) pollLoop() {
 	defer close(c.pollDone)
 	idle := time.NewTimer(pollInterval)
@@ -236,7 +269,8 @@ func (c *dnsClient) exchange(up []byte) {
 	if err != nil {
 		return
 	}
-	if _, err := c.conn.Write(query); err != nil {
+	resolver := c.resolvers[int(c.rr.Add(1)-1)%len(c.resolvers)]
+	if _, err := c.conn.WriteToUDP(query, resolver); err != nil {
 		return
 	}
 	buf := make([]byte, dnsReadBuf)
@@ -245,7 +279,7 @@ func (c *dnsClient) exchange(up []byte) {
 		if err := c.conn.SetReadDeadline(deadline); err != nil {
 			return
 		}
-		n, err := c.conn.Read(buf)
+		n, _, err := c.conn.ReadFromUDP(buf) // reply may come from any source (anycast/smart-DNS backend)
 		if err != nil {
 			return // timeout or socket closed
 		}
@@ -420,10 +454,25 @@ func (s *dnsServer) serveLoop() {
 			default: // full: drop, kcp-go retransmits
 			}
 		}
+		// Briefly hold the reply so a downstream datagram (the handshake response, a KCP ack) can ride
+		// THIS answer instead of a later poll — see serverHold. A datagram already waiting is taken at
+		// once; otherwise we wait up to serverHold and reply empty. A per-query timer (not time.After in
+		// the select, which would leak a timer until it fires) keeps the idle path allocation-free enough.
 		var down []byte
 		select {
 		case down = <-s.downstream:
-		default: // nothing to push this round
+		case <-s.closed:
+			return
+		default:
+			hold := time.NewTimer(serverHold)
+			select {
+			case down = <-s.downstream:
+			case <-hold.C:
+			case <-s.closed:
+				hold.Stop()
+				return
+			}
+			hold.Stop()
 		}
 		resp, berr := buildResponse(id, qn, dnsmessage.TypeTXT, []dnsmessage.Resource{txtResource(qn, s.codec.EncodeTXT(down))})
 		if berr != nil {

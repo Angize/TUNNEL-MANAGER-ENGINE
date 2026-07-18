@@ -27,11 +27,12 @@ const (
 
 // DNS carries L3 packets over a DNS tunnel. It satisfies the core carrier interface (Run/Close).
 type DNS struct {
-	dev      *tun.Device
-	isClient bool
-	cfg      dnstun.SessionConfig
-	zone     string
-	addr     string // client: resolver "host:port"; server: listen address (e.g. ":53")
+	dev       *tun.Device
+	isClient  bool
+	cfg       dnstun.SessionConfig
+	zone      string
+	addr      string   // server: listen address (e.g. ":53"); unused for the client
+	resolvers []string // client: recursive resolvers to rotate across ("host" or "host:port")
 
 	mu      sync.Mutex // guards curConn/curT so Close can tear down whatever is live
 	curConn net.Conn
@@ -42,7 +43,7 @@ type DNS struct {
 	closeOnce sync.Once
 }
 
-func newDNS(dev *tun.Device, isClient bool, addr, zone, psk, cipher string) (*DNS, error) {
+func newDNS(dev *tun.Device, isClient bool, addr string, resolvers []string, zone, psk, cipher string) (*DNS, error) {
 	codec, err := dnstun.NewCodec(zone)
 	if err != nil {
 		return nil, err
@@ -52,22 +53,23 @@ func newDNS(dev *tun.Device, isClient bool, addr, zone, psk, cipher string) (*DN
 		return nil, fmt.Errorf("dns: zone %q leaves too little room per query (mtu=%d, need >=%d)", zone, mtu, dnsMinMTU)
 	}
 	return &DNS{
-		dev: dev, isClient: isClient, zone: zone, addr: addr,
+		dev: dev, isClient: isClient, zone: zone, addr: addr, resolvers: resolvers,
 		cfg:     dnstun.SessionConfig{PSK: psk, Cipher: cipher, MTU: mtu},
 		closeCh: make(chan struct{}),
 	}, nil
 }
 
-// DialDNS (client) tunnels through resolverAddr (a recursive resolver "host:port", typically a
-// domestic resolver on :53) for the delegated zone.
-func DialDNS(dev *tun.Device, resolverAddr, zone, psk, cipher string) (*DNS, error) {
-	return newDNS(dev, true, resolverAddr, zone, psk, cipher)
+// DialDNS (client) tunnels through resolvers (recursive resolvers, each "host" or "host:port",
+// typically domestic resolvers on :53) for the delegated zone. Queries rotate across them so heavy
+// loss or filtering on one resolver is covered by the others.
+func DialDNS(dev *tun.Device, resolvers []string, zone, psk, cipher string) (*DNS, error) {
+	return newDNS(dev, true, "", resolvers, zone, psk, cipher)
 }
 
 // ListenDNS (server) is the authoritative responder for the delegated zone, bound to listenAddr
 // (e.g. ":53").
 func ListenDNS(dev *tun.Device, listenAddr, zone, psk, cipher string) (*DNS, error) {
-	return newDNS(dev, false, listenAddr, zone, psk, cipher)
+	return newDNS(dev, false, listenAddr, nil, zone, psk, cipher)
 }
 
 // Run drives the carrier: one long-lived tun→net loop feeds whatever session is live, while the
@@ -113,7 +115,7 @@ func (d *DNS) connect() (net.Conn, error) {
 	}
 	var t dnstun.WireTransport
 	if d.isClient {
-		t, err = dnstun.NewDNSClientTransport(d.addr, codec)
+		t, err = dnstun.NewDNSClientTransport(d.resolvers, codec)
 	} else {
 		t, _, err = dnstun.NewDNSServerTransport(d.addr, codec)
 	}
