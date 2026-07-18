@@ -3,12 +3,210 @@ package dnstun
 import (
 	"bytes"
 	"crypto/rand"
+	mrand "math/rand"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
+
+// startLossyRelay stands in for a marginal domestic resolver: it forwards each datagram (client->server
+// and server->client) only with probability passRate, dropping the rest. It returns its front address
+// for the client to point at. Independent PRNGs per direction keep it goroutine-safe.
+func startLossyRelay(t *testing.T, server *net.UDPAddr, passRate float64, seed int64) string {
+	t.Helper()
+	front, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := net.DialUDP("udp", nil, server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = front.Close(); _ = back.Close() })
+
+	var mu sync.Mutex
+	var client *net.UDPAddr
+
+	go func() { // client -> server
+		rng := mrand.New(mrand.NewSource(seed))
+		buf := make([]byte, dnsReadBuf)
+		for {
+			n, from, err := front.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			client = from
+			mu.Unlock()
+			if rng.Float64() < passRate {
+				_, _ = back.Write(buf[:n])
+			}
+		}
+	}()
+	go func() { // server -> client
+		rng := mrand.New(mrand.NewSource(seed + 1))
+		buf := make([]byte, dnsReadBuf)
+		for {
+			n, err := back.Read(buf)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			c := client
+			mu.Unlock()
+			if c != nil && rng.Float64() < passRate {
+				_, _ = front.WriteToUDP(buf[:n], c)
+			}
+		}
+	}()
+	return front.LocalAddr().String()
+}
+
+// TestDNSCarrierSurvivesLossyResolver is the hardening proof: with a resolver that drops ~40% of
+// datagrams in each direction (as the domestic smart-DNS resolvers this carrier must use do), the
+// session must still converge and move data — carried by the per-query nonce, the reply-on-init hold
+// (so the handshake needs one surviving round-trip, not two), and KCP retransmission.
+func TestDNSCarrierSurvivesLossyResolver(t *testing.T) {
+	origPoll, origTO, origHold := pollInterval, queryTimeout, serverHold
+	pollInterval, queryTimeout, serverHold = 3*time.Millisecond, 300*time.Millisecond, 5*time.Millisecond
+	defer func() { pollInterval, queryTimeout, serverHold = origPoll, origTO, origHold }()
+
+	codec, err := NewCodec("t.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtu := codec.MaxUpstream() - SessionOverhead
+	cfg := SessionConfig{PSK: "psk", Cipher: "chacha20", MTU: mtu}
+
+	srvT, srvAddr, err := NewDNSServerTransport("127.0.0.1:0", codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay := startLossyRelay(t, srvAddr.(*net.UDPAddr), 0.6, 1)
+
+	srvCh := make(chan net.Conn, 1)
+	go func() {
+		c, e := ServeSession(srvT, cfg)
+		if e != nil {
+			t.Errorf("ServeSession: %v", e)
+			srvCh <- nil
+			return
+		}
+		srvCh <- c
+	}()
+
+	cliT, err := NewDNSClientTransport([]string{relay}, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli, err := DialSession(cliT, cfg)
+	if err != nil {
+		t.Fatalf("DialSession over a lossy resolver: %v", err)
+	}
+	defer cli.Close()
+
+	// Write BEFORE receiving the server conn: the client's first KCP datagram is what unblocks the
+	// server's AcceptKCP (and thus ServeSession); waiting on srvCh first would deadlock.
+	payload := []byte("hardened DNS carrier surviving a lossy smart-DNS resolver")
+	go func() { _, _ = cli.Write(payload) }()
+
+	srv := <-srvCh
+	if srv == nil {
+		t.Fatal("server session failed")
+	}
+	defer srv.Close()
+
+	go func() { // server echoes
+		buf := make([]byte, 2048)
+		for {
+			n, e := srv.Read(buf)
+			if e != nil {
+				return
+			}
+			if _, e := srv.Write(buf[:n]); e != nil {
+				return
+			}
+		}
+	}()
+
+	got := make([]byte, len(payload))
+	readDone := make(chan error, 1)
+	go func() {
+		off, buf := 0, make([]byte, 2048)
+		for off < len(got) {
+			n, e := cli.Read(buf)
+			if e != nil {
+				readDone <- e
+				return
+			}
+			copy(got[off:], buf[:n])
+			off += n
+		}
+		readDone <- nil
+	}()
+
+	select {
+	case e := <-readDone:
+		if e != nil {
+			t.Fatalf("read echo over lossy resolver: %v", e)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("timed out: hardened DNS carrier did not converge over a lossy resolver")
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("echo mismatch over lossy resolver")
+	}
+}
+
+// TestDNSClientRotatesResolvers verifies the client spreads its queries across ALL configured
+// resolvers (round-robin), so heavy loss on any one is covered by the others. Three blackhole
+// listeners (they never answer) each must receive at least one query.
+func TestDNSClientRotatesResolvers(t *testing.T) {
+	origPoll, origTO := pollInterval, queryTimeout
+	pollInterval, queryTimeout = 2*time.Millisecond, 25*time.Millisecond
+	defer func() { pollInterval, queryTimeout = origPoll, origTO }()
+
+	codec, err := NewCodec("t.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var addrs []string
+	counts := make([]atomic.Int32, 3)
+	for i := range counts {
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pc.Close()
+		addrs = append(addrs, pc.LocalAddr().String())
+		go func(pc *net.UDPConn, cnt *atomic.Int32) {
+			b := make([]byte, dnsReadBuf)
+			for {
+				if _, _, e := pc.ReadFromUDP(b); e != nil {
+					return
+				}
+				cnt.Add(1)
+			}
+		}(pc, &counts[i])
+	}
+
+	tr, err := NewDNSClientTransport(addrs, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	time.Sleep(600 * time.Millisecond) // several poll rotations
+	for i := range counts {
+		if counts[i].Load() == 0 {
+			t.Errorf("resolver %d received no query — client did not rotate across all resolvers", i)
+		}
+	}
+}
 
 func TestDNSMessageHelpersRoundTrip(t *testing.T) {
 	// A query built by the client must parse back to the same id+name on the server, and a TXT
@@ -185,9 +383,9 @@ func TestDNSServerAuthoritativeBehavior(t *testing.T) {
 // + KCP — and tunnel a byte stream in both directions over actual DNS message exchanges.
 func TestDNSCarrierEndToEnd(t *testing.T) {
 	// Snappy polling for the test; restore afterwards.
-	origPoll, origTO := pollInterval, queryTimeout
-	pollInterval, queryTimeout = 3*time.Millisecond, 2*time.Second
-	defer func() { pollInterval, queryTimeout = origPoll, origTO }()
+	origPoll, origTO, origHold := pollInterval, queryTimeout, serverHold
+	pollInterval, queryTimeout, serverHold = 3*time.Millisecond, 2*time.Second, 5*time.Millisecond
+	defer func() { pollInterval, queryTimeout, serverHold = origPoll, origTO, origHold }()
 
 	codec, err := NewCodec("t.example.com")
 	if err != nil {
@@ -214,7 +412,7 @@ func TestDNSCarrierEndToEnd(t *testing.T) {
 		srvCh <- c
 	}()
 
-	cliT, err := NewDNSClientTransport(srvAddr.String(), codec)
+	cliT, err := NewDNSClientTransport([]string{srvAddr.String()}, codec)
 	if err != nil {
 		t.Fatal(err)
 	}
