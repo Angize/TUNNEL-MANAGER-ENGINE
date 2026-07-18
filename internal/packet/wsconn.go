@@ -222,6 +222,14 @@ func wsClientHandshake(conn net.Conn, host, path string, deadline time.Time) (*b
 		resp.Header.Get("Sec-WebSocket-Accept") != wsAccept(key) {
 		return nil, errNotWS
 	}
+	// We advertise permessage-deflate to match Chrome's WS fingerprint, but wsConn does NOT
+	// implement DEFLATE and readWSFrame ignores RSV1. If the edge/server actually negotiated it
+	// (echoing it in the 101), inbound frames would be compressed and de-framed as garbage, so
+	// fail the handshake rather than silently corrupt the stream. Our own origin never echoes
+	// Sec-WebSocket-Extensions, so this only trips against an edge that would have compressed.
+	if exts := resp.Header.Get("Sec-WebSocket-Extensions"); strings.Contains(strings.ToLower(exts), "permessage-deflate") {
+		return nil, fmt.Errorf("ws: server negotiated permessage-deflate (unsupported); refusing to read compressed frames")
+	}
 	var zero time.Time
 	conn.SetDeadline(zero) // clear; the framer sets its own per-frame deadlines
 	return r, nil

@@ -150,7 +150,7 @@ type dnsClient struct {
 	closed    chan struct{}
 	pollDone  chan struct{} // closed when pollLoop has fully exited
 	once      sync.Once
-	qid       atomic.Uint32
+	qid       atomic.Uint32 // fallback DNS transaction-id source when a crypto/rand read fails
 }
 
 // NewDNSClientTransport resolves the recursive resolvers (each "host" or "host:port"; :53 default),
@@ -264,7 +264,18 @@ func (c *dnsClient) exchange(up []byte) {
 	if err != nil {
 		return
 	}
-	id := uint16(c.qid.Add(1))
+	// Derive the 16-bit DNS transaction id from crypto/rand, not a sequential counter: predictable
+	// ids let an OFF-PATH attacker spoof a matching (e.g. empty-TXT) answer that ends the exchange
+	// early, a spoofed-answer availability hit. A random id per query forces the attacker to guess
+	// the full 16 bits. On the vanishingly rare rand read error, fall back to the monotonic counter
+	// so a query still goes out. AEAD still protects integrity; this only hardens availability.
+	var idb [2]byte
+	var id uint16
+	if _, rerr := rand.Read(idb[:]); rerr == nil {
+		id = uint16(idb[0])<<8 | uint16(idb[1])
+	} else {
+		id = uint16(c.qid.Add(1))
+	}
 	query, err := buildQuery(id, name)
 	if err != nil {
 		return

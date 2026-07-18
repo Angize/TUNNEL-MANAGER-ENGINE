@@ -157,11 +157,10 @@ func (sv *Server) Handle(raw net.Conn, deadline time.Time) (net.Conn, error) {
 	if !deadline.IsZero() {
 		_ = raw.SetDeadline(deadline)
 	}
+	// readClientHello returns the bytes it consumed even on error, so hello is
+	// always safe to replay to dest below.
 	hello, _, sid, err := readClientHello(raw)
-	if err != nil {
-		return nil, err
-	}
-	if openToken(sv.psk, sid) && sv.firstSight(sid) {
+	if err == nil && openToken(sv.psk, sid) && sv.firstSight(sid) {
 		if !deadline.IsZero() {
 			_ = raw.SetDeadline(time.Time{})
 		}
@@ -180,6 +179,11 @@ func (sv *Server) Handle(raw net.Conn, deadline time.Time) (net.Conn, error) {
 		_ = s.SetDeadline(time.Time{})
 		return s, nil
 	}
+	// Everything that is not a successfully-authenticated token — an unreadable
+	// hello (fragmented, multi-record, oversized, or non-TLS), an absent/invalid
+	// token, or a replay — MUST be proxied to dest, replaying whatever bytes we
+	// consumed. Dropping the connection here would give a censor a distinguisher;
+	// a probe/real browser has to see the genuine dest site instead.
 	sv.proxyToDest(raw, hello)
 	return nil, ErrProbe
 }
@@ -240,30 +244,36 @@ func (sv *Server) proxyToDest(raw net.Conn, hello []byte) {
 // readClientHello reads exactly one TLS handshake record (the ClientHello),
 // returns the raw bytes (for replay) plus the client random and session id.
 func readClientHello(c net.Conn) (buf, random, sid []byte, err error) {
+	// buf always holds every byte consumed from c, including on the error paths
+	// below, so the caller can replay them verbatim to dest (a rejected hello must
+	// still be proxied, never dropped).
 	hdr := make([]byte, 5)
-	if _, err = io.ReadFull(c, hdr); err != nil {
-		return
+	n, err := io.ReadFull(c, hdr)
+	buf = hdr[:n]
+	if err != nil {
+		return buf, nil, nil, err
 	}
 	if hdr[0] != 0x16 { // TLS handshake content type
-		return nil, nil, nil, errNotTLS
+		return buf, nil, nil, errNotTLS
 	}
 	recLen := int(hdr[3])<<8 | int(hdr[4])
 	if recLen < 40 || recLen > 16384 {
-		return nil, nil, nil, errBadHello
+		return buf, nil, nil, errBadHello
 	}
 	body := make([]byte, recLen)
-	if _, err = io.ReadFull(c, body); err != nil {
-		return
+	n, err = io.ReadFull(c, body)
+	buf = append(buf, body[:n]...)
+	if err != nil {
+		return buf, nil, nil, err
 	}
-	buf = append(hdr, body...)
 	// body: hs_type(1) hs_len(3) client_version(2) random(32) sid_len(1) sid...
 	if len(body) < 39 || body[0] != 0x01 {
-		return nil, nil, nil, errBadHello
+		return buf, nil, nil, errBadHello
 	}
 	random = body[6:38]
 	sidLen := int(body[38])
 	if 39+sidLen > len(body) {
-		return nil, nil, nil, errBadHello
+		return buf, nil, nil, errBadHello
 	}
 	sid = body[39 : 39+sidLen]
 	return buf, random, sid, nil

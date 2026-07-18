@@ -62,9 +62,15 @@ var handshakeTimeout = 15 * time.Second
 // transport. The carrier frames tunnel packets over it.
 type sessionConn struct {
 	*kcp.UDPSession
-	qpc       *QueuePacketConn
-	t         WireTransport
-	sealer    *crypto.Sealer
+	qpc    *QueuePacketConn
+	t      WireTransport
+	sealer *crypto.Sealer
+	// pend is a session staged by a recent different-ephemeral init (server only; nil otherwise).
+	// It is promoted — tearing the live session down so the carrier reconnects to the new client —
+	// only once a data datagram actually OPENS under it (see recvPump), so a replayed init an
+	// attacker captured on-path can never trigger a teardown. Written by onHandshake and read by
+	// recvPump, both on the single recvPump goroutine, so it needs no lock.
+	pend      *crypto.Sealer
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -141,6 +147,16 @@ func (sc *sessionConn) recvPump(inCh <-chan []byte, onHandshake func([]byte)) {
 			case kindData:
 				_, _, pt, err := sc.sealer.Open(d[1:], nil)
 				if err != nil {
+					// The live session couldn't open it. It may open under a session STAGED by a
+					// recent different-ephemeral init (server only). A frame that actually opens
+					// under the staged keys proves a real, live new client — a replayed init an
+					// attacker can never produce such a frame for never reaches here — so promote
+					// by tearing the live session down, letting the carrier reconnect to accept it.
+					if sc.pend != nil {
+						if _, _, _, perr := sc.pend.Open(d[1:], nil); perr == nil {
+							_ = sc.qpc.Close()
+						}
+					}
 					continue
 				}
 				sc.qpc.QueueIncoming(pt, peerKey)
@@ -225,8 +241,10 @@ handshake:
 
 // ServeSession (server) waits for a valid init on t, derives the session and answers, then
 // returns the reliable stream once the client's kcp-go session establishes. It re-answers a
-// retransmitted init (same ephemeral) so a lost response self-heals. Single-session: a NEW init
-// (client restart) is ignored until this session is closed — the carrier owns re-accept.
+// retransmitted init (same ephemeral) so a lost response self-heals. Single-session: a NEW,
+// PSK-authenticated init (client restart) is STAGED and answered but does not replace the live
+// session until a datagram actually opens under it — so a replayed old init cannot tear the
+// session down (remote DoS). Promotion tears this session down; the carrier owns re-accept.
 func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 	done := make(chan struct{})
 	inCh := make(chan []byte, 256)
@@ -271,20 +289,44 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 	qpc := NewQueuePacketConn(peerKey)
 	sc := &sessionConn{qpc: qpc, t: t, sealer: sealer, done: done}
 	// Re-answer a retransmit of the SAME init (a lost response self-heals). A DIFFERENT ephemeral
-	// means the previous client is gone and a new one is dialing (restart, or our own resp was
-	// lost so it timed out and re-dialed): tear this session down by closing the queue conn so a
-	// pre-accept AcceptKCP unblocks and the carrier reconnects to accept the new client — never
-	// leave the single session slot parked on a client that will never speak again.
+	// might mean the previous client is gone and a new one is dialing (restart) — but it might also
+	// be a REPLAYED old init an attacker captured on-path (it still verifies the PSK MAC), so tearing
+	// the live session down on sight is a remote DoS. Instead, mirror the datagram carriers'
+	// promote-on-open discipline as the single-session design allows: STAGE the new init as a pending
+	// session and answer it, but keep the live session running. Only a data datagram that actually
+	// opens under the staged keys (see recvPump) — which a replay can never produce — promotes it and
+	// tears the old session down so the carrier reconnects to the new client. A staged init that
+	// re-arrives is re-answered from the cached response without recomputing the (ECDH+KDF) crypto.
+	var (
+		pendInit [32]byte
+		pendResp []byte
+	)
 	onHS := func(hs []byte) {
 		e, err := crypto.ParseInit(cfg.PSK, hs)
 		if err != nil {
-			return
+			return // unauthenticated/garbage init: never touch the live or staged session
 		}
 		if e == gotInit {
-			_ = t.Send(respDG)
+			_ = t.Send(respDG) // retransmit of the CURRENT init: re-answer, self-heal
 			return
 		}
-		_ = sc.qpc.Close()
+		if sc.pend != nil && e == pendInit {
+			_ = t.Send(pendResp) // retransmit of the STAGED init: re-answer without re-deriving
+			return
+		}
+		// A different, PSK-authenticated init: stage (do not adopt) a candidate session and answer it.
+		sr, gerr := crypto.GenerateEphemeral()
+		if gerr != nil {
+			return
+		}
+		s, serr := crypto.SessionSealer(cfg.Cipher, cfg.PSK, sr, e, e, sr.Pub, false)
+		if serr != nil {
+			return
+		}
+		pendInit = e
+		pendResp = append([]byte{kindHandshake}, crypto.RespMsg(cfg.PSK, e, sr)...)
+		sc.pend = s
+		_ = t.Send(pendResp)
 	}
 	go sc.sendPump()
 	go sc.recvPump(inCh, onHS)

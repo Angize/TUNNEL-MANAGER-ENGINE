@@ -37,8 +37,10 @@ type l2route struct {
 	dst     [6]byte
 }
 
-// l2inject injects raw IPv4 packets to a peer over AF_PACKET. The route is resolved once and
-// cached (rt); until the next hop is resolvable, send() returns an error and transmits nothing.
+// l2inject injects raw IPv4 packets to a peer over AF_PACKET. The route is resolved lazily and
+// cached (rt), and re-resolved after a send failure; until the next hop is resolvable, send()
+// returns an error and transmits nothing. mu also serializes send() against close() so Sendto
+// never runs on a closed (or kernel-reused) fd.
 type l2inject struct {
 	mu   sync.Mutex
 	fd   int
@@ -71,24 +73,27 @@ func (l *l2inject) close() {
 }
 
 // send injects one IPv4 packet (full IP header + payload) toward the peer, prepending the
-// resolved Ethernet header. The route is resolved lazily on first use and cached. Returns an
-// error (sending nothing) when the socket is closed or the next hop isn't resolvable yet.
+// resolved Ethernet header. The route is resolved lazily on first use and cached, and is
+// re-resolved after a send failure. Returns an error (sending nothing) when the socket is
+// closed or the next hop isn't resolvable yet.
 func (l *l2inject) send(ipPkt []byte) error {
+	// Hold the mutex across the whole send — including the Sendto syscall — so a concurrent
+	// close() cannot close (and the kernel reuse) the fd mid-send. close() takes the same
+	// mutex, so it waits for any in-flight send to finish; Sendto makes no callback into
+	// l2inject, so there is no deadlock.
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.fd < 0 {
-		l.mu.Unlock()
 		return fmt.Errorf("l2: injector closed")
 	}
 	if l.rt == nil {
 		rt, err := resolveL2(l.peer)
 		if err != nil {
-			l.mu.Unlock()
 			return err
 		}
 		l.rt = rt
 	}
-	fd, rt := l.fd, l.rt
-	l.mu.Unlock()
+	rt := l.rt
 
 	frame := make([]byte, 14+len(ipPkt))
 	copy(frame[0:6], rt.dst[:])
@@ -98,7 +103,15 @@ func (l *l2inject) send(ipPkt []byte) error {
 
 	sa := &syscall.SockaddrLinklayer{Ifindex: rt.ifindex, Halen: 6}
 	copy(sa.Addr[:6], rt.dst[:])
-	return syscall.Sendto(fd, frame, 0, sa)
+	if err := syscall.Sendto(l.fd, frame, 0, sa); err != nil {
+		// Invalidate the cached route so the next send re-resolves it: a next-hop change
+		// (gateway MAC churn, route flap) surfaces here as a Sendto failure, and dropping the
+		// stale l2route lets resolveL2 pick up the fresh ifindex/MAC instead of injecting to a
+		// dead next hop for the life of the process.
+		l.rt = nil
+		return err
+	}
+	return nil
 }
 
 // resolveL2 finds the egress interface and next-hop MAC for peer from the kernel routing and

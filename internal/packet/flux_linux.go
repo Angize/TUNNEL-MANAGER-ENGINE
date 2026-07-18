@@ -190,6 +190,10 @@ func newFlux(dev *tun.Device, ka, rotate time.Duration, obfs, cryptoOn bool, psk
 	}
 	sh := deriveFluxShape(psk, f.epochNow(), shape)
 	f.curShape.Store(&sh)
+	// Seed logEp to the startup epoch so rotateWatcher logs the FIRST genuine rotation — even one that
+	// lands before its first tick — instead of the prev==0 guard swallowing it as the startup seed; the
+	// startup epoch itself stays unlogged because the first same-epoch tick then sees prev==sh.epoch.
+	f.logEp.Store(sh.epoch)
 	// emit sends each ready FEC packet (data/parity shard) to the current peer wrapped
 	// in the carrier; deliver feeds each recovered frame back into the normal crypto
 	// path with the source of the packet that completed the block.
@@ -738,6 +742,10 @@ func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
 		}
 		f.rp = replayGuard{}
 		f.session.Store(&sealerBox{s: s})
+		// Clear the ephemeral so a replayed resp captured on-path hits the ci==nil guard above
+		// instead of re-parsing and wiping the fresh anti-replay window. A legitimate
+		// re-handshake regenerates a fresh ci in sendInit (ci==nil path).
+		f.ci.Store(nil)
 		f.lastRx.Store(time.Now().UnixNano())
 		f.st.reconnected("flux") // recovery after a self-heal (nil-safe; silent on first connect)
 		return
@@ -900,7 +908,9 @@ func (f *Flux) rotateSourceFlux(proactive bool) {
 	}
 	f.localIP.Store(&net.IPAddr{IP: ip})
 	log.Printf("flux: rotated source to %s", addr)
-	f.st.down("src-rotate", "flux")
+	// Source swap keeps the same AEAD session (no re-handshake) -> no matching reconnect. Use event() not
+	// down() so wasDown isn't armed (a phantom recovery), and carry the new source IP for the panel log.
+	f.st.event("down", "src-rotate", "ip:"+addr)
 }
 
 // rotatePeerFlux points the client at the next pool endpoint (burn+advance, or a timed rotate) and
@@ -927,12 +937,15 @@ func (f *Flux) rotatePeerFlux(proactive bool) {
 	f.peer.Store(&net.IPAddr{IP: ip})
 	f.session.Store(nil)
 	f.ci.Store(nil)
+	// Refresh the status descriptor to the NEW peer so "active" doesn't stay pinned to the dialed IP
+	// SetStatusPath baked in — same "flux:<carrier> · <peer>" format (nil-safe when status is off).
+	f.st.setActive("flux:" + f.carrier + " · " + ip.String())
 	// Fresh staleness window + unproven mark for the jumped-to endpoint, so a proactive jump onto a dead
 	// endpoint fails over within the dead window instead of stranding (clear mode). Mirrors rotatePeerUDP.
 	f.lastRx.Store(time.Now().UnixNano())
 	f.peerAnswered.Store(false)
 	log.Printf("flux: rotated destination to %s", addr)
-	f.st.down("peer-rotate", "flux")
+	f.st.down("peer-rotate", "ip:"+addr) // clears the session -> re-handshake -> reconnect pairs the down
 }
 
 // adoptPeerFlux re-points the client at the pool's CURRENT destination — used when an operator pin has
@@ -948,8 +961,11 @@ func (f *Flux) adoptPeerFlux() {
 	f.peer.Store(&net.IPAddr{IP: ip})
 	f.session.Store(nil)
 	f.ci.Store(nil)
+	// Refresh the status descriptor to the pinned peer so "active" tracks the current destination
+	// (same "flux:<carrier> · <peer>" format as SetStatusPath; nil-safe when status is off).
+	f.st.setActive("flux:" + f.carrier + " · " + ip.String())
 	log.Printf("flux: pinned destination to %s", ip)
-	f.st.down("peer-pin", "flux")
+	f.st.down("peer-pin", "ip:"+ip.String()) // clears the session -> re-handshake -> reconnect pairs the down
 }
 
 // adoptSourceFlux swaps the crafted-header source to the pool's CURRENT source (an operator source pin).
@@ -964,7 +980,7 @@ func (f *Flux) adoptSourceFlux() {
 	}
 	f.localIP.Store(&net.IPAddr{IP: ip})
 	log.Printf("flux: pinned source to %s", ip)
-	f.st.down("src-pin", "flux")
+	f.st.event("down", "src-pin", "ip:"+ip.String()) // source pin: session survives, no reconnect (see rotateSourceFlux)
 }
 
 // ProbeAllNow retests every suspect/dead endpoint on both pools at once (the panel "probe now" control,

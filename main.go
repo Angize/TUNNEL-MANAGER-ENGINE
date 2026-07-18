@@ -278,7 +278,13 @@ func main() {
 	if cfg.Role == "client" && cfg.DeadAfterSecs > 0 {
 		if s, ok := b.(interface{ SetDeadAfter(int) }); ok {
 			s.SetDeadAfter(cfg.DeadAfterSecs)
-			log.Printf("tnl-core: self-heal deadline set to %ds (>=2×keepalive)", cfg.DeadAfterSecs)
+			// Log the EFFECTIVE deadline: the carrier clamps dead_after_secs up to >=2×keepalive
+			// (deadWindow), so logging cfg.DeadAfterSecs verbatim would misreport a clamped value.
+			effDead := cfg.DeadAfterSecs
+			if floor := 2 * cfg.Keepalive; effDead < floor {
+				effDead = floor
+			}
+			log.Printf("tnl-core: self-heal deadline set to %ds (>=2×keepalive)", effDead)
 		}
 	}
 	// Datagram transports (udp/raw/flux): wire a status-file event ring so the client's precise

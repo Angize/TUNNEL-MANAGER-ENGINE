@@ -75,12 +75,32 @@ func (s *coreStatus) reconnected(detail string) {
 	}
 }
 
-func (s *coreStatus) write() {
+// setActive refreshes the live-carrier descriptor (e.g. "udp · 1.2.3.4:443") after a destination
+// rotation so the status file's "active" field doesn't go stale. Locks only to swap the field, then
+// flushes outside s.mu because write() re-locks mu.
+func (s *coreStatus) setActive(a string) {
 	if s == nil || s.path == "" {
 		return
 	}
 	s.mu.Lock()
-	evs := append([]coreEvent(nil), s.events...) // copy so the marshal runs outside the lock
+	s.active = a
+	s.mu.Unlock()
+	s.write()
+}
+
+func (s *coreStatus) write() {
+	if s == nil || s.path == "" {
+		return
+	}
+	// Hold writeMu across BOTH the snapshot and the file write so the on-disk write order can never
+	// invert the snapshot order: without this, two concurrent write() calls could snapshot in one
+	// order but rename in the other, letting an older snapshot clobber a newer status file and drop
+	// the latest event until the next event forces a rewrite. Lock order is writeMu->mu (mu released
+	// before I/O), matching ws_pool.go's writeStatus so the two never deadlock.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	evs := append([]coreEvent(nil), s.events...) // copy so the marshal runs outside s.mu
 	active := s.active
 	s.mu.Unlock()
 	payload := struct {
@@ -92,8 +112,6 @@ func (s *coreStatus) write() {
 	if err != nil {
 		return
 	}
-	s.writeMu.Lock() // serialize writers: the shared ".tmp" path must not be raced by concurrent write() calls
-	defer s.writeMu.Unlock()
 	tmp := s.path + ".tmp"
 	if os.WriteFile(tmp, buf, 0o600) != nil {
 		return

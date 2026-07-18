@@ -385,6 +385,9 @@ func (c *Config) applyDefaults() {
 		if c.FluxCarrier == "" {
 			c.FluxCarrier = "udp"
 		}
+		if c.FluxShape == "" { // '' already means random in the carrier; make it explicit so the startup log prints "random" not blank
+			c.FluxShape = "random"
+		}
 	}
 	if c.Fec { // FEC defaults apply on any datagram carrier that has it enabled
 		if c.FecData == 0 {
@@ -751,6 +754,12 @@ func (c *Config) validate() error {
 	}
 	if c.Cover && c.Transport != "tcp" {
 		return errors.New("cover (TLS) requires transport \"tcp\"")
+	}
+	// The REALITY ClientHello auth token is keyed on the PSK (deriveKey/authKey over
+	// the PSK); with crypto off the token is derived over an empty key, so any observer
+	// could forge it. Require crypto so the cover token is actually authenticated.
+	if c.Cover && !c.Crypto.Enabled {
+		return errors.New("cover (TLS) requires crypto enabled (the REALITY auth token is keyed on the PSK)")
 	}
 	if c.Cover && c.CoverSNI == "" {
 		return errors.New("cover (TLS) requires cover_sni (the SNI to present)")
