@@ -16,11 +16,23 @@ const (
 	maxLabel = 63  // DNS label length limit
 	maxName  = 255 // DNS name wire-length limit
 	maxTXT   = 255 // one TXT character-string
+	// nonceLen is the length (in base32 chars) of the per-query random label prepended to EVERY
+	// query name. It makes every name unique — including the idle poll and the handshake init
+	// retransmit, which are otherwise byte-identical every time — so a recursive resolver can never
+	// answer them from its cache or coalesce them: each query reaches our authoritative server and
+	// the downstream datagram it carries actually returns. Without this, a resolver honoring TTL=0
+	// is the only thing that keeps the tunnel alive, and Google/most resolvers coalesce or briefly
+	// cache identical in-flight names, which starves the handshake and the session never converges.
+	nonceLen = 8
 )
 
+// nonceWire is the wire cost of the nonce label: its length octet plus its bytes.
+const nonceWire = 1 + nonceLen
+
 var (
-	errTooBig  = errors.New("dns codec: datagram exceeds one-message capacity")
-	errBadName = errors.New("dns codec: query name not under the zone")
+	errTooBig   = errors.New("dns codec: datagram exceeds one-message capacity")
+	errBadName  = errors.New("dns codec: query name not under the zone")
+	errBadNonce = errors.New("dns codec: nonce label empty or too long")
 )
 
 // Codec maps datagrams onto DNS messages under a fixed delegated zone. UPSTREAM (client→server)
@@ -73,9 +85,9 @@ func zoneWireLen(zone string) int {
 }
 
 // computeMaxUpstream finds the max raw byte count whose base32 form, split into <=63-char labels,
-// fits alongside the zone inside the 255-byte name limit.
+// fits alongside the zone AND the per-query nonce label inside the 255-byte name limit.
 func (c *Codec) computeMaxUpstream() int {
-	dataWire := maxName - zoneWireLen(c.zone)
+	dataWire := maxName - zoneWireLen(c.zone) - nonceWire
 	if dataWire <= 0 {
 		return 0
 	}
@@ -91,14 +103,22 @@ func (c *Codec) computeMaxUpstream() int {
 	return chars * 5 / 8 // base32: 8 chars per 5 bytes; floor gives the max raw bytes fitting in `chars`
 }
 
-// EncodeName builds the query name carrying data: base32(data) split into <=63-char labels under the
-// zone. It errors if data is larger than MaxUpstream.
-func (c *Codec) EncodeName(data []byte) (string, error) {
+// EncodeName builds the query name carrying data: a per-query nonce label (leftmost, makes the name
+// unique so a resolver can't cache/coalesce it) followed by base32(data) split into <=63-char labels
+// under the zone. It errors if data exceeds MaxUpstream or the nonce is empty/over-long. The nonce is
+// supplied by the caller (the transport) so the codec stays pure; a poll is EncodeName(nil, nonce),
+// which yields "<nonce>.<zone>" — unique, yet carrying no upstream payload.
+func (c *Codec) EncodeName(data []byte, nonce string) (string, error) {
 	if len(data) > c.maxUp {
 		return "", errTooBig
 	}
-	s := lowB32.EncodeToString(data)
+	if nonce == "" || len(nonce) > maxLabel {
+		return "", errBadNonce
+	}
 	var b strings.Builder
+	b.WriteString(nonce)
+	b.WriteByte('.')
+	s := lowB32.EncodeToString(data)
 	for len(s) > 0 {
 		n := len(s)
 		if n > maxLabel {
@@ -113,24 +133,30 @@ func (c *Codec) EncodeName(data []byte) (string, error) {
 }
 
 // DecodeName extracts the datagram from a query name under the zone, tolerating a missing/extra
-// trailing dot and any 0x20 case randomization the resolver applied.
+// trailing dot and any 0x20 case randomization the resolver applied. The leftmost label is the
+// per-query nonce (see EncodeName) and is discarded; the remaining labels are the base32 data. A
+// nonce-only name ("<nonce>.<zone>") or the bare zone carries zero upstream bytes (a poll).
 func (c *Codec) DecodeName(name string) ([]byte, error) {
 	nl := strings.ToLower(strings.TrimSpace(name))
 	if !strings.HasSuffix(nl, ".") {
 		nl += "."
 	}
-	// Require a real label boundary before the zone: "<data>.<zone>" or a bare "<zone>" query.
+	// Require a real label boundary before the zone: "<labels>.<zone>" or a bare "<zone>" query.
 	// A plain HasSuffix would accept e.g. "abt.example.com" for zone "t.example.com" and mis-parse
-	// the foreign label "ab" as upstream data.
+	// the foreign label "ab" as a nonce.
 	if nl != c.zone && !strings.HasSuffix(nl, "."+c.zone) {
 		return nil, errBadName
 	}
-	prefix := strings.TrimSuffix(nl[:len(nl)-len(c.zone)], ".") // data labels, no trailing dot
+	prefix := strings.TrimSuffix(nl[:len(nl)-len(c.zone)], ".") // nonce + data labels, no trailing dot
 	if prefix == "" {
-		return []byte{}, nil // a bare zone query (e.g. a poll with no upstream data)
+		return []byte{}, nil // bare zone (external probe), no nonce/data
 	}
-	joined := strings.ReplaceAll(prefix, ".", "")
-	return lowB32.DecodeString(joined)
+	labels := strings.Split(prefix, ".")
+	data := labels[1:] // drop the leftmost nonce label
+	if len(data) == 0 {
+		return []byte{}, nil // nonce-only name: a poll with no upstream payload
+	}
+	return lowB32.DecodeString(strings.Join(data, ""))
 }
 
 // EncodeTXT packs a downstream datagram into TXT character-strings (<=255 bytes each). A datagram

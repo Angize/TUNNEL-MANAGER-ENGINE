@@ -163,7 +163,7 @@ func TestDNSServerAuthoritativeBehavior(t *testing.T) {
 
 	// A TXT query still carries the tunnel: it delivers its upstream datagram and gets a TXT reply.
 	payload := []byte("hello-upstream")
-	qname, err := codec.EncodeName(payload)
+	qname, err := codec.EncodeName(payload, newNonce())
 	if err != nil {
 		t.Fatal(err)
 	}

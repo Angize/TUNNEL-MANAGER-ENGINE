@@ -304,15 +304,20 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 	return sc, nil
 }
 
-// tuneSession applies the DNS-appropriate KCP settings: turbo mode (fast retransmit) for quick
-// recovery on a lossy channel, stream mode (the carrier frames its own packets), a small window,
-// and the MTU the transport can carry in one datagram (mtu<=0 falls back to the default).
+// tuneSession applies the DNS-appropriate KCP settings. The carrier is HIGH-LATENCY (hundreds of ms
+// per round-trip) and strictly paced at ~one datagram per round-trip by the client's poll loop, so
+// the old LAN turbo profile (30ms min-RTO + fast-resend) just fired ~10+ spurious retransmits per
+// segment before an ACK could return and never converged. Instead: stream mode (the carrier frames
+// its own packets); nodelay OFF so the min-RTO sits at ~100ms and adapts UP to the measured RTT;
+// resend=0 to DISABLE fast-retransmit (there are never dup-acks with one datagram in flight); a
+// 100ms flush interval matched to the pace; a small window bounding in-flight data to about the
+// carrier's bandwidth-delay product; and the MTU the transport carries in one query (<=0 -> default).
 func tuneSession(s *kcp.UDPSession, mtu int) {
 	if mtu <= 0 {
 		mtu = kcpMTUDefault
 	}
 	s.SetStreamMode(true)
-	s.SetNoDelay(1, 20, 2, 1)
-	s.SetWindowSize(256, 256)
+	s.SetNoDelay(0, 100, 0, 1)
+	s.SetWindowSize(64, 64)
 	s.SetMtu(mtu)
 }
