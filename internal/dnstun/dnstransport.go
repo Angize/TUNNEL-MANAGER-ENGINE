@@ -72,34 +72,41 @@ func parseResponseTXT(buf []byte, wantID uint16) ([]byte, error) {
 	return out, nil
 }
 
-// parseQuery extracts the transaction id and question name from a query (ignores responses).
-func parseQuery(buf []byte) (id uint16, name string, ok bool) {
+// parseQuery extracts the transaction id, question name and type from a query (ignores responses).
+func parseQuery(buf []byte) (id uint16, name string, qtype dnsmessage.Type, ok bool) {
 	var p dnsmessage.Parser
 	h, err := p.Start(buf)
 	if err != nil || h.Response {
-		return 0, "", false
+		return 0, "", 0, false
 	}
 	q, err := p.Question()
 	if err != nil {
-		return 0, "", false
+		return 0, "", 0, false
 	}
-	return h.ID, q.Name.String(), true
+	return h.ID, q.Name.String(), q.Type, true
 }
 
-func buildResponseTXT(id uint16, qname string, txt []string) ([]byte, error) {
-	n, err := dnsmessage.NewName(qname)
-	if err != nil {
-		return nil, err
-	}
+// buildResponse assembles an authoritative reply: the AA bit is set, RA is cleared, the question is
+// echoed with the type actually queried, and the given answer records are attached. A recursive
+// resolver querying a zone's own nameserver iteratively (RD=0) requires AA on the answer — without
+// it the delegation looks lame and the lookup SERVFAILs, so this bit is what makes the carrier work
+// through real resolvers rather than only a direct-to-server dig.
+func buildResponse(id uint16, qname dnsmessage.Name, qtype dnsmessage.Type, answers []dnsmessage.Resource) ([]byte, error) {
 	msg := dnsmessage.Message{
-		Header:    dnsmessage.Header{ID: id, Response: true, RecursionAvailable: true},
-		Questions: []dnsmessage.Question{{Name: n, Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET}},
-		Answers: []dnsmessage.Resource{{
-			Header: dnsmessage.ResourceHeader{Name: n, Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET},
-			Body:   &dnsmessage.TXTResource{TXT: txt},
-		}},
+		Header:    dnsmessage.Header{ID: id, Response: true, Authoritative: true},
+		Questions: []dnsmessage.Question{{Name: qname, Type: qtype, Class: dnsmessage.ClassINET}},
+		Answers:   answers,
 	}
 	return msg.Pack()
+}
+
+// txtResource wraps downstream character-strings as a single TXT answer record under name. TTL is
+// left at 0 so no resolver caches a downstream slot (the idle poll reuses the bare-zone name).
+func txtResource(name dnsmessage.Name, txt []string) dnsmessage.Resource {
+	return dnsmessage.Resource{
+		Header: dnsmessage.ResourceHeader{Name: name, Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET},
+		Body:   &dnsmessage.TXTResource{TXT: txt},
+	}
 }
 
 // ---- client transport (WireTransport) ----
@@ -258,11 +265,19 @@ type dnsServer struct {
 	closed     chan struct{}
 	serveDone  chan struct{} // closed when serveLoop has fully exited
 	once       sync.Once
+
+	zoneName dnsmessage.Name     // the delegated zone apex, precomputed for question/answer names
+	soa      dnsmessage.Resource // apex SOA, answered so resolvers see a healthy (not lame) zone
+	ns       dnsmessage.Resource // apex NS, likewise
 }
 
 // NewDNSServerTransport binds listenAddr (typically ":53") as the authoritative responder for the
 // delegated zone and starts serving. It returns the transport and the bound address.
 func NewDNSServerTransport(listenAddr string, codec *Codec) (WireTransport, net.Addr, error) {
+	zoneName, soa, ns, err := apexRecords(codec.Zone())
+	if err != nil {
+		return nil, nil, err
+	}
 	la, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		return nil, nil, err
@@ -278,9 +293,40 @@ func NewDNSServerTransport(listenAddr string, codec *Codec) (WireTransport, net.
 		downstream: make(chan []byte, sendQueueSize),
 		closed:     make(chan struct{}),
 		serveDone:  make(chan struct{}),
+		zoneName:   zoneName,
+		soa:        soa,
+		ns:         ns,
 	}
 	go s.serveLoop()
 	return s, conn.LocalAddr(), nil
+}
+
+// apexRecords precomputes the zone-apex name plus its SOA and NS answer records. They point the
+// zone at itself (MNAME/NS = apex): the parent delegation already carries the glue that routes
+// resolvers here, so these only need to answer the apex probes (SOA/NS) that resolvers make while
+// validating the zone — self-reference keeps them well-formed without a second hostname to publish.
+// Serial is fixed and MinTTL is 0 (no zone transfers, no negative caching for this carrier).
+func apexRecords(zone string) (dnsmessage.Name, dnsmessage.Resource, dnsmessage.Resource, error) {
+	zn, err := dnsmessage.NewName(zone)
+	if err != nil {
+		return dnsmessage.Name{}, dnsmessage.Resource{}, dnsmessage.Resource{}, err
+	}
+	mbox, err := dnsmessage.NewName("hostmaster." + zone)
+	if err != nil {
+		mbox = zn // zone too long for the hostmaster. prefix: fall back to the apex as RNAME
+	}
+	soa := dnsmessage.Resource{
+		Header: dnsmessage.ResourceHeader{Name: zn, Type: dnsmessage.TypeSOA, Class: dnsmessage.ClassINET},
+		Body: &dnsmessage.SOAResource{
+			NS: zn, MBox: mbox, Serial: 1,
+			Refresh: 3600, Retry: 600, Expire: 604800, MinTTL: 0,
+		},
+	}
+	ns := dnsmessage.Resource{
+		Header: dnsmessage.ResourceHeader{Name: zn, Type: dnsmessage.TypeNS, Class: dnsmessage.ClassINET},
+		Body:   &dnsmessage.NSResource{NS: zn},
+	}
+	return zn, soa, ns, nil
 }
 
 func (s *dnsServer) Send(d []byte) error {
@@ -326,13 +372,33 @@ func (s *dnsServer) serveLoop() {
 		if err != nil {
 			return
 		}
-		id, qname, ok := parseQuery(buf[:n])
+		id, qname, qtype, ok := parseQuery(buf[:n])
 		if !ok {
 			continue
 		}
+		qn, nerr := dnsmessage.NewName(qname)
+		if nerr != nil {
+			continue
+		}
+
+		// Only TXT queries carry the tunnel. Anything else is a resolver validating or minimizing
+		// the delegation (SOA/NS at the apex, or an intermediate A/NS probe); answer in-zone names
+		// authoritatively so the zone never looks lame, but never let it touch the session. Names
+		// outside the zone are dropped — an authoritative server must not claim what it doesn't serve.
+		if qtype != dnsmessage.TypeTXT {
+			if !s.underZone(qname) {
+				continue
+			}
+			resp, berr := buildResponse(id, qn, qtype, s.apexAnswers(qname, qtype))
+			if berr == nil {
+				_, _ = s.conn.WriteToUDP(resp, addr)
+			}
+			continue
+		}
+
 		data, derr := s.codec.DecodeName(qname)
 		if derr != nil {
-			continue // not under our zone / malformed
+			continue // a TXT query outside our zone / malformed
 		}
 		if len(data) > 0 {
 			select {
@@ -347,10 +413,47 @@ func (s *dnsServer) serveLoop() {
 		case down = <-s.downstream:
 		default: // nothing to push this round
 		}
-		resp, berr := buildResponseTXT(id, qname, s.codec.EncodeTXT(down))
+		resp, berr := buildResponse(id, qn, dnsmessage.TypeTXT, []dnsmessage.Resource{txtResource(qn, s.codec.EncodeTXT(down))})
 		if berr != nil {
 			continue
 		}
 		_, _ = s.conn.WriteToUDP(resp, addr)
 	}
+}
+
+// apexAnswers returns the authority records for a non-TXT query: the SOA or NS at the exact zone
+// apex, and nothing (an authoritative NODATA, AA set) for every other name or type. NODATA rather
+// than silence keeps a QNAME-minimizing resolver moving — it reads "the name exists, no record of
+// this type" and proceeds to the real TXT query instead of retrying and giving up.
+func (s *dnsServer) apexAnswers(qname string, qtype dnsmessage.Type) []dnsmessage.Resource {
+	if !s.isApex(qname) {
+		return nil
+	}
+	switch qtype {
+	case dnsmessage.TypeSOA:
+		return []dnsmessage.Resource{s.soa}
+	case dnsmessage.TypeNS:
+		return []dnsmessage.Resource{s.ns}
+	}
+	return nil
+}
+
+// normName lowercases, trims, and ensures a single trailing dot so a query name compares cleanly
+// against the codec's fully-qualified zone (case- and trailing-dot-tolerant).
+func normName(qname string) string {
+	q := strings.ToLower(strings.TrimSpace(qname))
+	if !strings.HasSuffix(q, ".") {
+		q += "."
+	}
+	return q
+}
+
+// isApex reports whether qname is exactly the delegated zone apex.
+func (s *dnsServer) isApex(qname string) bool { return normName(qname) == s.codec.Zone() }
+
+// underZone reports whether qname is the apex or a name beneath it (a real label boundary before the
+// zone, so "abt.example.com" is not accepted as under "t.example.com").
+func (s *dnsServer) underZone(qname string) bool {
+	q := normName(qname)
+	return q == s.codec.Zone() || strings.HasSuffix(q, "."+s.codec.Zone())
 }
