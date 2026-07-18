@@ -1,6 +1,7 @@
 package dnstun
 
 import (
+	"crypto/rand"
 	"errors"
 	"net"
 	"strings"
@@ -20,6 +21,17 @@ var (
 )
 
 const dnsReadBuf = 1500
+
+// newNonce returns a fresh nonceLen-char lowercase-base32 label for one query. It is the leftmost
+// label of every query name, making each name unique so a recursive resolver never serves a query
+// from cache or coalesces two — every poll and every retransmit reaches our authoritative server.
+// crypto/rand is overkill for cache-busting but the volume is ~one label per round-trip, so cost is
+// irrelevant; on the vanishingly rare read error the zero-value bytes still yield a valid label.
+func newNonce() string {
+	var b [(nonceLen*5 + 7) / 8]byte // enough entropy bytes to base32 to >= nonceLen chars
+	_, _ = rand.Read(b[:])
+	return lowB32.EncodeToString(b[:])[:nonceLen]
+}
 
 // ---- DNS message helpers (x/net/dnsmessage) ----
 
@@ -215,7 +227,7 @@ func (c *dnsClient) pollLoop() {
 // exchange runs one query/response. A lost query or timed-out answer is not an error here: kcp-go
 // retransmits any upstream datagram, and the downstream slot is retried on the next poll.
 func (c *dnsClient) exchange(up []byte) {
-	name, err := c.codec.EncodeName(up)
+	name, err := c.codec.EncodeName(up, newNonce())
 	if err != nil {
 		return
 	}

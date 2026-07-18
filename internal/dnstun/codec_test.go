@@ -40,7 +40,7 @@ func TestNameRoundTrip(t *testing.T) {
 		if _, err := rand.Read(data); err != nil {
 			t.Fatal(err)
 		}
-		name, err := c.EncodeName(data)
+		name, err := c.EncodeName(data, newNonce())
 		if err != nil {
 			t.Fatalf("EncodeName(%d bytes): %v", size, err)
 		}
@@ -59,8 +59,40 @@ func TestNameRoundTrip(t *testing.T) {
 
 func TestNameOverCapacityRejected(t *testing.T) {
 	c, _ := NewCodec("t.example.com")
-	if _, err := c.EncodeName(make([]byte, c.MaxUpstream()+1)); err == nil {
+	if _, err := c.EncodeName(make([]byte, c.MaxUpstream()+1), newNonce()); err == nil {
 		t.Fatal("EncodeName accepted an over-capacity datagram")
+	}
+}
+
+func TestEncodeNameRejectsBadNonce(t *testing.T) {
+	c, _ := NewCodec("t.example.com")
+	if _, err := c.EncodeName([]byte{1, 2, 3}, ""); err == nil {
+		t.Fatal("EncodeName accepted an empty nonce")
+	}
+	if _, err := c.EncodeName([]byte{1, 2, 3}, strings.Repeat("a", maxLabel+1)); err == nil {
+		t.Fatal("EncodeName accepted an over-long nonce")
+	}
+}
+
+func TestNonceMakesEveryNameUnique(t *testing.T) {
+	// The whole point of the nonce: identical payloads (and the empty poll) must still yield DISTINCT
+	// query names every call, so a recursive resolver can never cache or coalesce them.
+	c, _ := NewCodec("t.example.com")
+	seen := make(map[string]bool)
+	for i := 0; i < 1000; i++ {
+		name, err := c.EncodeName(nil, newNonce()) // the idle poll: same (empty) payload every time
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen[name] {
+			t.Fatalf("duplicate poll name %q — resolver could cache/coalesce it", name)
+		}
+		seen[name] = true
+		// A nonce-only poll name must still decode to zero upstream bytes.
+		got, derr := c.DecodeName(name)
+		if derr != nil || len(got) != 0 {
+			t.Fatalf("poll name %q decoded to %x (err %v), want empty", name, got, derr)
+		}
 	}
 }
 
@@ -72,7 +104,7 @@ func TestDecodeName0x20CaseRandomization(t *testing.T) {
 	if _, err := rand.Read(data); err != nil {
 		t.Fatal(err)
 	}
-	name, _ := c.EncodeName(data)
+	name, _ := c.EncodeName(data, newNonce())
 
 	// Flip case on alternating characters, as a 0x20-randomizing resolver would.
 	rc := []rune(name)
