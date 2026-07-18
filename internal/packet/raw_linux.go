@@ -834,6 +834,10 @@ func (r *Raw) tryHandshake(body []byte, addr *net.IPAddr) {
 		}
 		r.rp = replayGuard{}
 		r.session.Store(&sealerBox{s: s})
+		// Clear the ephemeral so a replayed resp captured on-path hits the ci==nil guard above
+		// instead of re-parsing and wiping the fresh anti-replay window. A legitimate
+		// re-handshake regenerates a fresh ci in sendInit (ci==nil path).
+		r.ci.Store(nil)
 		r.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale"
 		r.st.reconnected("raw")               // recovery after a self-heal (nil-safe; silent on first connect)
 		return
@@ -1008,7 +1012,9 @@ func (r *Raw) rotateSourceRaw(proactive bool) {
 	}
 	r.localIP.Store(&net.IPAddr{IP: ip})
 	log.Printf("raw: rotated source to %s", addr)
-	r.st.down("src-rotate", "raw")
+	// Source swap keeps the same AEAD session (no re-handshake) -> no matching reconnect. Use event() not
+	// down() so wasDown isn't armed (a phantom recovery), and carry the new source IP for the panel log.
+	r.st.event("down", "src-rotate", "ip:"+addr)
 }
 
 // rotatePeerRaw points the client at the next pool endpoint and clears the session so the next loop
@@ -1033,6 +1039,7 @@ func (r *Raw) rotatePeerRaw(proactive bool) {
 		return
 	}
 	r.peer.Store(&net.IPAddr{IP: ip})
+	r.st.setActive("raw:" + r.profile + " · " + ip.String()) // refresh the frozen active descriptor to the new destination (matches SetStatusPath)
 	r.session.Store(nil)
 	r.ci.Store(nil)
 	// Give the jumped-to endpoint a FRESH staleness window and mark it unproven, so a proactive jump
@@ -1041,7 +1048,7 @@ func (r *Raw) rotatePeerRaw(proactive bool) {
 	r.lastRx.Store(time.Now().UnixNano())
 	r.peerAnswered.Store(false)
 	log.Printf("raw: rotated destination to %s", addr)
-	r.st.down("peer-rotate", "raw")
+	r.st.down("peer-rotate", "ip:"+addr) // clears the session -> re-handshake -> reconnect pairs the down
 }
 
 // adoptPeerRaw re-points the client at the pool's CURRENT destination — used when an operator pin has
@@ -1055,10 +1062,11 @@ func (r *Raw) adoptPeerRaw() {
 		return
 	}
 	r.peer.Store(&net.IPAddr{IP: ip})
+	r.st.setActive("raw:" + r.profile + " · " + ip.String()) // refresh the frozen active descriptor to the new destination (matches SetStatusPath)
 	r.session.Store(nil)
 	r.ci.Store(nil)
 	log.Printf("raw: pinned destination to %s", ip)
-	r.st.down("peer-pin", "raw")
+	r.st.down("peer-pin", "ip:"+ip.String()) // clears the session -> re-handshake -> reconnect pairs the down
 }
 
 // adoptSourceRaw swaps the crafted-header source to the pool's CURRENT source (an operator source pin).
@@ -1073,7 +1081,7 @@ func (r *Raw) adoptSourceRaw() {
 	}
 	r.localIP.Store(&net.IPAddr{IP: ip})
 	log.Printf("raw: pinned source to %s", ip)
-	r.st.down("src-pin", "raw")
+	r.st.event("down", "src-pin", "ip:"+ip.String()) // source pin: session survives, no reconnect (see rotateSourceRaw)
 }
 
 // ProbeAllNow retests every suspect/dead endpoint on both pools at once (the panel "probe now" control,

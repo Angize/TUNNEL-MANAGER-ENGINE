@@ -502,9 +502,17 @@ func (b *TCP) SetStatusPath(path string) {
 	if !b.isClient || path == "" || b.pool != nil {
 		return
 	}
-	carrier := "ws"
-	if b.xhttp {
+	// Label the status file by the ACTUAL transport, not a hardcoded "ws": a direct tcp or a
+	// cover/REALITY carrier also reaches here and must not be mislabeled "ws". xhttp implies ws,
+	// so it is checked first; cover is a direct-tcp variant, so it falls under the non-ws branch.
+	carrier := "tcp"
+	switch {
+	case b.xhttp:
 		carrier = "xhttp"
+	case b.ws:
+		carrier = "ws"
+	case b.cover:
+		carrier = "cover"
 	}
 	b.st = newCoreStatus(path, carrier+" · "+b.addr)
 }
@@ -915,6 +923,16 @@ func (b *TCP) publishServerConn(cf *connFramer) {
 	}
 	b.authMu.Unlock()
 	for _, v := range reap {
+		// handleFrame may Store a reaped conn as b.cur without authMu after our
+		// snapshot, making it the live downstream target between snapshot and close.
+		// Re-check against the now-current conn: if it just became downstream, skip
+		// the close and re-track it in authConns so it survives and is not leaked.
+		if v == b.cur.Load() {
+			b.authMu.Lock()
+			b.authConns = append(b.authConns, v)
+			b.authMu.Unlock()
+			continue
+		}
 		v.conn.Close() // its serve loop errors out -> onConnErr cleans up cur/authConns
 	}
 }
@@ -1356,7 +1374,10 @@ func classifyErr(s string) string {
 		return "eof"
 	case strings.Contains(l, "tls") || strings.Contains(l, "handshake") || strings.Contains(l, "certificate"):
 		return "tls" // TLS failed — a blocked SNI is often killed at the ClientHello
-	case strings.Contains(l, "websocket") || strings.Contains(l, "ws ") || strings.Contains(l, "101") || strings.Contains(l, "upgrade"):
+	case strings.Contains(l, "websocket") || strings.Contains(l, "ws ") || strings.Contains(l, "101 switching") || strings.Contains(l, "upgrade"):
+		// Match the full HTTP-101 status line ("101 Switching Protocols"), not a bare "101" substring,
+		// so an unrelated error that merely contains "101" (an IP octet, a port, a byte count) is not
+		// misclassified as a websocket-upgrade failure.
 		return "ws_upgrade" // reached TLS but the CDN/origin refused the upgrade
 	default:
 		return "dropped"
@@ -1492,6 +1513,9 @@ func (b *TCP) dialLoop() {
 		}
 		log.Printf("core/tcp: connected to %s", label)
 		connectedAt := time.Now()
+		// Single-edge (non-pool) self-heal: pair this recovery with a prior carrier-loss "down". nil-safe
+		// (no-op when no status file is wired) and silent on the first connect (only a pending down emits).
+		b.st.reconnected(label)
 		// Clear a STALE manual-switch flag before this connection's death is ever accounted. rotate1
 		// sets manualSwitch unconditionally, but during an outage (no live curConn to drop) the flag is
 		// set with no death to consume it; left pending it would mask the NEXT genuine death as a clean
@@ -1634,6 +1658,14 @@ func (b *TCP) dialLoop() {
 			} else {
 				succeedBoth()
 			}
+		}
+		// Single-edge (non-pool) status file: surface a GENUINE carrier loss as a precise "down" event
+		// (paired with the "up" the next successful dial emits via reconnected), mirroring the datagram
+		// carriers. b.st is only ever wired on a non-pool carrier, so the ws-pool branch above (b.st==nil
+		// there) is untouched; nil-safe and skipped for a deliberate switch or Close. The non-pool branches
+		// don't consume takeLastErr, so the death cause is still available here.
+		if b.st != nil && !deliberate && !b.closed.Load() {
+			b.st.down(classifyErr(b.takeLastErr()), label)
 		}
 		// Only back off before re-dialing on a GENUINE drop. A deliberate, healthy rotation (proactive
 		// timer or operator pin) re-dials immediately, so the switch gap is just the reconnect+handshake
@@ -2160,12 +2192,14 @@ func (b *TCP) peerPinPollLoop() {
 					log.Printf("core/tcp: pin destination %s (panel select)", key)
 					drop()
 				}
+				b.pp.expirePinIfLapsed() // flush the status file the moment a lapsed pin stops being honoured (current() drops it under the hot lock but can't write)
 			}
 			if b.sp != nil {
 				if key, ok := b.sp.readSelectCmd(); ok && b.sp.selectEntry(key) {
 					log.Printf("core/tcp: pin source %s (panel select)", key)
 					drop()
 				}
+				b.sp.expirePinIfLapsed()
 			}
 		}
 	}

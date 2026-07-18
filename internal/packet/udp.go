@@ -163,7 +163,12 @@ func (b *UDP) rotatePeerUDP(proactive bool) {
 	b.lastRx.Store(time.Now().UnixNano())
 	b.peerAnswered.Store(false)
 	log.Printf("core/udp: rotated destination to %s", addr)
-	b.st.down("peer-rotate", "udp")
+	// BUG #30: refresh the live-carrier descriptor so the status file's "active" field tracks the NEW
+	// destination instead of staying frozen at the initial peer. Same format SetStatusPath uses
+	// ("udp · "+peer, peer=UDPAddr.String()). Only the DESTINATION path refreshes active; the source
+	// path (rotateSourceUDP) leaves it, since "active" names the destination, not the source.
+	b.st.setActive("udp · " + ua.String())
+	b.st.down("peer-rotate", "ip:"+addr) // clears the session -> re-handshake -> reconnect pairs the down
 }
 
 // SetSourcePool (client) wires a source-IP rotation pool: the client cycles the local IP it sends
@@ -217,7 +222,10 @@ func (b *UDP) rotateSourceUDP(proactive bool) {
 	}
 	if host, ok := b.rebindSourceTo(addr); ok {
 		log.Printf("core/udp: rotated source to %s", host)
-		b.st.down("src-rotate", "udp")
+		// A source rebind keeps the SAME AEAD session alive (no re-handshake), so there is no matching
+		// reconnect. Use event() not down(): log the rotation but do NOT arm wasDown (which would leave a
+		// phantom pending recovery that a later unrelated re-handshake would mis-pair). Carry the new IP.
+		b.st.event("down", "src-rotate", "ip:"+host)
 	}
 }
 
@@ -266,7 +274,8 @@ func (b *UDP) adoptPeerUDP() {
 	b.session.Store(nil)
 	b.ci.Store(nil)
 	log.Printf("core/udp: pinned destination to %s", addr)
-	b.st.down("peer-pin", "udp")
+	b.st.setActive("udp · " + ua.String()) // BUG #30: keep "active" tracking the pinned destination (see rotatePeerUDP)
+	b.st.down("peer-pin", "ip:"+addr)       // clears the session -> re-handshake -> reconnect pairs the down
 }
 
 // adoptSourceUDP rebinds the socket onto the pool's CURRENT source (an operator source pin). Safe from
@@ -279,7 +288,7 @@ func (b *UDP) adoptSourceUDP() {
 	addr := b.sp.current()
 	if host, ok := b.rebindSourceTo(addr); ok {
 		log.Printf("core/udp: pinned source to %s", host)
-		b.st.down("src-pin", "udp")
+		b.st.event("down", "src-pin", "ip:"+host) // source pin: session survives, no reconnect (see rotateSourceUDP)
 	}
 }
 
@@ -697,6 +706,10 @@ func (b *UDP) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 		}
 		b.rp = replayGuard{}
 		b.session.Store(&sealerBox{s: s})
+		// Clear the ephemeral so a replayed resp captured on-path hits the ci==nil guard above
+		// instead of re-parsing and wiping the fresh anti-replay window. A legitimate
+		// re-handshake regenerates a fresh ci in sendInit (ci==nil path).
+		b.ci.Store(nil)
 		b.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale"
 		b.st.reconnected("udp")               // recovery after a self-heal (nil-safe; silent on first connect)
 		return
@@ -823,6 +836,14 @@ func (b *UDP) clientLoop() {
 				if sh != "" {
 					b.st.event("heal", "src-retest", sh) // burned source IP recovered
 				}
+			}
+			// BUG #35: clear mode has no handshake to fire st.reconnected(), so a self-heal down() (the
+			// clear-mode failover above, or a peer rotate/pin) would arm wasDown with no matching "up".
+			// Pair it on the data-plane recovery: once the CURRENT endpoint answers again (peerAnswered,
+			// set by deliver and cleared on every rotation), report the reconnect. reconnected() is a
+			// no-op unless a down is pending, so calling it on each answering loop never invents an "up".
+			if !b.cryptoOn && rc.active() && b.peerAnswered.Load() {
+				b.st.reconnected("udp")
 			}
 			failN = 0
 			b.send(typePing, nil, b.peer.Load())

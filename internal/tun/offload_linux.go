@@ -51,9 +51,17 @@ func splitGSO(pkt []byte, gsoSize, gsoType int) [][]byte {
 // rebuilding each segment's headers and checksums. It supports IPv4 and IPv6.
 func segment(pkt []byte, gsoSize int, isTCP bool) [][]byte {
 	v6 := pkt[0]>>4 == 6
-	var ipHdrLen int
+	var ipHdrLen int // offset at which the L4 header begins
 	if v6 {
-		ipHdrLen = 40
+		// Walk the IPv6 extension-header chain for the TRUE L4 offset; a fixed
+		// 40 corrupts (or mis-segments) packets that carry extension headers.
+		// On an unrecognized/truncated chain, or an L4 protocol that disagrees
+		// with the GSO type, pass the super-packet through unchanged.
+		l4Off, proto, ok := ipv6L4Offset(pkt)
+		if !ok || (isTCP && proto != 6) || (!isTCP && proto != 17) {
+			return [][]byte{pkt}
+		}
+		ipHdrLen = l4Off
 	} else {
 		ipHdrLen = int(pkt[0]&0x0f) * 4
 	}
@@ -103,7 +111,9 @@ func segment(pkt []byte, gsoSize int, isTCP bool) [][]byte {
 
 		// ---- L3 ----
 		if v6 {
-			binary.BigEndian.PutUint16(seg[4:6], uint16(l4Hdr+len(chunk))) // payload length
+			// Payload length spans everything after the fixed 40-byte IPv6
+			// header: extension headers (ipHdrLen-40) + L4 header + data.
+			binary.BigEndian.PutUint16(seg[4:6], uint16((ipHdrLen-40)+l4Hdr+len(chunk))) // payload length
 		} else {
 			binary.BigEndian.PutUint16(seg[2:4], uint16(len(seg))) // total length
 			binary.BigEndian.PutUint16(seg[4:6], baseID+uint16(i)) // id (kernel increments)
@@ -139,10 +149,15 @@ func finalizeCsum(pkt []byte) {
 	var ipHdrLen int
 	var proto byte
 	if v6 {
-		if len(pkt) < 40 {
+		// Walk the IPv6 extension-header chain for the TRUE L4 offset and final
+		// protocol; assuming a fixed 40 writes the checksum at the wrong offset
+		// (corrupting the packet) whenever extension headers are present. On an
+		// unrecognized/truncated chain, leave the packet unmodified.
+		var ok bool
+		ipHdrLen, proto, ok = ipv6L4Offset(pkt)
+		if !ok {
 			return
 		}
-		ipHdrLen, proto = 40, pkt[6]
 	} else {
 		if len(pkt) < 20 {
 			return
@@ -162,6 +177,46 @@ func finalizeCsum(pkt []byte) {
 	case 17:
 		pkt[ipHdrLen+6], pkt[ipHdrLen+7] = 0, 0
 		binary.BigEndian.PutUint16(pkt[ipHdrLen+6:ipHdrLen+8], l4Checksum(pkt, ipHdrLen, v6, 17))
+	}
+}
+
+// ipv6L4Offset walks the IPv6 extension-header chain, starting from the fixed
+// header's Next Header field (byte 6), to locate the true L4 header. It returns
+// the byte offset of the L4 header and the final protocol number. ok is false
+// when the packet is truncated or the chain contains an unrecognized extension
+// header; the caller must then leave the packet unmodified rather than write an
+// L4 checksum at a guessed offset. Only the standard extension headers are
+// recognized: hop-by-hop (0), routing (43), fragment (44, fixed 8 bytes) and
+// destination-options (60); anything else is treated as the upper-layer proto.
+func ipv6L4Offset(pkt []byte) (l4Off int, proto byte, ok bool) {
+	if len(pkt) < 40 {
+		return 0, 0, false
+	}
+	next := pkt[6]
+	off := 40
+	for {
+		switch next {
+		case 0, 43, 60: // hop-by-hop, routing, destination-options: [next][len(8-octet units)]...
+			if off+2 > len(pkt) {
+				return 0, 0, false
+			}
+			next = pkt[off]
+			off += (int(pkt[off+1]) + 1) * 8 // len excludes the first 8 octets
+		case 44: // fragment header: fixed 8 bytes
+			if off+8 > len(pkt) {
+				return 0, 0, false
+			}
+			next = pkt[off]
+			off += 8
+		default:
+			// Upper-layer protocol (e.g. TCP 6, UDP 17), 59 (no next header),
+			// or an unrecognized ext header. The caller only writes a checksum
+			// for 6/17, so unsupported chains become a safe pass-through.
+			if off > len(pkt) {
+				return 0, 0, false
+			}
+			return off, next, true
+		}
 	}
 }
 

@@ -274,6 +274,16 @@ func (d *fecDecoder) input(pkt []byte) {
 		// if the decoder's total buffered bytes would exceed the budget: an unauthenticated
 		// peer must not be able to pin ~n*shardLen*fecKeepBlocks of RAM (amplification DoS).
 		padBytes := (n - count) * shardLen
+		// Byte-pressure eviction: a few large-geometry partial blocks can drive d.bytes to
+		// fecMaxBytes with fewer than fecKeepBlocks blocks, so the count-based evictLocked never
+		// fires and every new block is refused below — permanently disabling FEC recovery for an
+		// unauthenticated peer (pre-auth DoS). Drop oldest-by-arrival blocks until there is room
+		// (or nothing left to evict), THEN refuse only if still over budget.
+		for d.bytes+padBytes+shardLen > fecMaxBytes && len(d.blocks) > 0 {
+			if !d.evictOldestLocked() {
+				break
+			}
+		}
 		if d.bytes+padBytes+shardLen > fecMaxBytes {
 			return
 		}
@@ -337,17 +347,32 @@ func (d *fecDecoder) input(pkt []byte) {
 // (b) there is no uint32 block-id wraparound hazard. Caller holds d.mu.
 func (d *fecDecoder) evictLocked() {
 	for len(d.blocks) > fecKeepBlocks {
-		var oldID uint32
-		var oldB *fecBlock
-		for id, b := range d.blocks {
-			if oldB == nil || b.arrival < oldB.arrival {
-				oldID, oldB = id, b
-			}
-		}
-		if oldB == nil {
+		if !d.evictOldestLocked() {
 			return
 		}
-		d.bytes -= oldB.bytes
-		delete(d.blocks, oldID)
 	}
+}
+
+// evictOldestLocked drops the single OLDEST-INSERTED block (keyed on the decoder-local arrival
+// counter, not the wire block id) and returns true if one was removed. Shared by the count-based
+// evictLocked and the byte-pressure eviction on the new-block path, so both use the same
+// oldest-by-arrival selection. d.bytes is decremented by the dropped block and clamped so it can
+// never go negative. Caller holds d.mu.
+func (d *fecDecoder) evictOldestLocked() bool {
+	var oldID uint32
+	var oldB *fecBlock
+	for id, b := range d.blocks {
+		if oldB == nil || b.arrival < oldB.arrival {
+			oldID, oldB = id, b
+		}
+	}
+	if oldB == nil {
+		return false
+	}
+	d.bytes -= oldB.bytes
+	if d.bytes < 0 {
+		d.bytes = 0
+	}
+	delete(d.blocks, oldID)
+	return true
 }
