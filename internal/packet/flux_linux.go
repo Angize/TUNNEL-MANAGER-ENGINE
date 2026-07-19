@@ -275,6 +275,7 @@ func (f *Flux) Run() error {
 	go f.rotateWatcher()
 	if f.isClient {
 		go f.clientLoop()
+		go heartbeat(f.st, &f.lastRx, f.closeCh) // publish lastRx to the status file so an idle tunnel reads live, not half-open
 	}
 	return <-errc
 }
