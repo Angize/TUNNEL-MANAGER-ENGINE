@@ -373,6 +373,7 @@ func (r *Raw) Run() error {
 	}
 	if r.isClient {
 		go r.clientLoop()
+		go heartbeat(r.st, &r.lastRx, r.closeCh) // publish lastRx to the status file so an idle tunnel reads live, not half-open
 	}
 	return <-errc
 }

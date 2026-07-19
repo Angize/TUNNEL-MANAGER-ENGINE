@@ -492,6 +492,7 @@ func (b *UDP) Run() error {
 	if b.isClient {
 		go func() { errc <- b.netToTun() }()
 		go b.clientLoop()
+		go heartbeat(b.st, &b.lastRx, b.closeCh) // publish lastRx to the status file so an idle tunnel reads live, not half-open
 	} else {
 		for _, c := range b.srvConns {
 			c := c

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,7 +23,44 @@ type coreStatus struct {
 	active  string // short human descriptor of the live carrier, e.g. "udp · 1.2.3.4:443"
 	events  []coreEvent
 	evSeq   int64
-	wasDown bool // a disconnect is pending a matching recovery -> the next connect is a reconnect
+	wasDown bool  // a disconnect is pending a matching recovery -> the next connect is a reconnect
+	hb      int64 // unix-seconds of the last authenticated inbound frame (lastRx); a periodic liveness heartbeat
+}
+
+// hbInterval is how often a client carrier republishes its lastRx heartbeat into the status file, so a
+// reader can tell a live-but-idle tunnel (hb advances every keepalive) from a dead one (hb frozen) with
+// no ICMP. Kept small relative to keepalive so the freeze becomes visible promptly.
+const hbInterval = 5 * time.Second
+
+// heartbeat republishes lastRx (unix-seconds) into the status file every hbInterval until done closes.
+// A nil status writer (no status_path wired) is a no-op, so it is always safe to start for any client.
+func heartbeat(s *coreStatus, lastRx *atomic.Int64, done <-chan struct{}) {
+	if s == nil {
+		return
+	}
+	s.beat(lastRx.Load() / int64(time.Second)) // publish once immediately so a reader sees a heartbeat at startup
+	t := time.NewTicker(hbInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			s.beat(lastRx.Load() / int64(time.Second))
+		}
+	}
+}
+
+// beat records the latest lastRx (unix-seconds) and flushes the file. lastRx only moves forward (it is
+// re-baselined to now on a re-handshake / rotation), so hb is monotonic in practice.
+func (s *coreStatus) beat(sec int64) {
+	if s == nil || s.path == "" {
+		return
+	}
+	s.mu.Lock()
+	s.hb = sec
+	s.mu.Unlock()
+	s.write()
 }
 
 // newCoreStatus creates the writer and flushes an initial (empty-ring) file so a reader sees a live
@@ -102,12 +140,14 @@ func (s *coreStatus) write() {
 	s.mu.Lock()
 	evs := append([]coreEvent(nil), s.events...) // copy so the marshal runs outside s.mu
 	active := s.active
+	hb := s.hb
 	s.mu.Unlock()
 	payload := struct {
 		Active string      `json:"active"`
 		Events []coreEvent `json:"events"`
+		HB     int64       `json:"hb"`
 		TS     int64       `json:"ts"`
-	}{Active: active, Events: evs, TS: time.Now().Unix()}
+	}{Active: active, Events: evs, HB: hb, TS: time.Now().Unix()}
 	buf, err := json.Marshal(payload)
 	if err != nil {
 		return
