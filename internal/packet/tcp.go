@@ -308,7 +308,7 @@ type TCP struct {
 	pool   *wsPool       // client: rotating edge pool (nil = single fixed edge above)
 	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
 	st     *coreStatus   // client + single-edge ws/xhttp: self-heal event ring -> status file (nil = off / pool / server)
-	lastRx atomic.Int64  // client: unix-nano of the last authenticated inbound frame — feeds the status-file heartbeat (v2.48.3)
+	lastRx atomic.Int64  // client: unix-nano of the last authenticated INBOUND frame — feeds the status-file heartbeat (v2.48.3). Seeded once in Run() and advanced ONLY by readLoop; never stamp it for a frame we sent, or a carrier that reconnects forever behind a CDN reads "alive" while nothing flows (v2.48.5)
 
 	// pp is the DESTINATION rotation pool for the direct TCP carriers (plain tcp / tcp+cover): the
 	// client cycles the peer IPs and burns a blocked one so a single filtered server IP doesn't kill
@@ -682,6 +682,11 @@ func (b *TCP) Run() error {
 	if b.isClient {
 		go b.keepaliveLoop()
 		go b.diagLoop() // low-rate goroutine-count heartbeat so a slow session leak is visible in the log
+		// Seed the heartbeat ONCE, here, so a freshly started tunnel is not instantly reported dead. It is
+		// deliberately NOT re-seeded per connection (see handshakeAndPrime): only a genuine inbound frame
+		// may advance it afterwards, so a carrier that keeps re-establishing without ever receiving
+		// anything ages out and reports dead, instead of looking alive forever.
+		b.lastRx.Store(time.Now().UnixNano())
 		if b.st != nil {
 			b.st.setDW(int64(b.idle.Seconds()))      // b.idle IS the resolved stream dead-window (idle backstop / dead_after)
 			go heartbeat(b.st, &b.lastRx, b.closeCh) // single-edge / direct-tcp: publish lastRx so an idle tunnel reads live, not half-open
@@ -1748,8 +1753,12 @@ func (b *TCP) handshakeAndPrime(conn net.Conn) (*connFramer, error) {
 			return nil, err
 		}
 	}
-	_ = cf.writeFrame(typePing, nil)      // prime + authenticate us to the server
-	b.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale" before the first inbound frame
+	_ = cf.writeFrame(typePing, nil) // prime + authenticate us to the server
+	// Deliberately do NOT stamp b.lastRx here: this ping is something WE sent, and lastRx means "last
+	// authenticated INBOUND frame". Crediting it refreshed the status-file heartbeat on every reconnect,
+	// so a pooled/xhttp client whose dial+TLS always succeeds (a CDN edge always accepts) but which never
+	// receives a frame back reported "connected" forever while the tunnel carried nothing — green dot,
+	// 100% in-tunnel ping loss. Only readLoop's fresh authenticated inbound frame may stamp it.
 	return cf, nil
 }
 
