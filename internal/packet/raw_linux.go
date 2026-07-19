@@ -14,6 +14,7 @@ package packet
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -42,7 +43,7 @@ type Raw struct {
 	cipher        string
 	profile       string
 	isClient      bool
-	icmpID        uint16 // per-process ICMP echo identifier (receiver ignores it)
+	icmpID        uint16 // ICMP echo identifier; PSK-derived + shared by both ends for the icmp profile so the server's replies match the client's requests through stateful ICMP filters (random for other profiles; the core itself ignores it on receive)
 	spi           uint32 // per-session ESP Security Parameters Index (esp profile; constant like a real SA)
 
 	// IP spoofing. spoofFd is a SOCK_RAW+IP_HDRINCL socket used to build the whole IPv4
@@ -219,10 +220,20 @@ func newRaw(conn *net.IPConn, dev *tun.Device, ka time.Duration, obfs, cryptoOn 
 	if spi < 256 {
 		spi += 256 // SPIs 0..255 are IANA-reserved; a real SA uses >= 256
 	}
+	// ICMP profile: derive the echo identifier from the PSK so BOTH ends use the SAME id. A stateful
+	// ICMP filter/conntrack (e.g. Iran's) only lets an echo REPLY through when its id matches an echo
+	// REQUEST it saw leave; with per-process random ids the server's replies look unsolicited and get
+	// dropped, so the tunnel never establishes. A shared PSK-derived id makes the server's replies
+	// match the client's requests and pass stateful ICMP tracking. Other profiles don't use icmpID.
+	icmpID := binary.BigEndian.Uint16(idb[0:2])
+	if profile == "icmp" {
+		h := sha256.Sum256([]byte("tnl-core|v2|icmp-id|" + psk))
+		icmpID = binary.BigEndian.Uint16(h[0:2])
+	}
 	return &Raw{
 		conn: conn, dev: dev, keepalive: ka, obfs: obfs, cryptoOn: cryptoOn,
 		psk: psk, cipher: cipher, profile: profile, isClient: isClient, spoofFd: -1, pktFd: -1, fakeFd: -1,
-		icmpID: binary.BigEndian.Uint16(idb[0:2]), closeCh: make(chan struct{}),
+		icmpID: icmpID, closeCh: make(chan struct{}),
 		tcpISN: binary.BigEndian.Uint32(idb[2:6]), tcpAck: binary.BigEndian.Uint32(idb[6:10]), spi: spi,
 	}
 }
