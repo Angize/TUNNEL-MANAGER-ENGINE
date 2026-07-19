@@ -308,6 +308,7 @@ type TCP struct {
 	pool   *wsPool       // client: rotating edge pool (nil = single fixed edge above)
 	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
 	st     *coreStatus   // client + single-edge ws/xhttp: self-heal event ring -> status file (nil = off / pool / server)
+	lastRx atomic.Int64  // client: unix-nano of the last authenticated inbound frame — feeds the status-file heartbeat (v2.48.3)
 
 	// pp is the DESTINATION rotation pool for the direct TCP carriers (plain tcp / tcp+cover): the
 	// client cycles the peer IPs and burns a blocked one so a single filtered server IP doesn't kill
@@ -681,6 +682,11 @@ func (b *TCP) Run() error {
 	if b.isClient {
 		go b.keepaliveLoop()
 		go b.diagLoop() // low-rate goroutine-count heartbeat so a slow session leak is visible in the log
+		if b.st != nil {
+			go heartbeat(b.st, &b.lastRx, b.closeCh) // single-edge / direct-tcp: publish lastRx so an idle tunnel reads live, not half-open
+		} else if b.pool != nil {
+			go heartbeatPool(b.pool, &b.lastRx, b.closeCh) // ws/xhttp edge pool uses its own status writer
+		}
 		if b.pool != nil {
 			go b.retestLoop() // background health retests with exponential backoff
 		} else if b.pp != nil || b.sp != nil {
@@ -1740,7 +1746,8 @@ func (b *TCP) handshakeAndPrime(conn net.Conn) (*connFramer, error) {
 			return nil, err
 		}
 	}
-	_ = cf.writeFrame(typePing, nil) // prime + authenticate us to the server
+	_ = cf.writeFrame(typePing, nil)      // prime + authenticate us to the server
+	b.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale" before the first inbound frame
 	return cf, nil
 }
 
@@ -2278,7 +2285,8 @@ func (b *TCP) readLoop(cf *connFramer) error {
 			// FRESH (non-replayed) frame proves the live peer is still answering.
 			continue
 		}
-		cf.unanswered.Store(0) // a fresh inbound frame proves the peer is alive -> reset ping-loss
+		cf.unanswered.Store(0)                // a fresh inbound frame proves the peer is alive -> reset ping-loss
+		b.lastRx.Store(time.Now().UnixNano()) // ...and stamp liveness for the status-file heartbeat (client hb)
 		b.handleFrame(cf, typ, payload)
 	}
 }

@@ -51,6 +51,26 @@ func heartbeat(s *coreStatus, lastRx *atomic.Int64, done <-chan struct{}) {
 	}
 }
 
+// heartbeatPool is heartbeat for a ws/xhttp edge pool, whose status file is written by wsPool.writeStatus
+// (not coreStatus). Publishes the carrier's lastRx into the pool status every hbInterval so an idle pooled
+// tunnel reads live, not half-open. A nil pool is a no-op.
+func heartbeatPool(p *wsPool, lastRx *atomic.Int64, done <-chan struct{}) {
+	if p == nil {
+		return
+	}
+	p.beat(lastRx.Load() / int64(time.Second))
+	t := time.NewTicker(hbInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-t.C:
+			p.beat(lastRx.Load() / int64(time.Second))
+		}
+	}
+}
+
 // beat records the latest lastRx (unix-seconds) and flushes the file. lastRx only moves forward (it is
 // re-baselined to now on a re-handshake / rotation), so hb is monotonic in practice.
 func (s *coreStatus) beat(sec int64) {

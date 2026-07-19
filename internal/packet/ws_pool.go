@@ -91,6 +91,7 @@ type wsPool struct {
 	rotDegraded bool           // true once the healthy-IP count fell below 2 (rotation paused); drives the degraded/restored event
 	dataFail    map[string]int // per-IP count of consecutive short-lived (data-plane-fault) sessions
 	lastGood    int64          // unix time of the last SUSTAINED session on any edge (outage guard)
+	hb          int64          // unix-seconds of the carrier's lastRx — periodic liveness heartbeat (v2.48.3)
 	events      []coreEvent    // rolling ring of core-observed events (down/burn) for the panel log
 	evSeq       int64          // monotonic sequence so the panel can consume each event exactly once
 	wasDown     bool           // a genuine carrier down is pending its matching "up" (down/reconnect pairing)
@@ -869,7 +870,8 @@ func (p *wsPool) writeStatus() {
 	}
 	// Hold writeMu across BOTH the snapshot and the file write, so two concurrent writers can't snapshot
 	// in one order and win the write in the reverse order — an older snapshot must never overwrite a
-	// newer file (writes are change-driven; there is no periodic re-write to self-correct a stale one).
+	// newer file (as of v2.48.3 beat() also re-publishes every hbInterval, so a stale file additionally
+	// self-corrects within one interval; the ordering below still matters for two near-simultaneous writes).
 	// p.mu is always released before any caller reaches writeStatus, so writeMu→p.mu never inverts.
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
@@ -903,8 +905,9 @@ func (p *wsPool) writeStatus() {
 		Events     []coreEvent    `json:"events"`
 		PinIP      string         `json:"pin_ip"`
 		PinSNI     string         `json:"pin_sni"`
+		HB         int64          `json:"hb"`
 		TS         int64          `json:"ts"`
-	}{Active: p.active, BurnedIPs: burnedIPs, BurnedSNIs: burnedSNIs, Health: health, Events: evs, PinIP: p.pinIP, PinSNI: p.pinSNI, TS: time.Now().Unix()}
+	}{Active: p.active, BurnedIPs: burnedIPs, BurnedSNIs: burnedSNIs, Health: health, Events: evs, PinIP: p.pinIP, PinSNI: p.pinSNI, HB: p.hb, TS: time.Now().Unix()}
 	p.mu.Unlock()
 	if data, err := json.Marshal(st); err == nil {
 		// writeMu already held across the snapshot above (serializes writers AND orders snapshot->write).
@@ -913,4 +916,17 @@ func (p *wsPool) writeStatus() {
 			_ = os.Rename(tmp, p.statusPath) // atomic replace so a reader never sees a half file
 		}
 	}
+}
+
+// beat records the carrier's lastRx (unix-seconds) into the pool status and flushes it, so a reader can
+// tell a live-but-idle pooled tunnel (hb advancing each keepalive) from a dead one (hb frozen) without
+// ICMP. Nil-safe and no-op without a status path.
+func (p *wsPool) beat(sec int64) {
+	if p == nil || p.statusPath == "" {
+		return
+	}
+	p.mu.Lock()
+	p.hb = sec
+	p.mu.Unlock()
+	p.writeStatus()
 }
