@@ -3,6 +3,7 @@ package dnstun
 import (
 	"bytes"
 	"crypto/rand"
+	"io"
 	mrand "math/rand/v2"
 	"net"
 	"sync"
@@ -170,22 +171,27 @@ func TestSessionWrongPSKFails(t *testing.T) {
 	}
 }
 
-// TestServeSessionRecoversFromVanishedClient proves the server's single session slot is never
-// parked forever. A client arms the server with a valid init but then vanishes without completing
-// the KCP handshake (crash, or its own resp was lost so it timed out); the server sits in
-// AcceptKCP. A NEW client's init (different ephemeral) must make ServeSession return so the carrier
-// reconnects and accepts the new client — the old behavior ignored the new init and deadlocked.
+// TestServeSessionRecoversFromVanishedClient proves the server's single session slot recovers
+// PROMPTLY from a client that arms it (a valid init) then vanishes before completing the KCP
+// handshake (crash, or its own resp was lost so it timed out). A NEW client that fully dials and
+// writes must be ADOPTED IN PLACE and served — the server reads its data — with no reconnect and no
+// re-init, in about one round trip rather than a KCP dead-link timeout.
 func TestServeSessionRecoversFromVanishedClient(t *testing.T) {
 	cliT, srvT := newPipePair(0)
 	cfg := SessionConfig{PSK: "recover-me", Cipher: "chacha20"}
 
+	srvCh := make(chan net.Conn, 1)
 	srvErr := make(chan error, 1)
 	go func() {
-		_, err := ServeSession(srvT, cfg)
-		srvErr <- err
+		c, err := ServeSession(srvT, cfg)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		srvCh <- c
 	}()
 
-	// Client 1 arms the server with a valid init, then goes silent (never sends a KCP datagram).
+	// Client 1 arms the server with a valid init, then goes silent (never completes KCP).
 	ci1, err := crypto.GenerateEphemeral()
 	if err != nil {
 		t.Fatal(err)
@@ -196,23 +202,103 @@ func TestServeSessionRecoversFromVanishedClient(t *testing.T) {
 	select {
 	case err := <-srvErr:
 		t.Fatalf("ServeSession returned before a new client dialed: %v", err)
+	case <-srvCh:
+		t.Fatal("ServeSession returned before a new client dialed")
 	default:
 	}
 
-	// Client 2 dials with a fresh ephemeral: this must unblock the parked server.
-	ci2, err := crypto.GenerateEphemeral()
+	// Client 2 fully dials with a fresh ephemeral over the SAME transport and writes — a real new
+	// client completing the KCP handshake. The server must adopt it in place and serve it.
+	cli2, err := DialSession(cliT, cfg)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("client 2 DialSession: %v", err)
 	}
-	_ = cliT.Send(append([]byte{kindHandshake}, crypto.InitMsg(cfg.PSK, ci2)...))
+	defer cli2.Close()
+	payload := []byte("hello from the second client")
+	go func() { _, _ = cli2.Write(payload) }()
 
 	select {
 	case err := <-srvErr:
-		if err == nil {
-			t.Fatal("ServeSession returned nil; expected an error so the carrier reconnects")
+		t.Fatalf("ServeSession errored instead of adopting the new client: %v", err)
+	case srv := <-srvCh:
+		defer srv.Close()
+		got := make([]byte, len(payload))
+		_ = srv.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadFull(srv, got); err != nil {
+			t.Fatalf("server read from the adopted client: %v", err)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("ServeSession stayed parked in AcceptKCP after a new client dialed")
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("adopted-client data mismatch: got %q want %q", got, payload)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ServeSession stayed parked after a new client fully dialed (no adopt)")
+	}
+}
+
+// TestServeSessionIgnoresReplayedInit locks in the replayed-init DoS protection: once a client has
+// ESTABLISHED and data is flowing, a bare different-ephemeral init with NO follow-up data — exactly
+// what an on-path attacker replaying a captured init can produce — must NOT tear the live session
+// down. Only a data frame that actually opens under the staged keys (which a replay cannot forge)
+// may promote.
+func TestServeSessionIgnoresReplayedInit(t *testing.T) {
+	cliT, srvT := newPipePair(0)
+	cfg := SessionConfig{PSK: "no-teardown", Cipher: "chacha20"}
+
+	srvCh := make(chan net.Conn, 1)
+	go func() {
+		c, err := ServeSession(srvT, cfg)
+		if err != nil {
+			t.Errorf("ServeSession: %v", err)
+			srvCh <- nil
+			return
+		}
+		srvCh <- c
+	}()
+
+	cli, err := DialSession(cliT, cfg)
+	if err != nil {
+		t.Fatalf("DialSession: %v", err)
+	}
+	defer cli.Close()
+	// Keep a steady trickle of data so the session establishes and stays demonstrably live.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := cli.Write([]byte("ping")); err != nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	srv := <-srvCh
+	if srv == nil {
+		t.Fatal("server session failed to establish")
+	}
+	defer srv.Close()
+	buf := make([]byte, 64)
+	_ = srv.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := srv.Read(buf); err != nil {
+		t.Fatalf("server first read (establish): %v", err)
+	}
+
+	// Inject a bare, DIFFERENT-ephemeral init (a replay) with no follow-up data frame.
+	attacker, err := crypto.GenerateEphemeral()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cliT.Send(append([]byte{kindHandshake}, crypto.InitMsg(cfg.PSK, attacker)...))
+
+	// The live session must keep working: the server keeps reading the real client's data.
+	_ = srv.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := srv.Read(buf); err != nil {
+		t.Fatalf("live session was disrupted by a bare replayed init: %v", err)
 	}
 }
 

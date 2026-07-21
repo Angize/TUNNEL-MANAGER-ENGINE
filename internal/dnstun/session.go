@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Angize/TUNNEL-MANAGER-CORE/internal/crypto"
@@ -62,14 +63,20 @@ var handshakeTimeout = 15 * time.Second
 // transport. The carrier frames tunnel packets over it.
 type sessionConn struct {
 	*kcp.UDPSession
-	qpc    *QueuePacketConn
-	t      WireTransport
-	sealer *crypto.Sealer
+	qpc *QueuePacketConn
+	t   WireTransport
+	// sealer authenticates the byte stream. It is an atomic.Pointer because the server can SWAP it:
+	// when the armed client vanishes before completing KCP and a new client proves itself (a data
+	// datagram opens under the staged session), recvPump ADOPTS that session in place so the same
+	// AcceptKCP returns the new client — no teardown, no reconnect. sendPump only Loads it. It is
+	// Stored once at construction (before the pumps start) and swapped only by recvPump.
+	sealer atomic.Pointer[crypto.Sealer]
 	// pend is a session staged by a recent different-ephemeral init (server only; nil otherwise).
-	// It is promoted — tearing the live session down so the carrier reconnects to the new client —
-	// only once a data datagram actually OPENS under it (see recvPump), so a replayed init an
-	// attacker captured on-path can never trigger a teardown. Written by onHandshake and read by
-	// recvPump, both on the single recvPump goroutine, so it needs no lock.
+	// A data datagram that actually OPENS under it proves a real, live new client — a replayed init
+	// an attacker captured on-path never can — which then either ADOPTS it in place (while the armed
+	// session has never carried data, i.e. its client vanished) or, once the live session is
+	// established, TEARS DOWN so the carrier reconnects. Written by onHandshake and read by recvPump,
+	// both on the single recvPump goroutine, so it needs no lock.
 	pend      *crypto.Sealer
 	done      chan struct{}
 	closeOnce sync.Once
@@ -115,7 +122,7 @@ func (sc *sessionConn) sendPump() {
 		case <-sc.done:
 			return
 		case dg := <-out:
-			sealed, err := sc.sealer.Seal(dg, nil)
+			sealed, err := sc.sealer.Load().Seal(dg, nil)
 			if err != nil {
 				continue
 			}
@@ -128,6 +135,11 @@ func (sc *sessionConn) sendPump() {
 // late/duplicate handshake datagram (the server re-answers a retransmitted init; the client
 // ignores it). A datagram that fails to open is dropped in silence.
 func (sc *sessionConn) recvPump(inCh <-chan []byte, onHandshake func([]byte)) {
+	// liveProven flips true the first time a frame opens under the LIVE sealer — i.e. the live
+	// session is established / establishing. It gates promotion of a staged session: adopt-in-place
+	// while the armed session is still unproven (its client may have vanished), tear-down once it is
+	// established. recvPump-goroutine-local (onHandshake runs inline here too), so it needs no lock.
+	liveProven := false
 	for {
 		select {
 		case <-sc.done:
@@ -145,21 +157,33 @@ func (sc *sessionConn) recvPump(inCh <-chan []byte, onHandshake func([]byte)) {
 			}
 			switch d[0] {
 			case kindData:
-				_, _, pt, err := sc.sealer.Open(d[1:], nil)
-				if err != nil {
-					// The live session couldn't open it. It may open under a session STAGED by a
-					// recent different-ephemeral init (server only). A frame that actually opens
-					// under the staged keys proves a real, live new client — a replayed init an
-					// attacker can never produce such a frame for never reaches here — so promote
-					// by tearing the live session down, letting the carrier reconnect to accept it.
-					if sc.pend != nil {
-						if _, _, _, perr := sc.pend.Open(d[1:], nil); perr == nil {
+				if _, _, pt, err := sc.sealer.Load().Open(d[1:], nil); err == nil {
+					liveProven = true // a real frame opened under the live session -> it is (being) established
+					sc.qpc.QueueIncoming(pt, peerKey)
+					continue
+				}
+				// The live session couldn't open it. It may open under a session STAGED by a recent
+				// different-ephemeral init (server only). A frame that actually opens under the staged
+				// keys proves a real, live new client — a replayed init an attacker can never produce
+				// such a frame for never reaches here.
+				if sc.pend != nil {
+					if _, _, pt, perr := sc.pend.Open(d[1:], nil); perr == nil {
+						if !liveProven {
+							// The armed session never carried data — its client vanished before it
+							// could complete KCP. Adopt the proven new client IN PLACE: swap the sealer
+							// and feed this first frame (its KCP SYN) so the SAME AcceptKCP returns the
+							// new client — no teardown, no reconnect, no re-init. Recovery in one RTT.
+							sc.sealer.Store(sc.pend)
+							sc.pend = nil
+							liveProven = true
+							sc.qpc.QueueIncoming(pt, peerKey)
+						} else {
+							// The live session is already established; its KCP conv can't be retrofitted
+							// to a new client. Tear down so the carrier reconnects and re-accepts.
 							_ = sc.qpc.Close()
 						}
 					}
-					continue
 				}
-				sc.qpc.QueueIncoming(pt, peerKey)
 			case kindHandshake:
 				if onHandshake != nil {
 					onHandshake(d[1:])
@@ -233,7 +257,8 @@ handshake:
 		return nil, err
 	}
 	tuneSession(conn, cfg.MTU)
-	sc := &sessionConn{UDPSession: conn, qpc: qpc, t: t, sealer: sealer, done: done}
+	sc := &sessionConn{UDPSession: conn, qpc: qpc, t: t, done: done}
+	sc.sealer.Store(sealer) // before the pumps start: sendPump's first Seal must not Load a nil sealer
 	go sc.sendPump()
 	go sc.recvPump(inCh, nil) // client ignores any late handshake datagrams
 	return sc, nil
@@ -287,7 +312,8 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 	}
 
 	qpc := NewQueuePacketConn(peerKey)
-	sc := &sessionConn{qpc: qpc, t: t, sealer: sealer, done: done}
+	sc := &sessionConn{qpc: qpc, t: t, done: done}
+	sc.sealer.Store(sealer) // before the pumps start (below): sendPump's first Seal must not Load nil
 	// Re-answer a retransmit of the SAME init (a lost response self-heals). A DIFFERENT ephemeral
 	// might mean the previous client is gone and a new one is dialing (restart) — but it might also
 	// be a REPLAYED old init an attacker captured on-path (it still verifies the PSK MAC), so tearing
