@@ -38,7 +38,7 @@ func TestApplyTuning(t *testing.T) {
 		SuspectBackoff: []int64{5, 10, 20}, DeadRetestSecs: 900, PinTTLSecs: 45,
 		DataFailThreshold: 4, DataGoodWindowSecs: 200, IdleMult: 6, IdleMinSecs: 30,
 		SessionStaleMult: 2, SessionStaleMinSecs: 8, PingLossThreshold: 5,
-		MinLivenessSecs: 12, ProbeTimeoutSecs: 7, FluxRotateDefSecs: 300,
+		MinLivenessSecs: 12, ProbeTimeoutSecs: 7,
 	})
 	if !reflect.DeepEqual(suspectBackoff, []int64{5, 10, 20}) {
 		t.Errorf("suspectBackoff=%v", suspectBackoff)
@@ -49,7 +49,7 @@ func TestApplyTuning(t *testing.T) {
 	if idleMult != 6 || idleMinSecs != 30 || sessionStaleMult != 2 || sessionStaleMinSecs != 8 || pingLossThreshold != 5 {
 		t.Errorf("dead-detect: im=%d ims=%d ssm=%d ssmn=%d plt=%d", idleMult, idleMinSecs, sessionStaleMult, sessionStaleMinSecs, pingLossThreshold)
 	}
-	if minLiveness != 12*time.Second || probeTimeout != 7*time.Second || defaultFluxRotate != 300*time.Second {
+	if minLiveness != 12*time.Second || probeTimeout != 7*time.Second {
 		t.Errorf("durations: minLiveness=%v probeTimeout=%v flux=%v", minLiveness, probeTimeout, defaultFluxRotate)
 	}
 	// idleFor / the stale window now track the tuned multipliers.

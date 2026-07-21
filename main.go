@@ -62,7 +62,7 @@ func main() {
 			IdleMult: t.IdleMult, IdleMinSecs: t.IdleMinSecs,
 			SessionStaleMult: t.SessionStaleMult, SessionStaleMinSecs: t.SessionStaleMinSecs,
 			PingLossThreshold: t.PingLossThreshold, MinLivenessSecs: t.MinLivenessSecs,
-			ProbeTimeoutSecs: t.ProbeTimeoutSecs, FluxRotateDefSecs: t.FluxRotateDefSecs,
+			ProbeTimeoutSecs: t.ProbeTimeoutSecs,
 		})
 	}
 

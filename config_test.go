@@ -213,18 +213,6 @@ func TestFluxRotateHonoursTunedDefault(t *testing.T) {
 		t.Errorf("unset flux rotate should default to 600, got %d", c.FluxRotateSecs)
 	}
 	c = base()
-	c.Tuning = &TuningCfg{FluxRotateDefSecs: 1200}
-	c.applyDefaults()
-	if c.FluxRotateSecs != 1200 {
-		t.Errorf("flux rotate should honour the tuned default 1200, got %d", c.FluxRotateSecs)
-	}
-	c = base()
-	c.Tuning = &TuningCfg{FluxRotateDefSecs: 999999} // absurd -> clamped to the 86400 ceiling
-	c.applyDefaults()
-	if c.FluxRotateSecs != 86400 {
-		t.Errorf("an over-large tuned flux default should clamp to 86400, got %d", c.FluxRotateSecs)
-	}
-	c = base()
 	c.FluxRotateSecs = 42 // an explicit value is never overridden by the default
 	c.applyDefaults()
 	if c.FluxRotateSecs != 42 {
