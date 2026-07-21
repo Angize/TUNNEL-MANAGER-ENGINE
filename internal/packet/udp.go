@@ -92,6 +92,7 @@ type UDP struct {
 	hsCache initCache                        // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
 	ci      atomic.Pointer[crypto.Ephemeral] // client's current handshake ephemeral
 	lastRx  atomic.Int64                     // unix-nano of the last authenticated frame (client staleness)
+	hbRx    atomic.Int64                     // unix-nano of the last REAL inbound frame — feeds the status heartbeat; 0 until the peer answers (v2.48.7)
 	// peerAnswered gates the clear-mode heal: it is set when the CURRENT peer replies and cleared on
 	// every peer rotation, so success() only clears a burn on an endpoint that has actually replied
 	// SINCE we (re)pointed at it — never a false heal on a just-jumped-to (unproven) endpoint.
@@ -275,7 +276,7 @@ func (b *UDP) adoptPeerUDP() {
 	b.ci.Store(nil)
 	log.Printf("core/udp: pinned destination to %s", addr)
 	b.st.setActive("udp · " + ua.String()) // BUG #30: keep "active" tracking the pinned destination (see rotatePeerUDP)
-	b.st.down("peer-pin", "ip:"+addr)       // clears the session -> re-handshake -> reconnect pairs the down
+	b.st.down("peer-pin", "ip:"+addr)      // clears the session -> re-handshake -> reconnect pairs the down
 }
 
 // adoptSourceUDP rebinds the socket onto the pool's CURRENT source (an operator source pin). Safe from
@@ -499,7 +500,7 @@ func (b *UDP) Run() error {
 		go func() { errc <- b.netToTun() }()
 		go b.clientLoop()
 		b.st.setDW(int64(b.deadWin().Seconds())) // publish the resolved dead-window so the reader ages hb against it
-		go heartbeat(b.st, &b.lastRx, b.closeCh) // publish lastRx to the status file so an idle tunnel reads live, not half-open
+		go heartbeat(b.st, &b.hbRx, b.closeCh)   // publish lastRx to the status file so an idle tunnel reads live, not half-open
 	} else {
 		for _, c := range b.srvConns {
 			c := c
@@ -637,6 +638,7 @@ func (b *UDP) deliver(pkt []byte, addr *net.UDPAddr) {
 		return
 	}
 	b.lastRx.Store(time.Now().UnixNano()) // liveness: the peer is answering (clear mode has no session to prove it)
+	b.hbRx.Store(b.lastRx.Load())         // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
 	b.peerAnswered.Store(true)            // this endpoint has now replied since we pointed at it -> safe to heal its burn
 	if b.pp == nil {                      // a pooled client owns its peer (mirror the crypto path); a server always learns it
 		b.learnPeer(addr)
@@ -667,6 +669,7 @@ func (b *UDP) handleCrypto(pkt []byte, addr *net.UDPAddr) {
 		if typ, session, seq, payload, oerr := b.openWith(s, pkt); oerr == nil && b.rp.ok(session, seq) {
 			// authenticated, fresh frame -> now safe to (re)learn the peer address
 			b.lastRx.Store(time.Now().UnixNano()) // liveness: the session is answering
+			b.hbRx.Store(b.lastRx.Load())         // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
 			// The DESTINATION pool owns the client's peer: don't rebind it from a reply's source, so a
 			// client's own rotation isn't silently pulled off the endpoint its pool is driving. Servers
 			// (pp==nil) learn the client here — which lets them follow a client's SOURCE rotation and, on
@@ -688,6 +691,7 @@ func (b *UDP) handleCrypto(pkt []byte, addr *net.UDPAddr) {
 			b.rp = b.pendRp
 			b.pend = nil
 			b.lastRx.Store(time.Now().UnixNano())
+			b.hbRx.Store(b.lastRx.Load()) // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
 			b.learnPeer(addr)
 			b.dispatch(typ, payload, addr)
 			return
@@ -719,6 +723,7 @@ func (b *UDP) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 		// re-handshake regenerates a fresh ci in sendInit (ci==nil path).
 		b.ci.Store(nil)
 		b.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale"
+		b.hbRx.Store(b.lastRx.Load())         // server RESP arrived: genuine inbound -> heartbeat (green on a real connect)
 		b.st.reconnected("udp")               // recovery after a self-heal (nil-safe; silent on first connect)
 		return
 	}

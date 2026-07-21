@@ -84,6 +84,7 @@ type Raw struct {
 	tcpAck   uint32
 	tcpBytes atomic.Uint32 // cumulative tcp-profile payload bytes; drives the realistic seq advance
 	lastRx   atomic.Int64  // unix-nano of the last authenticated frame (client staleness)
+	hbRx     atomic.Int64  // unix-nano of the last REAL inbound frame — feeds the status heartbeat; 0 until the peer answers (v2.48.7)
 	// peerAnswered gates the clear-mode heal: set when the CURRENT endpoint replies, cleared on
 	// rotation, so a just-jumped-to (unproven) endpoint's burn is never falsely cleared. Mirrors UDP.
 	peerAnswered atomic.Bool
@@ -374,7 +375,7 @@ func (r *Raw) Run() error {
 	if r.isClient {
 		go r.clientLoop()
 		r.st.setDW(int64(r.deadWin().Seconds())) // publish the resolved dead-window so the reader ages hb against it
-		go heartbeat(r.st, &r.lastRx, r.closeCh) // publish lastRx to the status file so an idle tunnel reads live, not half-open
+		go heartbeat(r.st, &r.hbRx, r.closeCh)   // publish lastRx to the status file so an idle tunnel reads live, not half-open
 	}
 	return <-errc
 }
@@ -770,6 +771,7 @@ func (r *Raw) deliver(body []byte, addr *net.IPAddr) {
 		return
 	}
 	r.lastRx.Store(time.Now().UnixNano()) // liveness: the peer is answering (clear mode has no session to prove it)
+	r.hbRx.Store(r.lastRx.Load())         // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
 	r.peerAnswered.Store(true)            // this endpoint has replied since we pointed at it -> safe to heal its burn
 	r.learnPeer(addr)
 	r.dispatch(body[1], iff(body[1] == typeData, body[2:], nil), addr)
@@ -793,6 +795,7 @@ func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
 	if s := r.sealer(); s != nil {
 		if typ, session, seq, payload, oerr := r.openWith(s, body); oerr == nil && r.rp.ok(session, seq) {
 			r.lastRx.Store(time.Now().UnixNano()) // liveness: the session is answering
+			r.hbRx.Store(r.lastRx.Load())         // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
 			r.learnPeer(addr)
 			r.dispatch(typ, payload, addr)
 			return
@@ -807,6 +810,7 @@ func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
 			r.rp = r.pendRp
 			r.pend = nil
 			r.lastRx.Store(time.Now().UnixNano())
+			r.hbRx.Store(r.lastRx.Load()) // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
 			r.learnPeer(addr)
 			r.dispatch(typ, payload, addr)
 			return
@@ -852,6 +856,7 @@ func (r *Raw) tryHandshake(body []byte, addr *net.IPAddr) {
 		// re-handshake regenerates a fresh ci in sendInit (ci==nil path).
 		r.ci.Store(nil)
 		r.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale"
+		r.hbRx.Store(r.lastRx.Load())         // server RESP arrived: genuine inbound -> heartbeat (green on a real connect)
 		r.st.reconnected("raw")               // recovery after a self-heal (nil-safe; silent on first connect)
 		return
 	}

@@ -68,6 +68,7 @@ type Flux struct {
 	hsCache  initCache // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
 	ci       atomic.Pointer[crypto.Ephemeral]
 	lastRx   atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
+	hbRx     atomic.Int64 // unix-nano of the last REAL inbound frame — feeds the status heartbeat; 0 until the peer answers (v2.48.7)
 	// peerAnswered gates the clear-mode heal: set when the CURRENT endpoint replies, cleared on
 	// rotation, so a just-jumped-to (unproven) endpoint's burn is never falsely cleared. Mirrors UDP.
 	peerAnswered atomic.Bool
@@ -276,7 +277,7 @@ func (f *Flux) Run() error {
 	if f.isClient {
 		go f.clientLoop()
 		f.st.setDW(int64(f.deadWin().Seconds())) // publish the resolved dead-window so the reader ages hb against it
-		go heartbeat(f.st, &f.lastRx, f.closeCh) // publish lastRx to the status file so an idle tunnel reads live, not half-open
+		go heartbeat(f.st, &f.hbRx, f.closeCh)   // publish lastRx to the status file so an idle tunnel reads live, not half-open
 	}
 	return <-errc
 }
@@ -666,6 +667,7 @@ func (f *Flux) handleCrypto(body []byte, addr *net.IPAddr) {
 			return
 		}
 		f.lastRx.Store(time.Now().UnixNano()) // liveness: the peer is answering (clear mode has no session to prove it)
+		f.hbRx.Store(f.lastRx.Load())         // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
 		f.peerAnswered.Store(true)            // this endpoint has replied since we pointed at it -> safe to heal its burn
 		f.learnPeer(addr)
 		f.dispatch(body[1], iff(body[1] == typeData, body[2:], nil), addr)
@@ -674,6 +676,7 @@ func (f *Flux) handleCrypto(body []byte, addr *net.IPAddr) {
 	if s := f.sealer(); s != nil {
 		if typ, session, seq, payload, oerr := f.openWith(s, body); oerr == nil && f.rp.ok(session, seq) {
 			f.lastRx.Store(time.Now().UnixNano())
+			f.hbRx.Store(f.lastRx.Load()) // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
 			f.learnPeer(addr)
 			f.dispatch(typ, payload, addr)
 			return
@@ -688,6 +691,7 @@ func (f *Flux) handleCrypto(body []byte, addr *net.IPAddr) {
 			f.rp = f.pendRp
 			f.pend = nil
 			f.lastRx.Store(time.Now().UnixNano())
+			f.hbRx.Store(f.lastRx.Load()) // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
 			f.learnPeer(addr)
 			f.dispatch(typ, payload, addr)
 			return
@@ -749,7 +753,8 @@ func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
 		// re-handshake regenerates a fresh ci in sendInit (ci==nil path).
 		f.ci.Store(nil)
 		f.lastRx.Store(time.Now().UnixNano())
-		f.st.reconnected("flux") // recovery after a self-heal (nil-safe; silent on first connect)
+		f.hbRx.Store(f.lastRx.Load()) // server RESP arrived: genuine inbound -> heartbeat (green on a real connect)
+		f.st.reconnected("flux")      // recovery after a self-heal (nil-safe; silent on first connect)
 		return
 	}
 	// Compute-DoS mitigation: an attacker replaying captured valid inits at high rate
