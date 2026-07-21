@@ -267,8 +267,13 @@ func (p *wsPool) updateECH(host string, ech []byte) bool {
 	return false
 }
 
+// activeSep joins the two halves of a pooled carrier's status descriptor ("<ip> · <sni>"). The same
+// separator splits the IP back out in current(), so a single const keeps producer and parser in
+// lockstep — change it here and both sides move together.
+const activeSep = " · "
+
 // activeLabel builds the status-file "active edge" string for an (ip, sni) combo.
-func activeLabel(ip, host string) string { return ip + " · " + host }
+func activeLabel(ip, host string) string { return ip + activeSep + host }
 
 // setActive records the edge the client is ACTUALLY carrying data on right now, for the status
 // file's live "active edge" (and the panel's auto-switch log). current() is intentionally NOT the
@@ -421,7 +426,7 @@ func (p *wsPool) aimStandby() {
 		return
 	}
 	activeIP := p.active // p.active is "ip · sni"; take the IP before the separator
-	if k := strings.Index(activeIP, " · "); k >= 0 {
+	if k := strings.Index(activeIP, activeSep); k >= 0 {
 		activeIP = activeIP[:k]
 	}
 	for off := 1; off <= len(p.ips); off++ {
@@ -913,10 +918,7 @@ func (p *wsPool) writeStatus() {
 	p.mu.Unlock()
 	if data, err := json.Marshal(st); err == nil {
 		// writeMu already held across the snapshot above (serializes writers AND orders snapshot->write).
-		tmp := p.statusPath + ".tmp"
-		if os.WriteFile(tmp, data, 0o644) == nil {
-			_ = os.Rename(tmp, p.statusPath) // atomic replace so a reader never sees a half file
-		}
+		writeFileAtomic(p.statusPath, data, 0o644)
 	}
 }
 

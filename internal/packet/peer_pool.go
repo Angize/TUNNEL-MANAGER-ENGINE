@@ -316,21 +316,6 @@ func (p *PeerPool) selectEntry(key string) bool {
 	return ok
 }
 
-// pinApplied clears a manual pin once the carrier has ACTUALLY landed on the pinned endpoint, so a pin
-// behaves as "jump there and keep retrying until connected" (surviving a transient outage — see pinTTL)
-// yet releases the instant it succeeds instead of freezing rotation for the whole window.
-func (p *PeerPool) pinApplied(addr string) {
-	p.mu.Lock()
-	changed := p.pinKey != "" && p.pinKey == addr
-	if changed {
-		p.pinKey, p.pinUntil = "", 0
-	}
-	p.mu.Unlock()
-	if changed {
-		p.writeStatus()
-	}
-}
-
 // pinLanded releases a live manual pin because the carrier just handshook successfully — a pin is
 // "jump here and keep trying until connected", so a success IS the landing. Single-locked so it can't
 // race the pin's own TTL expiry between a check and the clear (the isPinned()+pinApplied(current())
@@ -602,8 +587,5 @@ func (p *PeerPool) writeStatus() {
 	if err != nil {
 		return
 	}
-	tmp := p.statusPath + ".tmp"
-	if os.WriteFile(tmp, data, 0o644) == nil {
-		_ = os.Rename(tmp, p.statusPath) // atomic replace so a reader never sees a half file
-	}
+	writeFileAtomic(p.statusPath, data, 0o644)
 }

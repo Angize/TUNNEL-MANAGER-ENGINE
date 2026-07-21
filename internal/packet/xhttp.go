@@ -444,9 +444,9 @@ func (b *TCP) dialXHTTPOnce(dialAddr, host string, ech []byte, path string) (net
 	var err error
 	switch b.xhMode {
 	case "grpc", "stream":
-		conn, _, err = b.dialXHTTPGrpc(hc, closeIdle, ctx, cancel, base, sid, dialAddr, host, setHdr)
+		conn, err = b.dialXHTTPGrpc(hc, closeIdle, ctx, cancel, base, sid, dialAddr, setHdr)
 	default:
-		conn, _, err = b.dialXHTTPPacket(hc, closeIdle, ctx, cancel, base, sid, dialAddr, host, setHdr)
+		conn, err = b.dialXHTTPPacket(hc, closeIdle, ctx, cancel, base, sid, dialAddr, setHdr)
 	}
 	if err != nil {
 		// A FAILED establish (dial ok but header timeout / non-200 / write error) has cancelled the
@@ -568,13 +568,13 @@ func (g *grpcDeframingReader) Close() error {
 
 // dialXHTTPGrpc (grpc) is stream-one dressed as a gRPC call: one full-duplex POST with
 // Content-Type application/grpc and gRPC message framing on both directions.
-func (b *TCP) dialXHTTPGrpc(hc *http.Client, closeIdle func(), ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
+func (b *TCP) dialXHTTPGrpc(hc *http.Client, closeIdle func(), ctx context.Context, cancel func(), base, sid, dialAddr string, setHdr func(*http.Request)) (net.Conn, error) {
 	pr, pw := io.Pipe()
 	req, err := http.NewRequestWithContext(ctx, "POST", base+"?s="+sid, pr)
 	if err != nil {
 		cancel()
 		pw.Close()
-		return nil, dialAddr, err
+		return nil, err
 	}
 	setHdr(req)
 	req.Header.Set("Content-Type", "application/grpc")
@@ -585,13 +585,13 @@ func (b *TCP) dialXHTTPGrpc(hc *http.Client, closeIdle func(), ctx context.Conte
 	if err != nil {
 		cancel()
 		pw.Close()
-		return nil, dialAddr, err
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
 		cancel()
 		pw.Close()
-		return nil, dialAddr, fmt.Errorf("xhttp/grpc: got HTTP %d (want 200)", resp.StatusCode)
+		return nil, fmt.Errorf("xhttp/grpc: got HTTP %d (want 200)", resp.StatusCode)
 	}
 	conn := &xhttpConn{
 		r:  &grpcDeframingReader{r: resp.Body}, // Read <- deframed downstream
@@ -599,27 +599,27 @@ func (b *TCP) dialXHTTPGrpc(hc *http.Client, closeIdle func(), ctx context.Conte
 		ra: strAddr(dialAddr), la: strAddr("xhttp-client"),
 	}
 	conn.closeFn = func() { cancel(); pw.Close(); resp.Body.Close(); closeIdle() }
-	return conn, dialAddr, nil
+	return conn, nil
 }
 
 // dialXHTTPPacket (packet-up) opens the long-lived downstream GET and starts the packet-up
 // upstream sender for a fresh session, returning a net.Conn over the pair.
-func (b *TCP) dialXHTTPPacket(hc *http.Client, closeIdle func(), ctx context.Context, cancel func(), base, sid, dialAddr, host string, setHdr func(*http.Request)) (net.Conn, string, error) {
+func (b *TCP) dialXHTTPPacket(hc *http.Client, closeIdle func(), ctx context.Context, cancel func(), base, sid, dialAddr string, setHdr func(*http.Request)) (net.Conn, error) {
 	greq, err := http.NewRequestWithContext(ctx, "GET", base+"?s="+sid, nil)
 	if err != nil { // a malformed host/path would otherwise nil-deref inside doWithHeaderTimeout's goroutine
 		cancel()
-		return nil, dialAddr, err
+		return nil, err
 	}
 	setHdr(greq)
 	gresp, err := doWithHeaderTimeout(hc, greq, xhttpEstablishTimeout)
 	if err != nil {
 		cancel()
-		return nil, dialAddr, err
+		return nil, err
 	}
 	if gresp.StatusCode != http.StatusOK {
 		gresp.Body.Close()
 		cancel()
-		return nil, dialAddr, fmt.Errorf("xhttp: down got HTTP %d (want 200)", gresp.StatusCode)
+		return nil, fmt.Errorf("xhttp: down got HTTP %d (want 200)", gresp.StatusCode)
 	}
 	urlFor := func(seq uint64) string {
 		return base + "?s=" + sid + "&seq=" + strconv.FormatUint(seq, 10)
@@ -630,7 +630,7 @@ func (b *TCP) dialXHTTPPacket(hc *http.Client, closeIdle func(), ctx context.Con
 	}
 	conn.closeFn = func() { cancel(); gresp.Body.Close(); closeIdle() }
 	conn.up = newXhUp(ctx, hc, urlFor, setHdr, func() { conn.Close() })
-	return conn, dialAddr, nil
+	return conn, nil
 }
 
 // --- server ----------------------------------------------------------------------------------

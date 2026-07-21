@@ -345,23 +345,18 @@ func (b *UDP) SetStatusPath(path string) {
 // the client keeps pinging under a key the fresh server cannot open and — because it still holds a
 // session — never re-initiates on its own. A false positive (a few lost pings on a healthy link)
 // only costs one harmless re-handshake. Only meaningful with crypto on.
-// deadWin resolves this carrier's dead-window: sessionStaleMult×keepalive (floored at sessionStaleMinSecs),
-// or the per-tunnel dead_after_secs override. Shared by sessionStale() and the status-file heartbeat (setDW)
-// so a reader ages hb against the EXACT same window the carrier self-heals on — no re-derived multiplier.
-func (b *UDP) deadWin() time.Duration {
-	def := time.Duration(sessionStaleMult) * b.keepalive
-	if floor := time.Duration(sessionStaleMinSecs) * time.Second; def < floor {
-		def = floor
-	}
-	return deadWindow(b.keepalive, b.deadAfterSecs, def)
-}
+func (b *UDP) deadWin() time.Duration { return sessionStaleWindow(b.keepalive, b.deadAfterSecs) }
+func (b *UDP) sessionStale() bool     { return staleSince(b.lastRx.Load(), b.deadWin()) }
 
-func (b *UDP) sessionStale() bool {
-	last := b.lastRx.Load()
-	if last == 0 {
-		return false // no baseline yet
-	}
-	return time.Since(time.Unix(0, last)) > b.deadWin()
+// markRx stamps a genuine inbound frame: it advances BOTH the failover clock (lastRx) and the liveness
+// heartbeat (hbRx) to the same instant. hbRx is set ONLY here — on proven inbound — so hb reads 0 until
+// the peer actually answers, which is what keeps a still-connecting tunnel yellow instead of a false
+// green. Seeds that only re-baseline the failover clock (initial connect, destination/source rotation)
+// call lastRx.Store directly and must NOT call this, or a never-answered link would look alive.
+func (b *UDP) markRx() {
+	now := time.Now().UnixNano()
+	b.lastRx.Store(now)
+	b.hbRx.Store(now)
 }
 
 // Dial (client role) binds an ephemeral UDP socket and targets peerAddr.
@@ -637,10 +632,9 @@ func (b *UDP) deliver(pkt []byte, addr *net.UDPAddr) {
 	if len(pkt) < 2 || pkt[0] != magic {
 		return
 	}
-	b.lastRx.Store(time.Now().UnixNano()) // liveness: the peer is answering (clear mode has no session to prove it)
-	b.hbRx.Store(b.lastRx.Load())         // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
-	b.peerAnswered.Store(true)            // this endpoint has now replied since we pointed at it -> safe to heal its burn
-	if b.pp == nil {                      // a pooled client owns its peer (mirror the crypto path); a server always learns it
+	b.markRx()                 // the peer is answering (clear mode has no session to prove it)
+	b.peerAnswered.Store(true) // this endpoint has now replied since we pointed at it -> safe to heal its burn
+	if b.pp == nil {           // a pooled client owns its peer (mirror the crypto path); a server always learns it
 		b.learnPeer(addr)
 	}
 	b.dispatch(pkt[1], iff(pkt[1] == typeData, pkt[2:], nil), addr)
@@ -668,8 +662,7 @@ func (b *UDP) handleCrypto(pkt []byte, addr *net.UDPAddr) {
 	if s := b.sealer(); s != nil {
 		if typ, session, seq, payload, oerr := b.openWith(s, pkt); oerr == nil && b.rp.ok(session, seq) {
 			// authenticated, fresh frame -> now safe to (re)learn the peer address
-			b.lastRx.Store(time.Now().UnixNano()) // liveness: the session is answering
-			b.hbRx.Store(b.lastRx.Load())         // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
+			b.markRx() // the session is answering
 			// The DESTINATION pool owns the client's peer: don't rebind it from a reply's source, so a
 			// client's own rotation isn't silently pulled off the endpoint its pool is driving. Servers
 			// (pp==nil) learn the client here — which lets them follow a client's SOURCE rotation and, on
@@ -690,8 +683,7 @@ func (b *UDP) handleCrypto(pkt []byte, addr *net.UDPAddr) {
 			b.session.Store(b.pend)
 			b.rp = b.pendRp
 			b.pend = nil
-			b.lastRx.Store(time.Now().UnixNano())
-			b.hbRx.Store(b.lastRx.Load()) // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
+			b.markRx() // a pending session promoted -> genuine inbound
 			b.learnPeer(addr)
 			b.dispatch(typ, payload, addr)
 			return
@@ -722,9 +714,8 @@ func (b *UDP) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 		// instead of re-parsing and wiping the fresh anti-replay window. A legitimate
 		// re-handshake regenerates a fresh ci in sendInit (ci==nil path).
 		b.ci.Store(nil)
-		b.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale"
-		b.hbRx.Store(b.lastRx.Load())         // server RESP arrived: genuine inbound -> heartbeat (green on a real connect)
-		b.st.reconnected("udp")               // recovery after a self-heal (nil-safe; silent on first connect)
+		b.markRx()              // server RESP arrived: genuine inbound (green on a real connect)
+		b.st.reconnected("udp") // recovery after a self-heal (nil-safe; silent on first connect)
 		return
 	}
 	// server: authenticate an init, reply, and install the fresh session.

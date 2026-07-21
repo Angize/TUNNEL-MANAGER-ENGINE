@@ -323,15 +323,14 @@ type dnsServer struct {
 	serveDone  chan struct{} // closed when serveLoop has fully exited
 	once       sync.Once
 
-	zoneName dnsmessage.Name     // the delegated zone apex, precomputed for question/answer names
-	soa      dnsmessage.Resource // apex SOA, answered so resolvers see a healthy (not lame) zone
-	ns       dnsmessage.Resource // apex NS, likewise
+	soa dnsmessage.Resource // apex SOA, answered so resolvers see a healthy (not lame) zone
+	ns  dnsmessage.Resource // apex NS, likewise
 }
 
 // NewDNSServerTransport binds listenAddr (typically ":53") as the authoritative responder for the
 // delegated zone and starts serving. It returns the transport and the bound address.
 func NewDNSServerTransport(listenAddr string, codec *Codec) (WireTransport, net.Addr, error) {
-	zoneName, soa, ns, err := apexRecords(codec.Zone())
+	_, soa, ns, err := apexRecords(codec.Zone())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -350,7 +349,6 @@ func NewDNSServerTransport(listenAddr string, codec *Codec) (WireTransport, net.
 		downstream: make(chan []byte, sendQueueSize),
 		closed:     make(chan struct{}),
 		serveDone:  make(chan struct{}),
-		zoneName:   zoneName,
 		soa:        soa,
 		ns:         ns,
 	}
