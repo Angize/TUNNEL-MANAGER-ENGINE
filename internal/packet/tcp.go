@@ -682,11 +682,11 @@ func (b *TCP) Run() error {
 	if b.isClient {
 		go b.keepaliveLoop()
 		go b.diagLoop() // low-rate goroutine-count heartbeat so a slow session leak is visible in the log
-		// Seed the heartbeat ONCE, here, so a freshly started tunnel is not instantly reported dead. It is
-		// deliberately NOT re-seeded per connection (see handshakeAndPrime): only a genuine inbound frame
-		// may advance it afterwards, so a carrier that keeps re-establishing without ever receiving
-		// anything ages out and reports dead, instead of looking alive forever.
-		b.lastRx.Store(time.Now().UnixNano())
+		// Do NOT seed the heartbeat: lastRx stays 0 until a GENUINE inbound frame arrives (a handshake
+		// response or a keepalive/data frame). That lets the node distinguish "connecting" (hb still 0,
+		// brief) from "connected" (hb advancing), so a freshly (re)built tunnel reads YELLOW — not green —
+		// until the peer actually answers, and a carrier that never connects ages to red instead of
+		// looking alive from a startup seed.
 		if b.st != nil {
 			b.st.setDW(int64(b.idle.Seconds()))      // b.idle IS the resolved stream dead-window (idle backstop / dead_after)
 			go heartbeat(b.st, &b.lastRx, b.closeCh) // single-edge / direct-tcp: publish lastRx so an idle tunnel reads live, not half-open
@@ -1747,6 +1747,11 @@ func (b *TCP) handshakeAndPrime(conn net.Conn) (*connFramer, error) {
 		if err := b.clientHandshake(cf); err != nil {
 			return nil, err
 		}
+		// A completed crypto handshake means the SERVER answered — an end-to-end authentication a CDN edge
+		// cannot fake — so this is genuine INBOUND proof. Stamp the heartbeat now for fast green on a real
+		// connect. A dead origin fails clientHandshake above and never reaches here, so this cannot
+		// false-green (unlike the old prime-ping stamp this replaces).
+		b.lastRx.Store(time.Now().UnixNano())
 	}
 	if b.obfs {
 		if err := cf.sendSalt(); err != nil { // client speaks first (length-mask salt)
