@@ -1631,7 +1631,7 @@ func (b *TCP) dialLoop() {
 				}
 			})
 		}
-		b.serve(cf)          // blocks until this connection dies
+		b.serve(cf)            // blocks until this connection dies
 		timerLive.Store(false) // disable the callback's re-arm before stopping, so a racing beat can't re-arm
 		if rot != nil {
 			rot.Stop()
@@ -1878,6 +1878,36 @@ func (b *TCP) dialLoopWarm() {
 		}
 		startReader(cf)
 	}
+	// dialWorker runs one background dial-until-success loop, shared by requestStandby (wantStandby
+	// true — a DIFFERENT edge than the active) and dialActiveAsync (false — a fresh active). A failed
+	// establish retries with a short backoff until a conn comes up or Close fires; on success it
+	// delivers the warm conn on out, or closes it if Close won the race against the buffered send.
+	dialWorker := func(wantStandby bool, out chan warmConn) {
+		for {
+			if b.closed.Load() {
+				return
+			}
+			cf, conn, label, combo, err := b.warmEstablish(wantStandby)
+			if err != nil {
+				if b.sleep(1 * time.Second) {
+					return
+				}
+				continue
+			}
+			select {
+			case out <- warmConn{cf, conn, label, combo}:
+				// The channel is buffered, so this send can succeed AFTER the manager has already
+				// exited and run its one-shot drain — leaking this conn's fd. Re-check: if Close has
+				// fired, nobody will drain us, so close it here.
+				if b.closed.Load() {
+					conn.Close()
+				}
+			case <-b.closeCh:
+				conn.Close()
+			}
+			return
+		}
+	}
 	// requestStandby dials a new standby in the background unless one is already up or building.
 	// The result arrives on `ready`; a persistent failure retries with a short backoff until a
 	// standby comes up or Close fires.
@@ -1886,32 +1916,7 @@ func (b *TCP) dialLoopWarm() {
 			return
 		}
 		standbyBuilding = true
-		go func() {
-			for {
-				if b.closed.Load() {
-					return
-				}
-				cf, conn, label, combo, err := b.warmEstablish(true) // different edge than the active
-				if err != nil {
-					if b.sleep(1 * time.Second) {
-						return
-					}
-					continue
-				}
-				select {
-				case ready <- warmConn{cf, conn, label, combo}:
-					// The channel is buffered, so this send can succeed AFTER the manager has already
-					// exited and run its one-shot drain — leaking this conn's fd. Re-check: if Close has
-					// fired, nobody will drain us, so close it here.
-					if b.closed.Load() {
-						conn.Close()
-					}
-				case <-b.closeCh:
-					conn.Close()
-				}
-				return
-			}
-		}()
+		go dialWorker(true, ready)
 	}
 	// promote swaps the warm standby into the active slot and retires the old active. Returns
 	// false when there is no standby ready to promote.
@@ -1983,30 +1988,7 @@ func (b *TCP) dialLoopWarm() {
 			return
 		}
 		activeBuilding = true
-		go func() {
-			for {
-				if b.closed.Load() {
-					return
-				}
-				cf, conn, label, combo, err := b.warmEstablish(false)
-				if err != nil {
-					if b.sleep(1 * time.Second) {
-						return
-					}
-					continue
-				}
-				select {
-				case activeReady <- warmConn{cf, conn, label, combo}:
-					// Buffered send can win the race against Close's one-shot drain — see requestStandby.
-					if b.closed.Load() {
-						conn.Close()
-					}
-				case <-b.closeCh:
-					conn.Close()
-				}
-				return
-			}
-		}()
+		go dialWorker(false, activeReady)
 	}
 
 	if !dialActiveBlocking() {

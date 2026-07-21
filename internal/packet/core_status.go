@@ -33,13 +33,10 @@ type coreStatus struct {
 // no ICMP. Kept small relative to keepalive so the freeze becomes visible promptly.
 const hbInterval = 5 * time.Second
 
-// heartbeat republishes lastRx (unix-seconds) into the status file every hbInterval until done closes.
-// A nil status writer (no status_path wired) is a no-op, so it is always safe to start for any client.
-func heartbeat(s *coreStatus, lastRx *atomic.Int64, done <-chan struct{}) {
-	if s == nil {
-		return
-	}
-	s.beat(lastRx.Load() / int64(time.Second)) // publish once immediately so a reader sees a heartbeat at startup
+// heartbeatLoop republishes the carrier's lastRx (unix-seconds) via beat every hbInterval until done
+// closes: an immediate publish so a reader sees a heartbeat at startup, then one per tick.
+func heartbeatLoop(beat func(int64), lastRx *atomic.Int64, done <-chan struct{}) {
+	beat(lastRx.Load() / int64(time.Second))
 	t := time.NewTicker(hbInterval)
 	defer t.Stop()
 	for {
@@ -47,29 +44,28 @@ func heartbeat(s *coreStatus, lastRx *atomic.Int64, done <-chan struct{}) {
 		case <-done:
 			return
 		case <-t.C:
-			s.beat(lastRx.Load() / int64(time.Second))
+			beat(lastRx.Load() / int64(time.Second))
 		}
 	}
 }
 
+// heartbeat republishes lastRx into the coreStatus file. A nil status writer (no status_path wired) is a
+// no-op, so it is always safe to start for any client. The nil guard stays HERE so a nil status never
+// leaves a goroutine ticking forever.
+func heartbeat(s *coreStatus, lastRx *atomic.Int64, done <-chan struct{}) {
+	if s == nil {
+		return
+	}
+	heartbeatLoop(s.beat, lastRx, done)
+}
+
 // heartbeatPool is heartbeat for a ws/xhttp edge pool, whose status file is written by wsPool.writeStatus
-// (not coreStatus). Publishes the carrier's lastRx into the pool status every hbInterval so an idle pooled
-// tunnel reads live, not half-open. A nil pool is a no-op.
+// (not coreStatus), so an idle pooled tunnel reads live, not half-open. A nil pool is a no-op.
 func heartbeatPool(p *wsPool, lastRx *atomic.Int64, done <-chan struct{}) {
 	if p == nil {
 		return
 	}
-	p.beat(lastRx.Load() / int64(time.Second))
-	t := time.NewTicker(hbInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-done:
-			return
-		case <-t.C:
-			p.beat(lastRx.Load() / int64(time.Second))
-		}
-	}
+	heartbeatLoop(p.beat, lastRx, done)
 }
 
 // beat records the latest lastRx (unix-seconds) and flushes the file. lastRx only moves forward (it is
@@ -187,9 +183,33 @@ func (s *coreStatus) write() {
 	if err != nil {
 		return
 	}
-	tmp := s.path + ".tmp"
-	if os.WriteFile(tmp, buf, 0o600) != nil {
-		return
+	writeFileAtomic(s.path, buf, 0o600)
+}
+
+// writeFileAtomic writes data to path via a .tmp file + rename, so a reader never sees a half-written
+// status file. The single durability primitive shared by all three status writers (coreStatus / peerPool
+// / wsPool); each passes its own perm.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) {
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, data, perm) == nil {
+		_ = os.Rename(tmp, path)
 	}
-	_ = os.Rename(tmp, s.path) // atomic replace so a reader never sees a half-written file
+}
+
+// sessionStaleWindow is the datagram carriers' resolved dead-window: sessionStaleMult×keepalive, floored at
+// sessionStaleMinSecs, or the per-tunnel dead_after_secs override. Shared by every datagram carrier's
+// deadWin() so sessionStale() and the status heartbeat (setDW) age against the EXACT same window — no
+// re-derived multiplier can drift between the three carriers.
+func sessionStaleWindow(keepalive time.Duration, deadAfterSecs int) time.Duration {
+	def := time.Duration(sessionStaleMult) * keepalive
+	if floor := time.Duration(sessionStaleMinSecs) * time.Second; def < floor {
+		def = floor
+	}
+	return deadWindow(keepalive, deadAfterSecs, def)
+}
+
+// staleSince reports whether last (unix-nano of the last inbound frame) has aged past window. A zero last
+// means "no baseline yet" -> not stale.
+func staleSince(last int64, window time.Duration) bool {
+	return last != 0 && time.Since(time.Unix(0, last)) > window
 }

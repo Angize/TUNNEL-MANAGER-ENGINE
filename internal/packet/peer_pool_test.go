@@ -190,9 +190,9 @@ func TestPeerPoolSelectPin(t *testing.T) {
 	if a, moved := p.rotateOnce(); a != "c" || moved {
 		t.Fatalf("rotateOnce() while pinned must stay on c: got %q moved=%v, want c false", a, moved)
 	}
-	p.pinApplied("c") // the carrier landed on c -> pin releases
+	p.pinLanded() // the carrier landed on c -> pin releases
 	if p.isPinned() {
-		t.Fatal("pinApplied on the pinned endpoint must release the pin")
+		t.Fatal("pinLanded on the pinned endpoint must release the pin")
 	}
 	// After the TTL a stale pin self-releases even without a land.
 	p.selectEntry("a")

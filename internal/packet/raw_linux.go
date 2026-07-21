@@ -770,9 +770,8 @@ func (r *Raw) deliver(body []byte, addr *net.IPAddr) {
 	if len(body) < 2 || body[0] != magic {
 		return
 	}
-	r.lastRx.Store(time.Now().UnixNano()) // liveness: the peer is answering (clear mode has no session to prove it)
-	r.hbRx.Store(r.lastRx.Load())         // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
-	r.peerAnswered.Store(true)            // this endpoint has replied since we pointed at it -> safe to heal its burn
+	r.markRx()                 // the peer is answering (clear mode has no session to prove it)
+	r.peerAnswered.Store(true) // this endpoint has replied since we pointed at it -> safe to heal its burn
 	r.learnPeer(addr)
 	r.dispatch(body[1], iff(body[1] == typeData, body[2:], nil), addr)
 }
@@ -794,8 +793,7 @@ func (r *Raw) openWith(s Sealer, body []byte) (typ byte, session, seq uint64, pa
 func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
 	if s := r.sealer(); s != nil {
 		if typ, session, seq, payload, oerr := r.openWith(s, body); oerr == nil && r.rp.ok(session, seq) {
-			r.lastRx.Store(time.Now().UnixNano()) // liveness: the session is answering
-			r.hbRx.Store(r.lastRx.Load())         // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
+			r.markRx() // the session is answering
 			r.learnPeer(addr)
 			r.dispatch(typ, payload, addr)
 			return
@@ -809,8 +807,7 @@ func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
 			r.session.Store(r.pend)
 			r.rp = r.pendRp
 			r.pend = nil
-			r.lastRx.Store(time.Now().UnixNano())
-			r.hbRx.Store(r.lastRx.Load()) // genuine inbound -> heartbeat (hb is 0 until the peer answers; NOT the failover clock)
+			r.markRx() // a pending session promoted -> genuine inbound
 			r.learnPeer(addr)
 			r.dispatch(typ, payload, addr)
 			return
@@ -828,8 +825,15 @@ func (r *Raw) learnPeer(addr *net.IPAddr) {
 	if !r.pinnedPeer() && r.pp == nil {
 		r.peer.Store(addr)
 	}
+	r.learnLocalIP(addr.IP)
+}
+
+// learnLocalIP records, once, the local source IP the kernel routes toward peer — the tcp profile's
+// checksum needs it. Idempotent: a no-op after the first success, so repeated inbound frames and a
+// staged pending session don't re-resolve it.
+func (r *Raw) learnLocalIP(peer net.IP) {
 	if r.localIP.Load() == nil {
-		if lip := routeLocalIP(addr.IP); lip != nil {
+		if lip := routeLocalIP(peer); lip != nil {
 			r.localIP.Store(&net.IPAddr{IP: lip})
 		}
 	}
@@ -855,9 +859,8 @@ func (r *Raw) tryHandshake(body []byte, addr *net.IPAddr) {
 		// instead of re-parsing and wiping the fresh anti-replay window. A legitimate
 		// re-handshake regenerates a fresh ci in sendInit (ci==nil path).
 		r.ci.Store(nil)
-		r.lastRx.Store(time.Now().UnixNano()) // baseline so the fresh session isn't instantly "stale"
-		r.hbRx.Store(r.lastRx.Load())         // server RESP arrived: genuine inbound -> heartbeat (green on a real connect)
-		r.st.reconnected("raw")               // recovery after a self-heal (nil-safe; silent on first connect)
+		r.markRx()              // server RESP arrived: genuine inbound (green on a real connect)
+		r.st.reconnected("raw") // recovery after a self-heal (nil-safe; silent on first connect)
 		return
 	}
 	// Compute-DoS mitigation: an attacker replaying captured valid inits at high rate
@@ -891,11 +894,7 @@ func (r *Raw) tryHandshake(body []byte, addr *net.IPAddr) {
 	// cannot wedge the tunnel. Peer rebinding is likewise deferred to that first frame.
 	r.pend = &sealerBox{s: s}
 	r.pendRp = replayGuard{}
-	if r.localIP.Load() == nil {
-		if lip := routeLocalIP(addr.IP); lip != nil {
-			r.localIP.Store(&net.IPAddr{IP: lip})
-		}
-	}
+	r.learnLocalIP(addr.IP)
 	if msg2 := crypto.RespMsg(r.psk, eInit, sr); msg2 != nil {
 		// Cache this init and its response so a replay of the same init (while pend is
 		// still current) is served without recomputing the crypto above. put copies body
@@ -933,23 +932,16 @@ func (r *Raw) dispatch(typ byte, payload []byte, addr *net.IPAddr) {
 // enough that the peer most likely restarted with a fresh session, so the client should drop its
 // dead session and re-handshake. Without it a SERVER restart wedges the tunnel: the client keeps
 // pinging under a key the fresh server can't open and never re-initiates. See UDP.sessionStale.
-// deadWin resolves this carrier's dead-window (sessionStaleMult×keepalive floored at sessionStaleMinSecs,
-// or the dead_after_secs override) — shared by sessionStale() and the status heartbeat (setDW) so a reader
-// ages hb against the exact same window the carrier self-heals on.
-func (r *Raw) deadWin() time.Duration {
-	def := time.Duration(sessionStaleMult) * r.keepalive
-	if floor := time.Duration(sessionStaleMinSecs) * time.Second; def < floor {
-		def = floor
-	}
-	return deadWindow(r.keepalive, r.deadAfterSecs, def)
-}
+func (r *Raw) deadWin() time.Duration { return sessionStaleWindow(r.keepalive, r.deadAfterSecs) }
+func (r *Raw) sessionStale() bool     { return staleSince(r.lastRx.Load(), r.deadWin()) }
 
-func (r *Raw) sessionStale() bool {
-	last := r.lastRx.Load()
-	if last == 0 {
-		return false
-	}
-	return time.Since(time.Unix(0, last)) > r.deadWin()
+// markRx stamps a genuine inbound frame: both the failover clock (lastRx) and the liveness heartbeat
+// (hbRx). hbRx is set ONLY here (proven inbound), so hb stays 0 until the peer answers — a connecting
+// tunnel reads yellow, not a false green. Failover-clock seeds (connect / rotation) must NOT call this.
+func (r *Raw) markRx() {
+	now := time.Now().UnixNano()
+	r.lastRx.Store(now)
+	r.hbRx.Store(now)
 }
 
 // SetPeerPool (client) wires a destination-IP rotation pool: a peer whose handshake never completes
