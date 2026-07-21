@@ -312,19 +312,18 @@ type Config struct {
 // TuningCfg is the JSON shape of the config's `tuning` object. Every field is optional (zero/empty =
 // keep default); the packet layer clamps each to a sane range before applying it.
 type TuningCfg struct {
-	SuspectBackoff      []int64 `json:"suspect_backoff"`          // retest schedule (secs) for a suspect pool entry
-	DeadRetestSecs      int64   `json:"dead_retest_secs"`         // slow retest interval (secs) for a dead entry
-	PinTTLSecs          int64   `json:"pin_ttl_secs"`             // manual-pin force window (dead-pin release cap)
-	DataFailThreshold   int     `json:"data_fail_threshold"`      // short sessions in a row before suspecting an IP
-	DataGoodWindowSecs  int64   `json:"data_good_window_secs"`    // recency window for the outage guard
-	IdleMult            int64   `json:"idle_mult"`                // ws/tcp read deadline = mult × keepalive
-	IdleMinSecs         int64   `json:"idle_min_secs"`            // …floored at this many seconds
-	SessionStaleMult    int64   `json:"session_stale_mult"`       // udp/raw/flux stale window = mult × keepalive
-	SessionStaleMinSecs int64   `json:"session_stale_min_secs"`   // …floored at this many seconds
-	PingLossThreshold   int     `json:"ping_loss_threshold"`      // unanswered keepalives before a client closes
-	MinLivenessSecs     int64   `json:"min_liveness_secs"`        // shortest session that still counts as healthy
-	ProbeTimeoutSecs    int64   `json:"probe_timeout_secs"`       // per-edge reachability probe timeout
-	FluxRotateDefSecs   int64   `json:"flux_rotate_default_secs"` // flux epoch length when unset per-tunnel
+	SuspectBackoff      []int64 `json:"suspect_backoff"`        // retest schedule (secs) for a suspect pool entry
+	DeadRetestSecs      int64   `json:"dead_retest_secs"`       // slow retest interval (secs) for a dead entry
+	PinTTLSecs          int64   `json:"pin_ttl_secs"`           // manual-pin force window (dead-pin release cap)
+	DataFailThreshold   int     `json:"data_fail_threshold"`    // short sessions in a row before suspecting an IP
+	DataGoodWindowSecs  int64   `json:"data_good_window_secs"`  // recency window for the outage guard
+	IdleMult            int64   `json:"idle_mult"`              // ws/tcp read deadline = mult × keepalive
+	IdleMinSecs         int64   `json:"idle_min_secs"`          // …floored at this many seconds
+	SessionStaleMult    int64   `json:"session_stale_mult"`     // udp/raw/flux stale window = mult × keepalive
+	SessionStaleMinSecs int64   `json:"session_stale_min_secs"` // …floored at this many seconds
+	PingLossThreshold   int     `json:"ping_loss_threshold"`    // unanswered keepalives before a client closes
+	MinLivenessSecs     int64   `json:"min_liveness_secs"`      // shortest session that still counts as healthy
+	ProbeTimeoutSecs    int64   `json:"probe_timeout_secs"`     // per-edge reachability probe timeout
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -370,17 +369,10 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Transport == "flux" {
 		if c.FluxRotateSecs == 0 {
-			// Honor the tuned global default (flux_rotate_default_secs) when the tunnel leaves the epoch
-			// length unset; fall back to 600 when the knob is unset/invalid. Resolving it to a concrete
-			// value HERE (not leaving 0 for the carrier's defaultFluxRotate) keeps both ends computing the
-			// same epoch and avoids a divide-by-zero in fluxEpochAt. Both ends share the global tuning.
-			d := int64(600)
-			if c.Tuning != nil && c.Tuning.FluxRotateDefSecs > 0 {
-				if d = c.Tuning.FluxRotateDefSecs; d > 86400 {
-					d = 86400
-				}
-			}
-			c.FluxRotateSecs = int(d)
+			// Resolve the flux epoch to a concrete default HERE so both ends compute the same epoch and
+			// fluxEpochAt cannot divide by zero. The panel always sends an explicit per-tunnel
+			// flux_rotate_secs; 600 is the fallback for a config that omits it.
+			c.FluxRotateSecs = 600
 		}
 		if c.FluxCarrier == "" {
 			c.FluxCarrier = "udp"

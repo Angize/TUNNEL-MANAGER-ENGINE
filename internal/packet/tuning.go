@@ -65,7 +65,6 @@ type TuningInput struct {
 	PingLossThreshold   int
 	MinLivenessSecs     int64
 	ProbeTimeoutSecs    int64
-	FluxRotateDefSecs   int64
 }
 
 // ApplyTuning overrides each operational default with its non-zero, in-range config value. A zero
@@ -116,9 +115,6 @@ func ApplyTuning(t TuningInput) {
 	}
 	if t.ProbeTimeoutSecs > 0 {
 		probeTimeout = time.Duration(tclamp64(t.ProbeTimeoutSecs, 1, 120)) * time.Second
-	}
-	if t.FluxRotateDefSecs > 0 {
-		defaultFluxRotate = time.Duration(tclamp64(t.FluxRotateDefSecs, 1, 86400)) * time.Second
 	}
 }
 
