@@ -63,9 +63,8 @@ type Flux struct {
 	session  atomic.Pointer[sealerBox]
 	curShape atomic.Pointer[fluxShape] // this epoch's shape (refreshed each second by rotateWatcher)
 	rp       replayGuard
-	pend     *sealerBox // server: session staged by a recent init, promoted only once a frame opens under it
-	pendRp   replayGuard
-	hsCache  initCache // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
+	staged   []*stagedBox // server: bounded set of sessions staged by recent inits, each promoted only once a frame opens under it
+	hsCache  initCache    // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
 	ci       atomic.Pointer[crypto.Ephemeral]
 	lastRx   atomic.Int64 // unix-nano of the last authenticated frame (client staleness)
 	hbRx     atomic.Int64 // unix-nano of the last REAL inbound frame — feeds the status heartbeat; 0 until the peer answers (v2.48.7)
@@ -680,14 +679,15 @@ func (f *Flux) handleCrypto(body []byte, addr *net.IPAddr) {
 			return
 		}
 	}
-	// A frame that did not open under the live session may open under a PENDING session
-	// staged by a recent init; promote it only when a frame actually opens under it, so a
-	// replayed init cannot tear down the live session or its replay window.
-	if f.pend != nil {
-		if typ, session, seq, payload, oerr := f.openWith(f.pend.s, body); oerr == nil && f.pendRp.ok(session, seq) {
-			f.session.Store(f.pend)
-			f.rp = f.pendRp
-			f.pend = nil
+	// A frame that did not open under the live session may open under a session STAGED by a recent
+	// init; promote a candidate only when a frame actually opens under it, so a replayed init cannot
+	// tear down the live session or its replay window. The live session was tried first above, so an
+	// established tunnel never reaches this loop; on the normal path the set holds one candidate.
+	for _, st := range f.staged {
+		if typ, session, seq, payload, oerr := f.openWith(st.box.s, body); oerr == nil && st.rp.ok(session, seq) {
+			f.session.Store(st.box)
+			f.rp = st.rp
+			f.staged = nil
 			f.markRx() // a pending session promoted -> genuine inbound
 			f.learnPeer(addr)
 			f.dispatch(typ, payload, addr)
@@ -764,11 +764,11 @@ func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
 	// would otherwise force a fresh ECDH+HKDF (GenerateEphemeral+SessionSealer) per packet.
 	// If this init matches one we recently answered (while a pending session is current),
 	// re-send the already-computed response and return before that expensive crypto. The
-	// handshake outcome is unchanged (pend/promote-on-open is untouched); a genuinely new
+	// handshake outcome is unchanged (staged/promote-on-open is untouched); a genuinely new
 	// init falls through to the full handshake below. The cache is a small LRU (not a
 	// single entry) so alternating two captured inits cannot bust it. It is touched only on
-	// this single receive goroutine (like pend/rp), so no locking is needed.
-	if f.pend != nil {
+	// this single receive goroutine (like staged), so no locking is needed.
+	if len(f.staged) > 0 {
 		if resp, ok := f.hsCache.get(body); ok {
 			f.sendCtrl(resp, addr)
 			return
@@ -789,12 +789,11 @@ func (f *Flux) tryHandshake(body []byte, addr *net.IPAddr) {
 	// Stage the new session as PENDING; the live session and its replay window survive until
 	// a frame actually opens under these new keys (see handleCrypto), so a replayed init
 	// cannot wedge the tunnel. Peer rebinding is likewise deferred to that first frame.
-	f.pend = &sealerBox{s: s}
-	f.pendRp = replayGuard{}
+	f.staged = stageSession(f.staged, s)
 	f.learnLocalIP(addr.IP)
 	if msg2 := crypto.RespMsg(f.psk, eInit, sr); msg2 != nil {
-		// Cache this init and its response so a replay of the same init (while pend is
-		// still current) is served without recomputing the crypto above. put copies body
+		// Cache this init and its response so a replay of the same init (while a staged session
+		// is still current) is served without recomputing the crypto above. put copies body
 		// (it aliases the receive buffer); msg2 is a fresh slice, safe to keep.
 		f.hsCache.put(body, msg2)
 		f.sendCtrl(msg2, addr)
