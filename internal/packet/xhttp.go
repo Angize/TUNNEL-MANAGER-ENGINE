@@ -34,7 +34,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -166,24 +165,33 @@ type seqChunk struct {
 	data []byte
 }
 
-// xhUp is the client's packet-up upstream. Each Write is copied, tagged with a monotonic seq,
-// and handed to a small pool of workers that POST it as a short, complete request; the server
-// reassembles by seq. A single long streaming POST is what a CDN buffers — short discrete POSTs
-// are forwarded at once, so the handshake and data flow through Cloudflare. Any POST failure
-// fails the whole conn (once) so dialLoop re-dials a fresh session.
+// maxUpBatch caps how many bytes the batcher coalesces into ONE upstream POST. Batching amortizes the
+// per-POST round-trip: without it each ~MTU datagram cost a full HTTP request through the CDN, so a
+// burst of upstream — e.g. the KCP acks a heavy download generates — couldn't be posted fast enough and
+// backed up into unbounded latency (bufferbloat). Well under maxXhChunk (the server's per-POST cap).
+const maxUpBatch = 32 << 10
+
+// xhUp is the client's packet-up upstream. Writes are copied and queued; a single batcher coalesces
+// them into one POST per batch (tagging each with a monotonic seq so the server reassembles in order)
+// and hands the batch to a small pool of workers that POST it as a short, complete request. Short
+// discrete POSTs (not one long streaming POST a CDN would buffer) are what flow through Cloudflare;
+// coalescing keeps the round-trip cost from throttling upstream throughput. Any POST failure fails the
+// whole conn (once) so dialLoop re-dials a fresh session.
 type xhUp struct {
 	hc     *http.Client
 	ctx    context.Context
 	urlFor func(seq uint64) string
 	setHdr func(*http.Request)
-	seq    uint64
-	ch     chan seqChunk
+	seq    uint64        // batch sequence; assigned only by the single batcher goroutine, so no atomic needed
+	ch     chan []byte   // raw upstream byte chunks from write()
+	work   chan seqChunk // coalesced, seq-tagged batches ready to POST
 	fail   func()
 	once   sync.Once
 }
 
 func newXhUp(ctx context.Context, hc *http.Client, urlFor func(uint64) string, setHdr func(*http.Request), fail func()) *xhUp {
-	u := &xhUp{hc: hc, ctx: ctx, urlFor: urlFor, setHdr: setHdr, fail: fail, ch: make(chan seqChunk, 256)}
+	u := &xhUp{hc: hc, ctx: ctx, urlFor: urlFor, setHdr: setHdr, fail: fail, ch: make(chan []byte, 256), work: make(chan seqChunk, 8)}
+	go u.batcher()
 	for i := 0; i < 4; i++ {
 		go u.worker()
 	}
@@ -193,12 +201,42 @@ func newXhUp(ctx context.Context, hc *http.Client, urlFor func(uint64) string, s
 func (u *xhUp) write(p []byte) (int, error) {
 	b := make([]byte, len(p))
 	copy(b, p)
-	seq := atomic.AddUint64(&u.seq, 1) - 1
 	select {
-	case u.ch <- seqChunk{seq, b}:
+	case u.ch <- b:
 		return len(p), nil
 	case <-u.ctx.Done():
 		return 0, io.ErrClosedPipe
+	}
+}
+
+// batcher coalesces queued write chunks into one POST body up to maxUpBatch, tagging each batch with a
+// monotonic seq so the server reassembles in order. It blocks for the first chunk, then drains whatever
+// is ALREADY queued without waiting — so an idle link posts one chunk at once (low latency) while a
+// burst posts a big batch (few round-trips). One goroutine, so seq stays strictly in byte order.
+func (u *xhUp) batcher() {
+	for {
+		var buf []byte
+		select {
+		case buf = <-u.ch:
+		case <-u.ctx.Done():
+			return
+		}
+		for len(buf) < maxUpBatch {
+			select {
+			case more := <-u.ch:
+				buf = append(buf, more...)
+				continue
+			default:
+			}
+			break
+		}
+		seq := u.seq
+		u.seq++
+		select {
+		case u.work <- seqChunk{seq, buf}:
+		case <-u.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -207,7 +245,7 @@ func (u *xhUp) worker() {
 		select {
 		case <-u.ctx.Done():
 			return
-		case sc := <-u.ch:
+		case sc := <-u.work:
 			if err := u.post(sc); err != nil {
 				u.once.Do(u.fail) // kill the conn once; dialLoop re-dials a fresh session
 				return
