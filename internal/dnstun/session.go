@@ -22,20 +22,37 @@ type WireTransport interface {
 	Close() error
 }
 
-// Every WireTransport datagram carries a 1-byte kind prefix. The two kinds are self-
-// authenticating even if flipped: a data datagram parsed as a handshake fails the PSK MAC, and
-// a handshake datagram parsed as data fails the AEAD — either way it is dropped, not acted on.
+// Every WireTransport datagram carries a 1-byte kind prefix. All kinds are self-authenticating even if
+// flipped: a data/ping/pong parsed as a handshake fails the PSK MAC, and a handshake parsed as sealed
+// data fails the AEAD — either way it is dropped, not acted on.
 const (
 	kindHandshake = 0x00
 	kindData      = 0x01
+	kindPing      = 0x02 // client -> server sealed keepalive; the server echoes a kindPong
+	kindPong      = 0x03 // server -> client sealed keepalive reply
 )
 
-// SessionConfig carries the crypto parameters both ends share (from the tunnel config) plus the
-// KCP MTU the transport can carry in one datagram. MTU<=0 falls back to kcpMTUDefault.
+// Client keepalive. The client sends a sealed ping every keepalive and re-dials (with a fresh init) if
+// it hears nothing authentic for deadWindow — the ONLY way it detects a server that restarted or a
+// session the server tore down (KCP's own dead-link never fires on a silent link, and the server keeps
+// answering DNS queries even for a mismatched session). Floored generously: this carrier is high-loss,
+// so the window must survive several dropped pings without reaping a healthy tunnel.
+const keepaliveDeadMult = 3
+
+// Vars (not consts) so a test can shorten them; production keeps these.
+var (
+	defaultKeepalive   = 10 * time.Second
+	keepaliveDeadFloor = 20 * time.Second
+)
+
+// SessionConfig carries the crypto parameters both ends share (from the tunnel config), the KCP MTU the
+// transport can carry in one datagram (MTU<=0 falls back to kcpMTUDefault), and the client keepalive
+// interval (0 falls back to defaultKeepalive).
 type SessionConfig struct {
-	PSK    string
-	Cipher string
-	MTU    int
+	PSK       string
+	Cipher    string
+	MTU       int
+	Keepalive time.Duration
 }
 
 // peerKey is the single logical peer identity on both ends' QueuePacketConn. The tunnel is
@@ -79,7 +96,10 @@ type sessionConn struct {
 	// init can't evict a legit client's staged session by overwriting it; an attacker needs maxStaged
 	// DISTINCT captured inits to push it out (was one). Written by onHandshake and read by recvPump,
 	// both on the single recvPump goroutine, so it needs no lock.
-	staged    []stagedSession
+	staged []stagedSession
+	// lastRx is the unix-nano of the last authentic inbound frame (data, ping, or pong). The client's
+	// keepalive goroutine ages it against deadWindow to detect a dead/mismatched session and re-dial.
+	lastRx    atomic.Int64
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -146,14 +166,14 @@ func (sc *sessionConn) sendPump() {
 	}
 }
 
-// recvPump opens inbound data datagrams and feeds the plaintext to kcp-go. onHandshake handles a
-// late/duplicate handshake datagram (the server re-answers a retransmitted init; the client
-// ignores it). A datagram that fails to open is dropped in silence.
+// recvPump opens inbound datagrams and feeds data plaintext to kcp-go, answers keepalive pings, and
+// tracks liveness. onHandshake handles a late/duplicate handshake datagram (the server re-answers a
+// retransmitted init; the client ignores it). A datagram that fails to open is dropped in silence.
 func (sc *sessionConn) recvPump(inCh <-chan []byte, onHandshake func([]byte)) {
-	// liveProven flips true the first time a frame opens under the LIVE sealer — i.e. the live
-	// session is established / establishing. It gates promotion of a staged session: adopt-in-place
-	// while the armed session is still unproven (its client may have vanished), tear-down once it is
-	// established. recvPump-goroutine-local (onHandshake runs inline here too), so it needs no lock.
+	// liveProven flips true the first time a frame opens under the LIVE sealer — i.e. the live session
+	// is established / establishing. It gates promotion of a staged session: adopt-in-place while the
+	// armed session is still unproven (its client may have vanished), tear-down once it is established.
+	// recvPump-goroutine-local (onHandshake runs inline here too), so it needs no lock.
 	liveProven := false
 	for {
 		select {
@@ -174,31 +194,22 @@ func (sc *sessionConn) recvPump(inCh <-chan []byte, onHandshake func([]byte)) {
 			case kindData:
 				if _, _, pt, err := sc.sealer.Load().Open(d[1:], nil); err == nil {
 					liveProven = true // a real frame opened under the live session -> it is (being) established
+					sc.lastRx.Store(time.Now().UnixNano())
 					sc.qpc.QueueIncoming(pt, peerKey)
 					continue
 				}
-				// The live session couldn't open it. It may open under a session STAGED by a recent
-				// different-ephemeral init (server only). A frame that actually opens under a staged
-				// candidate proves a real, live new client — a replayed init an attacker can never
-				// produce such a frame for never reaches here.
-				for i := range sc.staged {
-					if _, _, pt, perr := sc.staged[i].sealer.Open(d[1:], nil); perr == nil {
-						if !liveProven {
-							// The armed session never carried data — its client vanished before it
-							// could complete KCP. Adopt the proven new client IN PLACE: swap the sealer
-							// and feed this first frame (its KCP SYN) so the SAME AcceptKCP returns the
-							// new client — no teardown, no reconnect, no re-init. Recovery in one RTT.
-							sc.sealer.Store(sc.staged[i].sealer)
-							sc.staged = nil
-							liveProven = true
-							sc.qpc.QueueIncoming(pt, peerKey)
-						} else {
-							// The live session is already established; its KCP conv can't be retrofitted
-							// to a new client. Tear down so the carrier reconnects and re-accepts.
-							_ = sc.qpc.Close()
-						}
-						break
-					}
+				sc.tryStaged(d[1:], true, &liveProven) // a data frame's KCP SYN adopts a proven new client
+			case kindPing:
+				if _, _, _, err := sc.sealer.Load().Open(d[1:], nil); err == nil {
+					liveProven = true
+					sc.lastRx.Store(time.Now().UnixNano())
+					sc.sendKind(kindPong) // server: echo so the client's keepalive sees a live session
+					continue
+				}
+				sc.tryStaged(d[1:], false, &liveProven) // an idle re-dialed client's ping still forces the tear-down
+			case kindPong:
+				if _, _, _, err := sc.sealer.Load().Open(d[1:], nil); err == nil {
+					sc.lastRx.Store(time.Now().UnixNano()) // client: our keepalive was answered -> session live
 				}
 			case kindHandshake:
 				if onHandshake != nil {
@@ -207,6 +218,82 @@ func (sc *sessionConn) recvPump(inCh <-chan []byte, onHandshake func([]byte)) {
 			}
 		}
 	}
+}
+
+// tryStaged handles a frame the live session couldn't open by trying each staged candidate (server
+// only; the set is empty on the client). The first candidate that opens proves a real, live new client
+// — a replayed init an attacker captured can never produce such a frame. If the live session has never
+// carried data (its client vanished) AND this is a data frame, adopt the new client IN PLACE and feed
+// its KCP SYN so the SAME AcceptKCP returns it; once the live session is established, tear down instead
+// so the carrier reconnects (an established conv-0 KCP session can't be retrofitted). A proving PING
+// pre-establishment has no KCP frame to feed, so it just waits for the client's first data frame.
+func (sc *sessionConn) tryStaged(payload []byte, isData bool, liveProven *bool) {
+	for i := range sc.staged {
+		_, _, pt, perr := sc.staged[i].sealer.Open(payload, nil)
+		if perr != nil {
+			continue
+		}
+		switch {
+		case *liveProven:
+			_ = sc.qpc.Close() // established: tear down -> carrier reconnects and re-accepts the new client
+		case isData:
+			sc.sealer.Store(sc.staged[i].sealer)
+			sc.staged = nil
+			*liveProven = true
+			sc.lastRx.Store(time.Now().UnixNano())
+			sc.qpc.QueueIncoming(pt, peerKey)
+		}
+		return
+	}
+}
+
+// sendKind ships a sealed zero-length control frame (a ping or pong) over the transport.
+func (sc *sessionConn) sendKind(kind byte) {
+	s := sc.sealer.Load()
+	if s == nil {
+		return
+	}
+	sealed, err := s.Seal(nil, nil)
+	if err != nil {
+		return
+	}
+	_ = sc.t.Send(append([]byte{kind}, sealed...))
+}
+
+// keepalive (client only) sends a sealed ping every interval and re-dials — by Closing the session so
+// the carrier's Read errors — if nothing authentic has arrived for deadWindow. This is what detects a
+// server that restarted or a session the server tore down: the mismatched server can't produce a valid
+// pong, so lastRx ages out and the client reconnects with a fresh init. interval/deadWindow are
+// resolved by the caller so this goroutine never reads the package tunables (keeps it data-race free).
+func (sc *sessionConn) keepalive(interval, deadWindow time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-sc.done:
+			return
+		case <-t.C:
+			sc.sendKind(kindPing)
+			if last := sc.lastRx.Load(); last != 0 && time.Since(time.Unix(0, last)) > deadWindow {
+				_ = sc.Close() // idempotent; unblocks the carrier read -> reconnect with a fresh init
+				return
+			}
+		}
+	}
+}
+
+// resolveKeepalive turns the configured interval into (interval, deadWindow), applying the defaults and
+// the DNS-carrier floor. Called synchronously in DialSession so the keepalive goroutine holds only
+// local copies (no shared read of the package tunables).
+func resolveKeepalive(interval time.Duration) (time.Duration, time.Duration) {
+	if interval <= 0 {
+		interval = defaultKeepalive
+	}
+	dw := time.Duration(keepaliveDeadMult) * interval
+	if dw < keepaliveDeadFloor {
+		dw = keepaliveDeadFloor
+	}
+	return interval, dw
 }
 
 // DialSession (client) runs the X25519 handshake over t (retransmitting the init until the
@@ -275,8 +362,11 @@ handshake:
 	tuneSession(conn, cfg.MTU)
 	sc := &sessionConn{UDPSession: conn, qpc: qpc, t: t, done: done}
 	sc.sealer.Store(sealer) // before the pumps start: sendPump's first Seal must not Load a nil sealer
+	sc.lastRx.Store(time.Now().UnixNano())
+	kaInterval, kaDeadWindow := resolveKeepalive(cfg.Keepalive)
 	go sc.sendPump()
-	go sc.recvPump(inCh, nil) // client ignores any late handshake datagrams
+	go sc.recvPump(inCh, nil)                 // client ignores any late handshake datagrams
+	go sc.keepalive(kaInterval, kaDeadWindow) // detect a dead/mismatched server and re-dial (client only)
 	return sc, nil
 }
 
@@ -330,6 +420,7 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 	qpc := NewQueuePacketConn(peerKey)
 	sc := &sessionConn{qpc: qpc, t: t, done: done}
 	sc.sealer.Store(sealer) // before the pumps start (below): sendPump's first Seal must not Load nil
+	sc.lastRx.Store(time.Now().UnixNano())
 	// Re-answer a retransmit of the SAME init (a lost response self-heals). A DIFFERENT ephemeral
 	// might mean the previous client is gone and a new one is dialing (restart) — but it might also
 	// be a REPLAYED old init an attacker captured on-path (it still verifies the PSK MAC), so tearing

@@ -43,7 +43,7 @@ type DNS struct {
 	closeOnce sync.Once
 }
 
-func newDNS(dev *tun.Device, isClient bool, addr string, resolvers []string, zone, psk, cipher string) (*DNS, error) {
+func newDNS(dev *tun.Device, isClient bool, addr string, resolvers []string, zone, psk, cipher string, keepalive time.Duration) (*DNS, error) {
 	codec, err := dnstun.NewCodec(zone)
 	if err != nil {
 		return nil, err
@@ -54,7 +54,7 @@ func newDNS(dev *tun.Device, isClient bool, addr string, resolvers []string, zon
 	}
 	return &DNS{
 		dev: dev, isClient: isClient, zone: zone, addr: addr, resolvers: resolvers,
-		cfg:     dnstun.SessionConfig{PSK: psk, Cipher: cipher, MTU: mtu},
+		cfg:     dnstun.SessionConfig{PSK: psk, Cipher: cipher, MTU: mtu, Keepalive: keepalive},
 		closeCh: make(chan struct{}),
 	}, nil
 }
@@ -62,14 +62,14 @@ func newDNS(dev *tun.Device, isClient bool, addr string, resolvers []string, zon
 // DialDNS (client) tunnels through resolvers (recursive resolvers, each "host" or "host:port",
 // typically domestic resolvers on :53) for the delegated zone. Queries rotate across them so heavy
 // loss or filtering on one resolver is covered by the others.
-func DialDNS(dev *tun.Device, resolvers []string, zone, psk, cipher string) (*DNS, error) {
-	return newDNS(dev, true, "", resolvers, zone, psk, cipher)
+func DialDNS(dev *tun.Device, resolvers []string, zone, psk, cipher string, keepalive time.Duration) (*DNS, error) {
+	return newDNS(dev, true, "", resolvers, zone, psk, cipher, keepalive)
 }
 
 // ListenDNS (server) is the authoritative responder for the delegated zone, bound to listenAddr
-// (e.g. ":53").
+// (e.g. ":53"). The server never re-dials, so it takes no keepalive.
 func ListenDNS(dev *tun.Device, listenAddr, zone, psk, cipher string) (*DNS, error) {
-	return newDNS(dev, false, listenAddr, nil, zone, psk, cipher)
+	return newDNS(dev, false, listenAddr, nil, zone, psk, cipher, 0)
 }
 
 // Run drives the carrier: one long-lived tun→net loop feeds whatever session is live, while the
