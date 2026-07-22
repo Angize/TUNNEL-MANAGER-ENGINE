@@ -308,6 +308,7 @@ type TCP struct {
 	pool   *wsPool       // client: rotating edge pool (nil = single fixed edge above)
 	rotate time.Duration // client: proactive pool-rotation interval (0 = failover-only)
 	st     *coreStatus   // client + single-edge ws/xhttp: self-heal event ring -> status file (nil = off / pool / server)
+	stTag  string        // carrier label prefix ("tcp"/"cover"/"ws"/"xhttp") for setActive on a direct-pool rotation; set alongside st
 	lastRx atomic.Int64  // client: unix-nano of the last authenticated INBOUND frame — feeds the status-file heartbeat (v2.48.3). Seeded once in Run() and advanced ONLY by readLoop; never stamp it for a frame we sent, or a carrier that reconnects forever behind a CDN reads "alive" while nothing flows (v2.48.5)
 
 	// pp is the DESTINATION rotation pool for the direct TCP carriers (plain tcp / tcp+cover): the
@@ -520,6 +521,7 @@ func (b *TCP) SetStatusPath(path string) {
 		carrier = "cover"
 	}
 	b.st = newCoreStatus(path, carrier+" · "+b.addr)
+	b.stTag = carrier // reused by setActive when a direct dest pool rotates the active endpoint
 }
 
 // dialer returns a net.Dialer that, when a source IP is pinned, binds the outbound socket to
@@ -1483,10 +1485,12 @@ func (b *TCP) dialLoop() {
 			return // an operator pin freezes failover: current()/sourceIP() force the pinned endpoint
 		}
 		if b.pp != nil {
-			b.pp.fail()
-			// Surface the destination rotation in the panel event ring, like the datagram carriers. A
-			// dest burn drops the session, so the reconnect pairs this down(). nil-safe (ws-pool/server).
-			b.st.down("peer-rotate", "ip:"+b.pp.current())
+			addr, _ := b.pp.fail()
+			// Surface the destination rotation in the panel event ring, like the datagram carriers, and
+			// update the active endpoint. A dest burn drops the session, so the reconnect pairs this
+			// down(). nil-safe (ws-pool/server).
+			b.st.setActive(b.stTag + " · " + addr)
+			b.st.down("peer-rotate", "ip:"+addr)
 			if destRot++; b.sp != nil && b.pp.size() > 0 && destRot >= b.pp.size() {
 				b.rotateSourceTCP(false)
 				destRot = 0
@@ -1497,11 +1501,18 @@ func (b *TCP) dialLoop() {
 	}
 	succeedBoth := func() {
 		destRot = 0
+		// succeeded() returns the recovered address only on a real heal transition (it cleared a
+		// burn/suspect), else "" — so emit a discrete heal event exactly once per recovery, matching the
+		// datagram carriers' event("heal","peer-retest")/("src-retest"). nil-safe (ws-pool/server).
 		if b.pp != nil {
-			b.pp.succeeded()
+			if a := b.pp.succeeded(); a != "" {
+				b.st.event("heal", "peer-retest", "ip:"+a)
+			}
 		}
 		if b.sp != nil {
-			b.sp.succeeded()
+			if a := b.sp.succeeded(); a != "" {
+				b.st.event("heal", "src-retest", "ip:"+a)
+			}
 		}
 	}
 	for {
@@ -1623,8 +1634,14 @@ func (b *TCP) dialLoop() {
 				}
 				moved := false
 				if b.pp != nil {
-					if _, m := b.pp.rotateOnce(); m {
+					if addr, m := b.pp.rotateOnce(); m {
 						moved = true
+						// A proactive destination rotation is otherwise silent (rotateOnce only refreshes the
+						// pool-state file). Surface it in the panel event ring and update the active endpoint,
+						// mirroring rotatePeerUDP which emits peer-rotate on the proactive path too. down() arms
+						// the "up" the re-dial's reconnected() pairs. nil-safe on a ws-pool/server (b.st==nil).
+						b.st.setActive(b.stTag + " · " + addr)
+						b.st.down("peer-rotate", "ip:"+addr)
 					}
 				}
 				if b.rotateSourceTCP(true) { // advances the source pool; re-dial applies the new LocalAddr
