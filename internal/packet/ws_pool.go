@@ -592,18 +592,7 @@ func (p *wsPool) retestResult(kind, key string, success bool) {
 // backoff list; running off its end (fails == len) drops it to dead. A dead entry stays dead
 // on the slow interval. Caller holds the lock.
 func (p *wsPool) failRetestLocked(r *healthRec) {
-	now := p.now()
-	if r.state == stateDead {
-		r.nextRetest = now + deadRetest
-		return
-	}
-	r.fails++
-	if r.fails >= len(suspectBackoff) {
-		r.state = stateDead
-		r.nextRetest = now + deadRetest
-		return
-	}
-	r.nextRetest = now + suspectBackoff[r.fails]
+	retestBackoff(r, p.now())
 }
 
 // retestSpec is one entry the scheduler should probe now, paired with a partner on the OTHER

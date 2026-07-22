@@ -204,9 +204,10 @@ func skip(pkt []byte, n int) ([]byte, bool) {
 	return pkt[n:], true
 }
 
-// onesComplementSum computes the 16-bit one's-complement checksum (RFC 1071)
-// used by ICMP over the buffer as-is (the checksum field must be zero on entry).
-func onesComplementSum(b []byte) uint16 {
+// sumBytes accumulates the 16-bit big-endian words of b into a running RFC-1071 sum, padding a final
+// odd byte with a zero low byte. Fold + complement with foldComplement to finish. Splitting the sum
+// out lets a caller add several buffers' partial sums without concatenating them (see l4Checksum).
+func sumBytes(b []byte) uint32 {
 	var sum uint32
 	for i := 0; i+1 < len(b); i += 2 {
 		sum += uint32(b[i])<<8 | uint32(b[i+1])
@@ -214,25 +215,37 @@ func onesComplementSum(b []byte) uint16 {
 	if len(b)%2 == 1 {
 		sum += uint32(b[len(b)-1]) << 8
 	}
+	return sum
+}
+
+// foldComplement folds a running RFC-1071 sum's carries into 16 bits and returns its one's-complement.
+func foldComplement(sum uint32) uint16 {
 	for sum>>16 != 0 {
 		sum = (sum & 0xffff) + (sum >> 16)
 	}
 	return ^uint16(sum)
 }
 
+// onesComplementSum computes the 16-bit one's-complement checksum (RFC 1071)
+// used by ICMP over the buffer as-is (the checksum field must be zero on entry).
+func onesComplementSum(b []byte) uint16 {
+	return foldComplement(sumBytes(b))
+}
+
 // l4Checksum computes the TCP/UDP checksum over the IPv4 pseudo-header plus the
-// L4 segment (whose own checksum field must be zero on entry).
+// L4 segment (whose own checksum field must be zero on entry). The 12-byte pseudo-header lives on the
+// stack and is summed together with the segment IN PLACE — no per-packet heap buffer or copy. This is
+// exact because the pseudo-header is an even length, so sumBytes(ph)+sumBytes(l4) == sumBytes(ph++l4).
 func l4Checksum(src, dst net.IP, proto int, l4 []byte) uint16 {
 	s, d := src.To4(), dst.To4()
-	pseudo := make([]byte, 12+len(l4))
+	var ph [12]byte
 	if s != nil {
-		copy(pseudo[0:4], s)
+		copy(ph[0:4], s)
 	}
 	if d != nil {
-		copy(pseudo[4:8], d)
+		copy(ph[4:8], d)
 	}
-	pseudo[9] = byte(proto)
-	binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(l4)))
-	copy(pseudo[12:], l4)
-	return onesComplementSum(pseudo)
+	ph[9] = byte(proto)
+	binary.BigEndian.PutUint16(ph[10:12], uint16(len(l4)))
+	return foldComplement(sumBytes(ph[:]) + sumBytes(l4))
 }

@@ -325,27 +325,39 @@ func (b *UDP) adoptSourceUDP() {
 
 // ProbeAllNow retests every suspect/dead endpoint on both pools at once (the panel "probe now" control,
 // delivered as SIGHUP). No-op unless pooled.
-func (b *UDP) ProbeAllNow() {
-	if b.pp != nil {
-		b.pp.probeAllNow()
+// probeAllPools pulls every suspect/dead endpoint's retest forward on both of a carrier's pools (the
+// "probe now" control). Shared by udp/raw/flux, which differ only by which struct fields hold the pools.
+func probeAllPools(pp, sp *PeerPool) {
+	if pp != nil {
+		pp.probeAllNow()
 	}
-	if b.sp != nil {
-		b.sp.probeAllNow()
+	if sp != nil {
+		sp.probeAllNow()
 	}
 }
 
-// pinPollLoop polls the pools' cmd files on a 1s ticker and applies any operator pin. Runs until Close.
-func (b *UDP) pinPollLoop(rc *rotationController) {
+// runPinPoll is the 1s ticker that applies operator pins for a datagram carrier: identical across
+// udp/raw/flux, which inject their own close channel and adopt-peer/adopt-source callbacks.
+func runPinPoll(rc *rotationController, closeCh <-chan struct{}, adoptPeer, adoptSource func()) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
 		select {
-		case <-b.closeCh:
+		case <-closeCh:
 			return
 		case <-t.C:
-			rc.pollPins(b.adoptPeerUDP, b.adoptSourceUDP)
+			rc.pollPins(adoptPeer, adoptSource)
 		}
 	}
+}
+
+func (b *UDP) ProbeAllNow() {
+	probeAllPools(b.pp, b.sp)
+}
+
+// pinPollLoop polls the pools' cmd files on a 1s ticker and applies any operator pin. Runs until Close.
+func (b *UDP) pinPollLoop(rc *rotationController) {
+	runPinPoll(rc, b.closeCh, b.adoptPeerUDP, b.adoptSourceUDP)
 }
 
 // SetDeadAfter (client) tightens the session-stale deadline to the per-tunnel dead_after_secs so the
@@ -673,16 +685,23 @@ func (b *UDP) deliver(pkt []byte, addr *net.UDPAddr) {
 // openWith tries to open one datagram under a specific session sealer, returning the
 // authenticated frame. It touches no session/replay state, so a frame can safely be tried
 // against both the live and a pending session.
-func (b *UDP) openWith(s Sealer, pkt []byte) (typ byte, session, seq uint64, payload []byte, oerr error) {
-	if b.obfs {
-		return obfsOpen(s, pkt)
+// openFrame is the shared receive-side frame opener for the datagram carriers (udp/raw/flux): obfs
+// path when obfs is on, else parse the magic/type header and authenticate the type byte via the
+// sealer. The three carriers' openWith methods differ only by the obfs field, so they delegate here.
+func openFrame(s Sealer, data []byte, obfs bool) (typ byte, session, seq uint64, payload []byte, oerr error) {
+	if obfs {
+		return obfsOpen(s, data)
 	}
-	if len(pkt) >= 2 && pkt[0] == magic {
-		typ = pkt[1]
-		session, seq, payload, oerr = s.Open(pkt[2:], []byte{typ})
+	if len(data) >= 2 && data[0] == magic {
+		typ = data[1]
+		session, seq, payload, oerr = s.Open(data[2:], []byte{typ})
 		return
 	}
 	return 0, 0, 0, nil, errBadFrame
+}
+
+func (b *UDP) openWith(s Sealer, pkt []byte) (typ byte, session, seq uint64, payload []byte, oerr error) {
+	return openFrame(s, pkt, b.obfs)
 }
 
 // handleCrypto is the crypto-on receive path: try the frame as data under the current

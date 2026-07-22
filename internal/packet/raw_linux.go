@@ -778,15 +778,7 @@ func (r *Raw) deliver(body []byte, addr *net.IPAddr) {
 // openWith tries to open one datagram under a specific session sealer, touching no
 // session/replay state so a frame can be tried against both the live and a pending session.
 func (r *Raw) openWith(s Sealer, body []byte) (typ byte, session, seq uint64, payload []byte, oerr error) {
-	if r.obfs {
-		return obfsOpen(s, body)
-	}
-	if len(body) >= 2 && body[0] == magic {
-		typ = body[1]
-		session, seq, payload, oerr = s.Open(body[2:], []byte{typ})
-		return
-	}
-	return 0, 0, 0, nil, errBadFrame
+	return openFrame(s, body, r.obfs)
 }
 
 func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
@@ -1102,26 +1094,12 @@ func (r *Raw) adoptSourceRaw() {
 // ProbeAllNow retests every suspect/dead endpoint on both pools at once (the panel "probe now" control,
 // delivered as SIGHUP). No-op unless pooled.
 func (r *Raw) ProbeAllNow() {
-	if r.pp != nil {
-		r.pp.probeAllNow()
-	}
-	if r.sp != nil {
-		r.sp.probeAllNow()
-	}
+	probeAllPools(r.pp, r.sp)
 }
 
 // pinPollLoop polls the pools' cmd files on a 1s ticker and applies any operator pin. Runs until Close.
 func (r *Raw) pinPollLoop(rc *rotationController) {
-	t := time.NewTicker(time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-r.closeCh:
-			return
-		case <-t.C:
-			rc.pollPins(r.adoptPeerRaw, r.adoptSourceRaw)
-		}
-	}
+	runPinPoll(rc, r.closeCh, r.adoptPeerRaw, r.adoptSourceRaw)
 }
 
 func (r *Raw) clientLoop() {

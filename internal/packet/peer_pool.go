@@ -162,8 +162,9 @@ func (p *PeerPool) burnLocked(addr string) {
 // failRetestLocked reschedules a tracked endpoint after a failed (re)try: a suspect walks the backoff
 // list; running off its end drops it to dead; a dead endpoint stays dead on the slow interval. Same
 // schedule the ws edge pool uses. Caller holds the lock.
-func (p *PeerPool) failRetestLocked(r *healthRec) {
-	now := p.now()
+// retestBackoff walks a failing endpoint's suspect->dead backoff FSM: healthy/suspect steps down the
+// backoff schedule, dead resets to the slow retest. Shared verbatim by PeerPool and wsPool.
+func retestBackoff(r *healthRec, now int64) {
 	if r.state == stateDead {
 		r.nextRetest = now + deadRetest
 		return
@@ -175,6 +176,10 @@ func (p *PeerPool) failRetestLocked(r *healthRec) {
 		return
 	}
 	r.nextRetest = now + suspectBackoff[r.fails]
+}
+
+func (p *PeerPool) failRetestLocked(r *healthRec) {
+	retestBackoff(r, p.now())
 }
 
 // advanceFailLocked moves cur OFF the just-failed endpoint to the best next one to try: a healthy

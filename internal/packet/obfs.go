@@ -80,30 +80,24 @@ func randUint(max int) (int, error) {
 	}
 }
 
-func randPad(max int) ([]byte, error) {
-	n, err := randUint(max)
-	if err != nil || n == 0 {
-		return nil, err
-	}
-	pad := make([]byte, n)
-	if _, err := io.ReadFull(rand.Reader, pad); err != nil {
-		return nil, err
-	}
-	return pad, nil
-}
-
 // obfsSeal packs [type][realLen][payload][random-pad] and AEAD-seals it. The
-// returned bytes carry no constant fields (the sealer prepends a random nonce).
+// returned bytes carry no constant fields (the sealer prepends a random nonce). The random pad is
+// written straight into the tail of the output buffer — no separate pad buffer + copy per packet;
+// its exact bytes are irrelevant (obfsOpen strips it by realLen), so only length + payload matter.
 func obfsSeal(s Sealer, typ byte, payload []byte, padMax int) ([]byte, error) {
-	pad, err := randPad(padMax)
+	n, err := randUint(padMax)
 	if err != nil {
 		return nil, err
 	}
-	inner := make([]byte, obfsInnerHdr+len(payload)+len(pad))
+	inner := make([]byte, obfsInnerHdr+len(payload)+n)
 	inner[0] = typ
 	binary.BigEndian.PutUint16(inner[1:3], uint16(len(payload)))
 	copy(inner[obfsInnerHdr:], payload)
-	copy(inner[obfsInnerHdr+len(payload):], pad)
+	if n > 0 {
+		if _, err := io.ReadFull(rand.Reader, inner[obfsInnerHdr+len(payload):]); err != nil {
+			return nil, err
+		}
+	}
 	return s.Seal(inner, nil) // type is folded into the sealed plaintext, no aad needed
 }
 

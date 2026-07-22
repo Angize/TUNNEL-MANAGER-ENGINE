@@ -239,3 +239,31 @@ func TestRawDecapRejectsShortCarrier(t *testing.T) {
 		t.Error("gre decap accepted an IPv4 packet too short for its GRE header")
 	}
 }
+
+// TestL4ChecksumSplitMatchesReference proves the in-place split l4Checksum (no per-packet pseudo-header
+// buffer) is byte-identical to the reference build-and-sum implementation across many lengths/contents.
+func TestL4ChecksumSplitMatchesReference(t *testing.T) {
+	ref := func(src, dst net.IP, proto int, l4 []byte) uint16 {
+		s, d := src.To4(), dst.To4()
+		pseudo := make([]byte, 12+len(l4))
+		copy(pseudo[0:4], s)
+		copy(pseudo[4:8], d)
+		pseudo[9] = byte(proto)
+		binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(l4)))
+		copy(pseudo[12:], l4)
+		return onesComplementSum(pseudo)
+	}
+	for i := 0; i < 2000; i++ {
+		l4 := make([]byte, i%73) // vary length: 0, odd, even
+		for j := range l4 {
+			l4[j] = byte(i*31 + j*17) // vary content
+		}
+		src := net.IPv4(byte(i), byte(i>>8), 1, 2)
+		dst := net.IPv4(3, 4, byte(i>>4), byte(i))
+		for _, proto := range []int{protoTCP, protoUDP} {
+			if got, want := l4Checksum(src, dst, proto, l4), ref(src, dst, proto, l4); got != want {
+				t.Fatalf("len=%d proto=%d got=%04x want=%04x", len(l4), proto, got, want)
+			}
+		}
+	}
+}
