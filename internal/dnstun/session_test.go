@@ -401,6 +401,62 @@ func TestServeSessionStagedSetResistsEviction(t *testing.T) {
 	}
 }
 
+// TestSessionKeepaliveReapsSilentPeer proves the client keepalive detects a peer that established but
+// then went silent (a restarted / mismatched server that can't produce a valid pong) and re-dials by
+// Closing the session so the carrier's Read errors — the only thing that recovers such a session, since
+// KCP's own dead-link never fires on a link that carries no data.
+func TestSessionKeepaliveReapsSilentPeer(t *testing.T) {
+	origKA, origFloor := defaultKeepalive, keepaliveDeadFloor
+	defaultKeepalive, keepaliveDeadFloor = 50*time.Millisecond, 250*time.Millisecond
+	defer func() { defaultKeepalive, keepaliveDeadFloor = origKA, origFloor }()
+
+	cliT, srvT := newPipePair(0)
+	cfg := SessionConfig{PSK: "reap-me", Cipher: "chacha20"} // Keepalive 0 -> defaultKeepalive
+
+	// Minimal server: answer the init once so the client establishes, then go silent — never pong.
+	go func() {
+		for {
+			d, err := srvT.Recv()
+			if err != nil {
+				return
+			}
+			if len(d) >= 1 && d[0] == kindHandshake {
+				e, perr := crypto.ParseInit(cfg.PSK, d[1:])
+				if perr != nil {
+					continue
+				}
+				sr, gerr := crypto.GenerateEphemeral()
+				if gerr != nil {
+					continue
+				}
+				_ = srvT.Send(append([]byte{kindHandshake}, crypto.RespMsg(cfg.PSK, e, sr)...))
+			}
+			// Everything else (the client's pings, KCP SYNs) is drained and ignored: no pong ever.
+		}
+	}()
+
+	cli, err := DialSession(cliT, cfg)
+	if err != nil {
+		t.Fatalf("DialSession: %v", err)
+	}
+	defer cli.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 64)
+		_, e := cli.Read(buf)
+		done <- e
+	}()
+	select {
+	case e := <-done:
+		if e == nil {
+			t.Fatal("client Read returned nil; expected the keepalive to reap the silent-peer session")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("keepalive did not reap the silent-peer session within 2s (deadWindow was 250ms)")
+	}
+}
+
 // TestSessionCloseIsIdempotent guards the teardown path (Close is called from multiple defers).
 func TestSessionCloseIsIdempotent(t *testing.T) {
 	cliT, srvT := newPipePair(0)
