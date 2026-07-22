@@ -9,7 +9,7 @@
 // of the init bytes closes that — after each distinct init is seen once, its
 // replays are served from the cache.
 //
-// Like pend/rp/lastRx, an initCache is driven ONLY from a carrier's single receive
+// Like staged/rp/lastRx, an initCache is driven ONLY from a carrier's single receive
 // goroutine (tryHandshake runs only on the receive path), so it needs no locking.
 package packet
 

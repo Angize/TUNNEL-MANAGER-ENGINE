@@ -55,6 +55,32 @@ type Sealer interface {
 // sealerBox lets a *crypto.Sealer live in an atomic.Pointer.
 type sealerBox struct{ s Sealer }
 
+// stagedBox is one server-side staged (pending) session: its sealer plus its own replay guard,
+// adopted verbatim on promotion. A BOUNDED SET of these (maxStaged) replaces a single pending slot
+// so a replayed init can no longer evict a legit client's staged session by overwriting one slot —
+// promotion is still gated on a frame that actually opens under a candidate (which a replay can't
+// produce), and an attacker now needs maxStaged DISTINCT captured inits to push a legit candidate
+// out (was one). Shared by the datagram carriers (udp/raw/flux); touched only on the single receive
+// goroutine, so it needs no lock.
+type stagedBox struct {
+	box *sealerBox
+	rp  replayGuard
+}
+
+// maxStaged bounds the staged-candidate set (aligned with the handshake-cache size). Small: the set
+// only ever holds one entry on the normal path, and every non-live frame trial-opens against each
+// entry, so the bound also caps that per-packet work.
+const maxStaged = 8
+
+// stageSession appends a freshly derived session to the bounded staged set, evicting the OLDEST first
+// (FIFO) when full so the just-staged (newest, legit) candidate always survives.
+func stageSession(set []*stagedBox, s Sealer) []*stagedBox {
+	if len(set) >= maxStaged {
+		set = set[1:]
+	}
+	return append(set, &stagedBox{box: &sealerBox{s: s}})
+}
+
 // UDP carries L3 packets between a TUN device and a UDP peer.
 type UDP struct {
 	// conn is the live socket. It is an atomic pointer (not a plain *net.UDPConn) because a source-IP
@@ -87,8 +113,7 @@ type UDP struct {
 	peer    atomic.Pointer[net.UDPAddr]      // current known peer (server learns it)
 	session atomic.Pointer[sealerBox]        // negotiated session sealer (nil until handshake / clear mode)
 	rp      replayGuard                      // driven only by the single receive goroutine (netToTun on the client; serverReadLoop under rxMu on the server)
-	pend    *sealerBox                       // server: session staged by a recent init, promoted only once a frame opens under it
-	pendRp  replayGuard                      // replay guard for the pending session (adopted on promotion)
+	staged  []*stagedBox                     // server: bounded set of sessions staged by recent inits, each promoted only once a frame opens under it
 	hsCache initCache                        // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
 	ci      atomic.Pointer[crypto.Ephemeral] // client's current handshake ephemeral
 	lastRx  atomic.Int64                     // unix-nano of the last authenticated frame (client staleness)
@@ -674,15 +699,16 @@ func (b *UDP) handleCrypto(pkt []byte, addr *net.UDPAddr) {
 			return
 		}
 	}
-	// A frame that did not open under the live session may open under a PENDING session
-	// staged by a recent init. Only a frame that actually opens under it promotes it (and
-	// rebinds the peer), so a replayed init — which stages a session an attacker cannot
-	// produce a frame for — never tears down the live session or resets its replay window.
-	if b.pend != nil {
-		if typ, session, seq, payload, oerr := b.openWith(b.pend.s, pkt); oerr == nil && b.pendRp.ok(session, seq) {
-			b.session.Store(b.pend)
-			b.rp = b.pendRp
-			b.pend = nil
+	// A frame that did not open under the live session may open under a session STAGED by a recent
+	// init. Only a frame that actually opens under a candidate promotes it (and rebinds the peer), so
+	// a replayed init — which stages a session an attacker cannot produce a frame for — never tears
+	// down the live session or resets its replay window. The live session was tried first above, so an
+	// established tunnel never reaches this loop; on the normal path the set holds one candidate.
+	for _, st := range b.staged {
+		if typ, session, seq, payload, oerr := b.openWith(st.box.s, pkt); oerr == nil && st.rp.ok(session, seq) {
+			b.session.Store(st.box)
+			b.rp = st.rp
+			b.staged = nil
 			b.markRx() // a pending session promoted -> genuine inbound
 			b.learnPeer(addr)
 			b.dispatch(typ, payload, addr)
@@ -723,11 +749,11 @@ func (b *UDP) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 	// would otherwise force a fresh ECDH+HKDF (GenerateEphemeral+SessionSealer) per packet.
 	// If this init matches one we recently answered (while a pending session is current),
 	// just re-send the response we already computed and return before that expensive
-	// crypto. The handshake outcome is unchanged (pend/promote-on-open is untouched); a
+	// crypto. The handshake outcome is unchanged (staged/promote-on-open is untouched); a
 	// genuinely new init falls through to the full handshake below. The cache is a small
 	// LRU (not a single entry) so alternating two captured inits cannot bust it. It is
-	// touched only on this single receive goroutine (like pend/rp), so no locking is needed.
-	if b.pend != nil {
+	// touched only on this single receive goroutine (like staged), so no locking is needed.
+	if len(b.staged) > 0 {
 		if resp, ok := b.hsCache.get(pkt); ok {
 			b.writeCtrl(resp, addr)
 			return
@@ -749,11 +775,10 @@ func (b *UDP) tryHandshake(pkt []byte, addr *net.UDPAddr) {
 	// its replay window stay intact until a frame actually opens under these new keys (see
 	// handleCrypto), so a replayed init cannot wedge the tunnel by resetting them. Rebinding
 	// the peer is likewise deferred to that first opening frame.
-	b.pend = &sealerBox{s: s}
-	b.pendRp = replayGuard{}
+	b.staged = stageSession(b.staged, s)
 	if msg2 := crypto.RespMsg(b.psk, eInit, sr); msg2 != nil {
-		// Cache this init and its response so a replay of the same init (while pend is
-		// still current) is served without recomputing the crypto above. put copies pkt
+		// Cache this init and its response so a replay of the same init (while a staged session
+		// is still current) is served without recomputing the crypto above. put copies pkt
 		// (it aliases the receive buffer); msg2 is a fresh slice, safe to keep.
 		b.hsCache.put(pkt, msg2)
 		b.writeCtrl(msg2, addr)

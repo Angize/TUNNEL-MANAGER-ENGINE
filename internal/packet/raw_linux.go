@@ -71,9 +71,8 @@ type Raw struct {
 	srcAllow map[string]struct{}        // server pool: the client's known source IPs (4-byte keys) it may rotate across; set once before Run, then read-only
 	session  atomic.Pointer[sealerBox]
 	rp       replayGuard
-	pend     *sealerBox // server: session staged by a recent init, promoted only once a frame opens under it
-	pendRp   replayGuard
-	hsCache  initCache // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
+	staged   []*stagedBox // server: bounded set of sessions staged by recent inits, each promoted only once a frame opens under it
+	hsCache  initCache    // server: recent inits -> responses (compute-DoS replay cache; receive-goroutine-only)
 	ci       atomic.Pointer[crypto.Ephemeral]
 	seq      atomic.Uint32
 	// Synthetic-TCP-profile state (tcp profile only; ignored by the others): a per-session
@@ -799,14 +798,15 @@ func (r *Raw) handleCrypto(body []byte, addr *net.IPAddr) {
 			return
 		}
 	}
-	// A frame that did not open under the live session may open under a PENDING session
-	// staged by a recent init; promote it only when a frame actually opens under it, so a
-	// replayed init cannot tear down the live session or its replay window.
-	if r.pend != nil {
-		if typ, session, seq, payload, oerr := r.openWith(r.pend.s, body); oerr == nil && r.pendRp.ok(session, seq) {
-			r.session.Store(r.pend)
-			r.rp = r.pendRp
-			r.pend = nil
+	// A frame that did not open under the live session may open under a session STAGED by a recent
+	// init; promote a candidate only when a frame actually opens under it, so a replayed init cannot
+	// tear down the live session or its replay window. The live session was tried first above, so an
+	// established tunnel never reaches this loop; on the normal path the set holds one candidate.
+	for _, st := range r.staged {
+		if typ, session, seq, payload, oerr := r.openWith(st.box.s, body); oerr == nil && st.rp.ok(session, seq) {
+			r.session.Store(st.box)
+			r.rp = st.rp
+			r.staged = nil
 			r.markRx() // a pending session promoted -> genuine inbound
 			r.learnPeer(addr)
 			r.dispatch(typ, payload, addr)
@@ -867,11 +867,11 @@ func (r *Raw) tryHandshake(body []byte, addr *net.IPAddr) {
 	// would otherwise force a fresh ECDH+HKDF (GenerateEphemeral+SessionSealer) per packet.
 	// If this init matches one we recently answered (while a pending session is current),
 	// re-send the already-computed response and return before that expensive crypto. The
-	// handshake outcome is unchanged (pend/promote-on-open is untouched); a genuinely new
+	// handshake outcome is unchanged (staged/promote-on-open is untouched); a genuinely new
 	// init falls through to the full handshake below. The cache is a small LRU (not a
 	// single entry) so alternating two captured inits cannot bust it. It is touched only on
-	// this single receive goroutine (like pend/rp), so no locking is needed.
-	if r.pend != nil {
+	// this single receive goroutine (like staged), so no locking is needed.
+	if len(r.staged) > 0 {
 		if resp, ok := r.hsCache.get(body); ok {
 			r.writeCtrl(resp, r.replyAddr(addr))
 			return
@@ -892,12 +892,11 @@ func (r *Raw) tryHandshake(body []byte, addr *net.IPAddr) {
 	// Stage the new session as PENDING; the live session and its replay window survive until
 	// a frame actually opens under these new keys (see handleCrypto), so a replayed init
 	// cannot wedge the tunnel. Peer rebinding is likewise deferred to that first frame.
-	r.pend = &sealerBox{s: s}
-	r.pendRp = replayGuard{}
+	r.staged = stageSession(r.staged, s)
 	r.learnLocalIP(addr.IP)
 	if msg2 := crypto.RespMsg(r.psk, eInit, sr); msg2 != nil {
-		// Cache this init and its response so a replay of the same init (while pend is
-		// still current) is served without recomputing the crypto above. put copies body
+		// Cache this init and its response so a replay of the same init (while a staged session
+		// is still current) is served without recomputing the crypto above. put copies body
 		// (it aliases the receive buffer); msg2 is a fresh slice, safe to keep.
 		r.hsCache.put(body, msg2)
 		r.writeCtrl(msg2, r.replyAddr(addr))

@@ -335,6 +335,72 @@ func TestServeSessionUnblocksOnTransportClose(t *testing.T) {
 	}
 }
 
+// TestServeSessionStagedSetResistsEviction proves the bounded staged-candidate set: an on-path
+// attacker injecting several DISTINCT captured inits (each a bare init with no follow-up data — a
+// replay) cannot evict a legit client's staged session, so that client is still adopted and its data
+// flows. With the old single pend slot, ONE attacker init would have evicted the legit candidate.
+func TestServeSessionStagedSetResistsEviction(t *testing.T) {
+	cliT, srvT := newPipePair(0)
+	cfg := SessionConfig{PSK: "no-evict", Cipher: "chacha20"}
+
+	srvCh := make(chan net.Conn, 1)
+	srvErr := make(chan error, 1)
+	go func() {
+		c, err := ServeSession(srvT, cfg)
+		if err != nil {
+			srvErr <- err
+			return
+		}
+		srvCh <- c
+	}()
+
+	// Client 1 arms the server, then vanishes before completing KCP.
+	ci1, err := crypto.GenerateEphemeral()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cliT.Send(append([]byte{kindHandshake}, crypto.InitMsg(cfg.PSK, ci1)...))
+	time.Sleep(200 * time.Millisecond)
+
+	// The legit client fully dials (its init is staged as a candidate).
+	cli, err := DialSession(cliT, cfg)
+	if err != nil {
+		t.Fatalf("legit DialSession: %v", err)
+	}
+	defer cli.Close()
+
+	// The attacker floods maxStaged-1 further DISTINCT captured inits (bare, no data). Together with
+	// the legit candidate the set is exactly full, so FIFO keeps the legit (oldest-but-present) entry.
+	for i := 0; i < maxStaged-1; i++ {
+		atk, gerr := crypto.GenerateEphemeral()
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		_ = cliT.Send(append([]byte{kindHandshake}, crypto.InitMsg(cfg.PSK, atk)...))
+	}
+	time.Sleep(150 * time.Millisecond) // let the flood be staged before the legit client's data
+
+	payload := []byte("survived the eviction flood")
+	go func() { _, _ = cli.Write(payload) }()
+
+	select {
+	case err := <-srvErr:
+		t.Fatalf("ServeSession errored instead of adopting the legit client: %v", err)
+	case srv := <-srvCh:
+		defer srv.Close()
+		got := make([]byte, len(payload))
+		_ = srv.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadFull(srv, got); err != nil {
+			t.Fatalf("server read from the adopted client after the eviction flood: %v", err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("adopted-client data mismatch: got %q want %q", got, payload)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the legit client's staged candidate was evicted by the init flood (never adopted)")
+	}
+}
+
 // TestSessionCloseIsIdempotent guards the teardown path (Close is called from multiple defers).
 func TestSessionCloseIsIdempotent(t *testing.T) {
 	cliT, srvT := newPipePair(0)

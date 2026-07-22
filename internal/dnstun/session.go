@@ -71,16 +71,31 @@ type sessionConn struct {
 	// AcceptKCP returns the new client — no teardown, no reconnect. sendPump only Loads it. It is
 	// Stored once at construction (before the pumps start) and swapped only by recvPump.
 	sealer atomic.Pointer[crypto.Sealer]
-	// pend is a session staged by a recent different-ephemeral init (server only; nil otherwise).
-	// A data datagram that actually OPENS under it proves a real, live new client — a replayed init
-	// an attacker captured on-path never can — which then either ADOPTS it in place (while the armed
-	// session has never carried data, i.e. its client vanished) or, once the live session is
-	// established, TEARS DOWN so the carrier reconnects. Written by onHandshake and read by recvPump,
+	// staged is a BOUNDED set of sessions staged by recent different-ephemeral inits (server only).
+	// A data datagram that actually OPENS under a candidate proves a real, live new client — a
+	// replayed init an attacker captured on-path never can — which then either ADOPTS it in place
+	// (while the armed session has never carried data, i.e. its client vanished) or, once the live
+	// session is established, TEARS DOWN so the carrier reconnects. A SET (not one slot) so a replayed
+	// init can't evict a legit client's staged session by overwriting it; an attacker needs maxStaged
+	// DISTINCT captured inits to push it out (was one). Written by onHandshake and read by recvPump,
 	// both on the single recvPump goroutine, so it needs no lock.
-	pend      *crypto.Sealer
+	staged    []stagedSession
 	done      chan struct{}
 	closeOnce sync.Once
 }
+
+// stagedSession is one server-side staged candidate: the client's init ephemeral (so a retransmit of
+// the SAME init is re-answered from resp without re-deriving), its derived sealer, and that cached
+// handshake response.
+type stagedSession struct {
+	eInit  [32]byte
+	sealer *crypto.Sealer
+	resp   []byte
+}
+
+// maxStaged bounds the staged-candidate set. Small: on the normal path the set holds one entry, and
+// every non-live datagram trial-opens against each entry, so the bound also caps that per-packet work.
+const maxStaged = 8
 
 // Close tears down the whole session exactly once, unblocking every loop. UDPSession may be nil
 // on a server error path (AcceptKCP failed before it was set), so it is guarded. Closing t makes
@@ -163,18 +178,18 @@ func (sc *sessionConn) recvPump(inCh <-chan []byte, onHandshake func([]byte)) {
 					continue
 				}
 				// The live session couldn't open it. It may open under a session STAGED by a recent
-				// different-ephemeral init (server only). A frame that actually opens under the staged
-				// keys proves a real, live new client — a replayed init an attacker can never produce
-				// such a frame for never reaches here.
-				if sc.pend != nil {
-					if _, _, pt, perr := sc.pend.Open(d[1:], nil); perr == nil {
+				// different-ephemeral init (server only). A frame that actually opens under a staged
+				// candidate proves a real, live new client — a replayed init an attacker can never
+				// produce such a frame for never reaches here.
+				for i := range sc.staged {
+					if _, _, pt, perr := sc.staged[i].sealer.Open(d[1:], nil); perr == nil {
 						if !liveProven {
 							// The armed session never carried data — its client vanished before it
 							// could complete KCP. Adopt the proven new client IN PLACE: swap the sealer
 							// and feed this first frame (its KCP SYN) so the SAME AcceptKCP returns the
 							// new client — no teardown, no reconnect, no re-init. Recovery in one RTT.
-							sc.sealer.Store(sc.pend)
-							sc.pend = nil
+							sc.sealer.Store(sc.staged[i].sealer)
+							sc.staged = nil
 							liveProven = true
 							sc.qpc.QueueIncoming(pt, peerKey)
 						} else {
@@ -182,6 +197,7 @@ func (sc *sessionConn) recvPump(inCh <-chan []byte, onHandshake func([]byte)) {
 							// to a new client. Tear down so the carrier reconnects and re-accepts.
 							_ = sc.qpc.Close()
 						}
+						break
 					}
 				}
 			case kindHandshake:
@@ -320,27 +336,28 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 	// the live session down on sight is a remote DoS. Instead, mirror the datagram carriers'
 	// promote-on-open discipline as the single-session design allows: STAGE the new init as a pending
 	// session and answer it, but keep the live session running. Only a data datagram that actually
-	// opens under the staged keys (see recvPump) — which a replay can never produce — promotes it and
-	// tears the old session down so the carrier reconnects to the new client. A staged init that
-	// re-arrives is re-answered from the cached response without recomputing the (ECDH+KDF) crypto.
-	var (
-		pendInit [32]byte
-		pendResp []byte
-	)
+	// opens under a staged candidate (see recvPump) — which a replay can never produce — promotes it
+	// and tears the old session down so the carrier reconnects to the new client. Candidates live in a
+	// BOUNDED SET (not one slot), so a replayed init can't evict a legit client's staged session by
+	// overwriting it. A staged init that re-arrives is re-answered from its cached response without
+	// recomputing the (ECDH+KDF) crypto.
 	onHS := func(hs []byte) {
 		e, err := crypto.ParseInit(cfg.PSK, hs)
 		if err != nil {
-			return // unauthenticated/garbage init: never touch the live or staged session
+			return // unauthenticated/garbage init: never touch the live or staged sessions
 		}
 		if e == gotInit {
-			_ = t.Send(respDG) // retransmit of the CURRENT init: re-answer, self-heal
+			_ = t.Send(respDG) // retransmit of the CURRENT armed init: re-answer, self-heal
 			return
 		}
-		if sc.pend != nil && e == pendInit {
-			_ = t.Send(pendResp) // retransmit of the STAGED init: re-answer without re-deriving
-			return
+		for i := range sc.staged {
+			if sc.staged[i].eInit == e {
+				_ = t.Send(sc.staged[i].resp) // retransmit of a STAGED init: re-answer without re-deriving
+				return
+			}
 		}
-		// A different, PSK-authenticated init: stage (do not adopt) a candidate session and answer it.
+		// A new, PSK-authenticated init: derive + STAGE (do not adopt) a candidate session and answer
+		// it. Evict the OLDEST first (FIFO) when the set is full so this newest candidate survives.
 		sr, gerr := crypto.GenerateEphemeral()
 		if gerr != nil {
 			return
@@ -349,10 +366,12 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 		if serr != nil {
 			return
 		}
-		pendInit = e
-		pendResp = append([]byte{kindHandshake}, crypto.RespMsg(cfg.PSK, e, sr)...)
-		sc.pend = s
-		_ = t.Send(pendResp)
+		resp := append([]byte{kindHandshake}, crypto.RespMsg(cfg.PSK, e, sr)...)
+		if len(sc.staged) >= maxStaged {
+			sc.staged = sc.staged[1:]
+		}
+		sc.staged = append(sc.staged, stagedSession{eInit: e, sealer: s, resp: resp})
+		_ = t.Send(resp)
 	}
 	go sc.sendPump()
 	go sc.recvPump(inCh, onHS)
