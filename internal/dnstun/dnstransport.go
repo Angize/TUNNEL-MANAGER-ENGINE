@@ -27,6 +27,20 @@ var (
 	serverHold = 150 * time.Millisecond
 )
 
+// Client pipelining. The client keeps multiple queries in flight instead of one-at-a-time, so
+// throughput becomes ~window×payload/RTT instead of ~1 datagram/RTT — decisive on a high-latency
+// resolver path. Vars so tests can lower them.
+var (
+	pipelineWindow  = 16 // max queries in flight at once (also caps the per-non-live-frame work)
+	idleTarget      = 2  // nonce-only polls kept in flight when no transfer is active (bounds idle footprint)
+	sweepInterval   = 500 * time.Millisecond
+	collapseEmpties = 24 // consecutive empty replies before the window collapses back to idleTarget
+)
+
+// serverWorkers bounds the server's concurrent long-poll replies so a burst of pipelined client
+// queries doesn't serialize behind each other's serverHold. >= a client's pipelineWindow.
+const serverWorkers = 24
+
 const dnsReadBuf = 1500
 
 // newNonce returns a fresh nonceLen-char lowercase-base32 label for one query. It is the leftmost
@@ -148,9 +162,28 @@ type dnsClient struct {
 	outbound  chan []byte
 	inbound   chan []byte
 	closed    chan struct{}
-	pollDone  chan struct{} // closed when pollLoop has fully exited
 	once      sync.Once
 	qid       atomic.Uint32 // fallback DNS transaction-id source when a crypto/rand read fails
+
+	// Pipelining state. inflight maps a live query's DNS id to its deadline + the nonce label the
+	// reply must echo (matching by id AND nonce keeps the off-path anti-spoof strength of the old
+	// one-id-at-a-time loop). slots is a counting semaphore of spare in-flight capacity (starts full);
+	// the invariant |inflight| + len(slots) == pipelineWindow holds because a slot is acquired before
+	// the map insert and released after the delete. active flips the send target between idleTarget
+	// and pipelineWindow. wake nudges the sender to refill a just-freed slot. wg joins the 3 loops.
+	mu       sync.Mutex
+	inflight map[uint16]inflightQuery
+	slots    chan struct{}
+	active   atomic.Bool
+	wake     chan struct{}
+	wg       sync.WaitGroup
+}
+
+// inflightQuery records one outstanding query: when it expires (so the sweeper can reclaim its slot)
+// and the nonce label the reply must echo (so a spoofed answer must guess the id AND the nonce).
+type inflightQuery struct {
+	deadline time.Time
+	nonce    string
 }
 
 // NewDNSClientTransport resolves the recursive resolvers (each "host" or "host:port"; :53 default),
@@ -193,9 +226,17 @@ func NewDNSClientTransport(resolverAddrs []string, codec *Codec) (WireTransport,
 		outbound:  make(chan []byte, sendQueueSize),
 		inbound:   make(chan []byte, recvQueueSize),
 		closed:    make(chan struct{}),
-		pollDone:  make(chan struct{}),
+		inflight:  make(map[uint16]inflightQuery, pipelineWindow),
+		slots:     make(chan struct{}, pipelineWindow),
+		wake:      make(chan struct{}, 1),
 	}
-	go c.pollLoop()
+	for i := 0; i < pipelineWindow; i++ {
+		c.slots <- struct{}{} // prime the semaphore full: all in-flight capacity is initially spare
+	}
+	c.wg.Add(3)
+	go c.sendLoop()
+	go c.recvLoop()
+	go c.sweepLoop()
 	return c, nil
 }
 
@@ -224,89 +265,251 @@ func (c *dnsClient) Recv() ([]byte, error) {
 
 func (c *dnsClient) Close() error {
 	c.once.Do(func() {
-		close(c.closed)
-		_ = c.conn.Close() // unblocks pollLoop's Read
+		close(c.closed)    // unblocks the sender's selects, its slot-acquire, and the sweeper
+		_ = c.conn.Close() // unblocks the receiver's ReadFromUDP and any in-flight WriteToUDP
 	})
-	<-c.pollDone // wait for pollLoop to exit so no goroutine outlives Close
+	c.wg.Wait() // join sender + receiver + sweeper so no goroutine outlives Close
 	return nil
 }
 
-// pollLoop sends one query per iteration — a queued upstream datagram when available, otherwise a
-// nonce-only poll after pollInterval — and delivers the downstream datagram from the response.
-func (c *dnsClient) pollLoop() {
-	defer close(c.pollDone)
-	idle := time.NewTimer(pollInterval)
-	defer idle.Stop()
+// sendLoop is the client's query pump. It ships a queued upstream datagram the moment one arrives and,
+// to keep the pipe primed for downstream, tops the in-flight count up to the current target — idleTarget
+// when the tunnel is quiet, pipelineWindow while a transfer is active. It wakes on new upstream data, on
+// the receiver freeing a slot, and on a periodic tick (so an idle tunnel still keeps a couple of polls out).
+func (c *dnsClient) sendLoop() {
+	defer c.wg.Done()
+	tick := time.NewTicker(pollInterval)
+	defer tick.Stop()
 	for {
-		var up []byte
 		select {
 		case <-c.closed:
 			return
-		case up = <-c.outbound:
-		case <-idle.C:
-			up = nil // idle: poll for downstream
-		}
-		if !idle.Stop() {
-			select {
-			case <-idle.C:
-			default:
+		case up := <-c.outbound:
+			if !c.sendOne(up) { // real upstream data: always send
+				return
+			}
+		case <-c.wake:
+			if !c.fill() {
+				return
+			}
+		case <-tick.C:
+			if !c.fill() {
+				return
 			}
 		}
-		idle.Reset(pollInterval)
-		c.exchange(up)
 	}
 }
 
-// exchange runs one query/response. A lost query or timed-out answer is not an error here: kcp-go
-// retransmits any upstream datagram, and the downstream slot is retried on the next poll.
-func (c *dnsClient) exchange(up []byte) {
-	name, err := c.codec.EncodeName(up, newNonce())
+// fill sends nonce-only polls until the in-flight count reaches the current target. Returns false only
+// when the transport closed.
+func (c *dnsClient) fill() bool {
+	target := idleTarget
+	if c.active.Load() {
+		target = pipelineWindow
+	}
+	for c.inflightLen() < target {
+		if !c.sendOne(nil) {
+			return false
+		}
+	}
+	return true
+}
+
+// sendOne acquires an in-flight slot, encodes one query (up==nil is a downstream-only poll), records it
+// under a UNIQUE DNS id plus its nonce, and writes it to a round-robin resolver. On any pre-send failure
+// it rolls the slot back so a transient error never leaks capacity. Returns false only when the transport
+// closed while waiting for a slot.
+//
+// The 16-bit id is drawn from crypto/rand (predictable ids would let an off-path attacker spoof a matching
+// answer); with several queries outstanding it is also redrawn on collision so it stays a unique map key.
+func (c *dnsClient) sendOne(up []byte) bool {
+	if !c.acquire() {
+		return false
+	}
+	nonce := newNonce()
+	name, err := c.codec.EncodeName(up, nonce)
 	if err != nil {
-		return
+		c.release()
+		return true
 	}
-	// Derive the 16-bit DNS transaction id from crypto/rand, not a sequential counter: predictable
-	// ids let an OFF-PATH attacker spoof a matching (e.g. empty-TXT) answer that ends the exchange
-	// early, a spoofed-answer availability hit. A random id per query forces the attacker to guess
-	// the full 16 bits. On the vanishingly rare rand read error, fall back to the monotonic counter
-	// so a query still goes out. AEAD still protects integrity; this only hardens availability.
-	var idb [2]byte
+	c.mu.Lock()
 	var id uint16
-	if _, rerr := rand.Read(idb[:]); rerr == nil {
-		id = uint16(idb[0])<<8 | uint16(idb[1])
-	} else {
-		id = uint16(c.qid.Add(1))
+	for {
+		var idb [2]byte
+		if _, rerr := rand.Read(idb[:]); rerr == nil {
+			id = uint16(idb[0])<<8 | uint16(idb[1])
+		} else {
+			id = uint16(c.qid.Add(1))
+		}
+		if _, dup := c.inflight[id]; !dup {
+			break
+		}
 	}
+	c.inflight[id] = inflightQuery{deadline: time.Now().Add(queryTimeout), nonce: nonce}
+	c.mu.Unlock()
 	query, err := buildQuery(id, name)
 	if err != nil {
-		return
+		c.dropInflight(id)
+		return true
 	}
 	resolver := c.resolvers[int(c.rr.Add(1)-1)%len(c.resolvers)]
 	if _, err := c.conn.WriteToUDP(query, resolver); err != nil {
-		return
+		c.dropInflight(id)
+		return true
 	}
+	return true
+}
+
+// recvLoop reads responses from the shared socket, matches each to an outstanding query by BOTH its DNS
+// id and its echoed nonce label (so an off-path spoof must guess both, not just one of up to
+// pipelineWindow live ids), frees the slot, delivers the downstream datagram, and tracks activity so the
+// window widens on a real transfer and collapses back when it ends.
+func (c *dnsClient) recvLoop() {
+	defer c.wg.Done()
 	buf := make([]byte, dnsReadBuf)
-	deadline := time.Now().Add(queryTimeout)
+	empties := 0
 	for {
-		if err := c.conn.SetReadDeadline(deadline); err != nil {
-			return
-		}
 		n, _, err := c.conn.ReadFromUDP(buf) // reply may come from any source (anycast/smart-DNS backend)
 		if err != nil {
-			return // timeout or socket closed
+			return // socket closed by Close
+		}
+		id, qname, ok := responseIDName(buf[:n])
+		if !ok {
+			continue
+		}
+		if !c.matchRelease(id, qname) {
+			continue // unknown id / nonce mismatch: a stale, foreign, or spoofed answer
 		}
 		down, derr := parseResponseTXT(buf[:n], id)
 		if derr != nil {
-			continue // a stale/foreign answer: keep reading until our id or the deadline
+			continue
 		}
 		if len(down) > 0 {
 			select {
 			case c.inbound <- down:
 			case <-c.closed:
+				return
 			default: // full: drop, kcp-go retransmits
 			}
+			c.active.Store(true)
+			empties = 0
+		} else if empties++; empties >= collapseEmpties {
+			c.active.Store(false)
+			empties = 0
 		}
-		return
 	}
+}
+
+// sweepLoop reclaims the slot of any query whose answer never arrived within queryTimeout, so a lost
+// query/answer can't permanently drain the window (kcp-go retransmits upstream; polls are re-issued).
+func (c *dnsClient) sweepLoop() {
+	defer c.wg.Done()
+	t := time.NewTicker(sweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.closed:
+			return
+		case <-t.C:
+			now := time.Now()
+			freed := 0
+			c.mu.Lock()
+			for id, e := range c.inflight {
+				if now.After(e.deadline) {
+					delete(c.inflight, id)
+					freed++
+				}
+			}
+			c.mu.Unlock()
+			for i := 0; i < freed; i++ {
+				c.release()
+			}
+		}
+	}
+}
+
+// acquire takes one in-flight slot, returning false if the transport closed while it waited.
+func (c *dnsClient) acquire() bool {
+	select {
+	case <-c.slots:
+		return true
+	case <-c.closed:
+		return false
+	}
+}
+
+// release returns one in-flight slot (never blocks — a token is only returned for one that was acquired,
+// so there is always room) and nudges the sender to refill the freshly-opened slot.
+func (c *dnsClient) release() {
+	select {
+	case c.slots <- struct{}{}:
+	default:
+	}
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *dnsClient) inflightLen() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.inflight)
+}
+
+// matchRelease removes the outstanding query for id and frees its slot, but ONLY if id is live AND the
+// reply's echoed nonce matches the one sent (case-insensitively — a 0x20-mixing resolver may re-case the
+// name). Deleting-under-lock is the single authority for the release, so a receiver match and a sweeper
+// timeout for the same id can never double-free.
+func (c *dnsClient) matchRelease(id uint16, qname string) bool {
+	c.mu.Lock()
+	e, ok := c.inflight[id]
+	if ok && strings.EqualFold(nonceLabel(qname), e.nonce) {
+		delete(c.inflight, id)
+	} else {
+		ok = false
+	}
+	c.mu.Unlock()
+	if ok {
+		c.release()
+	}
+	return ok
+}
+
+// dropInflight rolls back an in-flight entry whose query never went out, freeing its slot.
+func (c *dnsClient) dropInflight(id uint16) {
+	c.mu.Lock()
+	_, ok := c.inflight[id]
+	if ok {
+		delete(c.inflight, id)
+	}
+	c.mu.Unlock()
+	if ok {
+		c.release()
+	}
+}
+
+// responseIDName parses a DNS message enough to return its id and question name; ok is false for a
+// malformed message or a query (not a response).
+func responseIDName(buf []byte) (id uint16, qname string, ok bool) {
+	var p dnsmessage.Parser
+	h, err := p.Start(buf)
+	if err != nil || !h.Response {
+		return 0, "", false
+	}
+	q, err := p.Question()
+	if err != nil {
+		return 0, "", false
+	}
+	return h.ID, q.Name.String(), true
+}
+
+// nonceLabel returns the leftmost label of a query name (the per-query nonce the client set).
+func nonceLabel(qname string) string {
+	if i := strings.IndexByte(qname, '.'); i >= 0 {
+		return qname[:i]
+	}
+	return qname
 }
 
 // ---- server transport (WireTransport) ----
@@ -416,16 +619,20 @@ func (s *dnsServer) Close() error {
 	return nil
 }
 
-// serveLoop reads each query, delivers its upstream datagram, and answers with a queued downstream
-// datagram (or an empty TXT when none is waiting). The reply goes to the query's UDP source — the
-// resolver — so a changing resolver address never breaks the session (the identity is the tunnel).
+// serveLoop reads each query and delivers its upstream datagram immediately, then dispatches the reply
+// (which may long-poll up to serverHold for a downstream datagram) to a bounded worker pool. Reading is
+// thus never blocked by another query's hold, so a client that pipelines many queries at once is answered
+// concurrently instead of one-serverHold-at-a-time. Replies go to the query's UDP source — the resolver —
+// so a changing resolver address never breaks the session (the identity is the tunnel).
 func (s *dnsServer) serveLoop() {
 	defer close(s.serveDone)
+	sem := make(chan struct{}, serverWorkers)
+	var wg sync.WaitGroup
 	buf := make([]byte, dnsReadBuf)
 	for {
 		n, addr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
-			return
+			break
 		}
 		id, qname, qtype, ok := parseQuery(buf[:n])
 		if !ok {
@@ -458,37 +665,68 @@ func (s *dnsServer) serveLoop() {
 		if len(data) > 0 {
 			select {
 			case s.upstream <- data:
-			case <-s.closed:
-				return
 			default: // full: drop, kcp-go retransmits
 			}
 		}
-		// Briefly hold the reply so a downstream datagram (the handshake response, a KCP ack) can ride
-		// THIS answer instead of a later poll — see serverHold. A datagram already waiting is taken at
-		// once; otherwise we wait up to serverHold and reply empty. A per-query timer (not time.After in
-		// the select, which would leak a timer until it fires) keeps the idle path allocation-free enough.
-		var down []byte
+		// Attach a downstream datagram to the reply in a worker, so THIS query's serverHold long-poll
+		// doesn't stall reading the next pipelined query. Copy addr — ReadFromUDP reuses its return. When
+		// the pool is saturated (a flood), reply now WITHOUT holding rather than block the read loop.
+		ra := *addr
+		select {
+		case sem <- struct{}{}:
+			wg.Add(1)
+			go func(id uint16, qn dnsmessage.Name, ra net.UDPAddr) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				s.reply(id, qn, &ra)
+			}(id, qn, ra)
+		default:
+			s.replyNoHold(id, qn, addr)
+		}
+	}
+	wg.Wait() // let in-flight replies finish before serveDone signals Close
+}
+
+// reply answers one query, briefly long-polling (serverHold) for a downstream datagram so a KCP ack/data
+// rides this reply instead of a later poll. A datagram already waiting is taken at once.
+func (s *dnsServer) reply(id uint16, qn dnsmessage.Name, addr *net.UDPAddr) {
+	var down []byte
+	select {
+	case down = <-s.downstream:
+	case <-s.closed:
+		return
+	default:
+		hold := time.NewTimer(serverHold)
 		select {
 		case down = <-s.downstream:
+		case <-hold.C:
 		case <-s.closed:
-			return
-		default:
-			hold := time.NewTimer(serverHold)
-			select {
-			case down = <-s.downstream:
-			case <-hold.C:
-			case <-s.closed:
-				hold.Stop()
-				return
-			}
 			hold.Stop()
+			return
 		}
-		resp, berr := buildResponse(id, qn, dnsmessage.TypeTXT, []dnsmessage.Resource{txtResource(qn, s.codec.EncodeTXT(down))})
-		if berr != nil {
-			continue
-		}
-		_, _ = s.conn.WriteToUDP(resp, addr)
+		hold.Stop()
 	}
+	s.write(id, qn, down, addr)
+}
+
+// replyNoHold answers immediately with whatever downstream is already queued (no long-poll), used when
+// the worker pool is saturated so the read loop is never blocked.
+func (s *dnsServer) replyNoHold(id uint16, qn dnsmessage.Name, addr *net.UDPAddr) {
+	var down []byte
+	select {
+	case down = <-s.downstream:
+	default:
+	}
+	s.write(id, qn, down, addr)
+}
+
+// write packs the TXT answer carrying down (empty TXT when nil) and sends it to addr.
+func (s *dnsServer) write(id uint16, qn dnsmessage.Name, down []byte, addr *net.UDPAddr) {
+	resp, berr := buildResponse(id, qn, dnsmessage.TypeTXT, []dnsmessage.Resource{txtResource(qn, s.codec.EncodeTXT(down))})
+	if berr != nil {
+		return
+	}
+	_, _ = s.conn.WriteToUDP(resp, addr)
 }
 
 // apexAnswers returns the authority records for a non-TXT query: the SOA or NS at the exact zone
