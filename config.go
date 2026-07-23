@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -453,15 +452,8 @@ func (c *Config) validate() error {
 			return errors.New("server role requires \"listen\"")
 		}
 		for _, la := range c.ListenIPs { // pooled server: each bind must be a valid IP:port (we bind these directly)
-			host, port, err := net.SplitHostPort(la)
-			if err != nil {
-				return fmt.Errorf("listen_ips entry %q must be host:port: %w", la, err)
-			}
-			if net.ParseIP(host) == nil {
-				return fmt.Errorf("listen_ips entry %q has a non-IP host (each bind must be a literal IP)", la)
-			}
-			if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
-				return fmt.Errorf("listen_ips entry %q has an invalid port", la)
+			if err := validatePoolEndpoint("listen_ips", la, true); err != nil { // same ip:port check as a dest pool entry
+				return err
 			}
 		}
 	case "client":

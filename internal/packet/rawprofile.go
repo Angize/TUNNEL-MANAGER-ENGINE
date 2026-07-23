@@ -128,17 +128,10 @@ func rawEncap(profile string, payload []byte, src, dst net.IP, isClient bool, id
 		return h
 
 	case protoTCP:
-		h := make([]byte, 20+len(payload))
-		binary.BigEndian.PutUint16(h[0:2], rawSrcPort)
-		binary.BigEndian.PutUint16(h[2:4], rawDstPort)
-		binary.BigEndian.PutUint32(h[4:8], seq)  // sequence — advances by payload bytes, like a real stream
-		binary.BigEndian.PutUint32(h[8:12], ack) // acknowledgement — a non-zero peer ISN, not the tell-tale 0
-		h[12] = 5 << 4                           // data offset = 5 words (20 bytes), no options
-		h[13] = 0x18                             // PSH | ACK — a data segment mid-stream
-		binary.BigEndian.PutUint16(h[14:16], rawTCPWindow)
-		copy(h[20:], payload)
-		binary.BigEndian.PutUint16(h[16:18], l4Checksum(src, dst, protoTCP, h))
-		return h
+		// A PSH|ACK data segment on the raw carrier's fixed ports (seq advances by payload bytes like a
+		// real stream; ack is a non-zero peer ISN, not the tell-tale 0). Identical byte layout to the
+		// desync injector, so both share buildTCPSeg (tcpseg.go).
+		return buildTCPSeg(src, dst, rawSrcPort, rawDstPort, seq, ack, tcpPshAck, rawTCPWindow, payload)
 
 	case protoESP:
 		// IPsec ESP (RFC 4303): [SPI 4B][seq 4B] then the sealed frame as the "encrypted

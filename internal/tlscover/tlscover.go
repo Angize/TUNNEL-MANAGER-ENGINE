@@ -159,7 +159,7 @@ func (sv *Server) Handle(raw net.Conn, deadline time.Time) (net.Conn, error) {
 	}
 	// readClientHello returns the bytes it consumed even on error, so hello is
 	// always safe to replay to dest below.
-	hello, _, sid, err := readClientHello(raw)
+	hello, sid, err := readClientHello(raw)
 	if err == nil && openToken(sv.psk, sid) && sv.firstSight(sid) {
 		if !deadline.IsZero() {
 			_ = raw.SetDeadline(time.Time{})
@@ -243,7 +243,7 @@ func (sv *Server) proxyToDest(raw net.Conn, hello []byte) {
 
 // readClientHello reads exactly one TLS handshake record (the ClientHello),
 // returns the raw bytes (for replay) plus the client random and session id.
-func readClientHello(c net.Conn) (buf, random, sid []byte, err error) {
+func readClientHello(c net.Conn) (buf, sid []byte, err error) {
 	// buf always holds every byte consumed from c, including on the error paths
 	// below, so the caller can replay them verbatim to dest (a rejected hello must
 	// still be proxied, never dropped).
@@ -251,32 +251,32 @@ func readClientHello(c net.Conn) (buf, random, sid []byte, err error) {
 	n, err := io.ReadFull(c, hdr)
 	buf = hdr[:n]
 	if err != nil {
-		return buf, nil, nil, err
+		return buf, nil, err
 	}
 	if hdr[0] != 0x16 { // TLS handshake content type
-		return buf, nil, nil, errNotTLS
+		return buf, nil, errNotTLS
 	}
 	recLen := int(hdr[3])<<8 | int(hdr[4])
 	if recLen < 40 || recLen > 16384 {
-		return buf, nil, nil, errBadHello
+		return buf, nil, errBadHello
 	}
 	body := make([]byte, recLen)
 	n, err = io.ReadFull(c, body)
 	buf = append(buf, body[:n]...)
 	if err != nil {
-		return buf, nil, nil, err
+		return buf, nil, err
 	}
 	// body: hs_type(1) hs_len(3) client_version(2) random(32) sid_len(1) sid...
+	// (the 32-byte random at body[6:38] is no longer consumed — sealToken uses a fresh per-seal nonce.)
 	if len(body) < 39 || body[0] != 0x01 {
-		return buf, nil, nil, errBadHello
+		return buf, nil, errBadHello
 	}
-	random = body[6:38]
 	sidLen := int(body[38])
 	if 39+sidLen > len(body) {
-		return buf, nil, nil, errBadHello
+		return buf, nil, errBadHello
 	}
 	sid = body[39 : 39+sidLen]
-	return buf, random, sid, nil
+	return buf, sid, nil
 }
 
 // prefixConn replays pre before delegating reads to the wrapped conn.

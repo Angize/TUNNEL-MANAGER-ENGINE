@@ -449,13 +449,7 @@ func (b *TCP) rotateSourceTCP(proactive bool) bool {
 	if b.sp == nil {
 		return false
 	}
-	var addr string
-	var moved bool
-	if proactive {
-		addr, moved = b.sp.rotateOnce()
-	} else {
-		addr, moved = b.sp.fail()
-	}
+	addr, moved := b.sp.nextEndpoint(proactive)
 	if moved {
 		log.Printf("core/tcp: rotated source to %s", addr)
 		// Surface the source rotation in the panel event ring, like the datagram carriers. A source

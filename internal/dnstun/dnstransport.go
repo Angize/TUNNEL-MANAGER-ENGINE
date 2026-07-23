@@ -105,11 +105,12 @@ func parseResponseTXT(buf []byte, wantID uint16) ([]byte, error) {
 	return out, nil
 }
 
-// parseQuery extracts the transaction id, question name and type from a query (ignores responses).
-func parseQuery(buf []byte) (id uint16, name string, qtype dnsmessage.Type, ok bool) {
+// parseMsgQuestion parses a DNS message's header + first question, returning (id, name, type). ok is
+// false for a malformed message or one whose direction doesn't match wantResponse (query vs response).
+func parseMsgQuestion(buf []byte, wantResponse bool) (id uint16, name string, qtype dnsmessage.Type, ok bool) {
 	var p dnsmessage.Parser
 	h, err := p.Start(buf)
-	if err != nil || h.Response {
+	if err != nil || h.Response != wantResponse {
 		return 0, "", 0, false
 	}
 	q, err := p.Question()
@@ -117,6 +118,11 @@ func parseQuery(buf []byte) (id uint16, name string, qtype dnsmessage.Type, ok b
 		return 0, "", 0, false
 	}
 	return h.ID, q.Name.String(), q.Type, true
+}
+
+// parseQuery extracts the transaction id, question name and type from a query (ignores responses).
+func parseQuery(buf []byte) (id uint16, name string, qtype dnsmessage.Type, ok bool) {
+	return parseMsgQuestion(buf, false)
 }
 
 // buildResponse assembles an authoritative reply: the AA bit is set, RA is cleared, the question is
@@ -240,28 +246,35 @@ func NewDNSClientTransport(resolverAddrs []string, codec *Codec) (WireTransport,
 	return c, nil
 }
 
-func (c *dnsClient) Send(d []byte) error {
+// queueSend / queueRecv hold the WireTransport send/recv bodies shared byte-for-byte by dnsClient and
+// dnsServer (they differ only in which queue/closed channels they touch). A full outbound queue drops —
+// kcp-go retransmits.
+func queueSend(closed <-chan struct{}, q chan<- []byte, d []byte) error {
 	select {
-	case <-c.closed:
+	case <-closed:
 		return net.ErrClosed
 	default:
 	}
 	buf := append([]byte(nil), d...)
 	select {
-	case c.outbound <- buf:
+	case q <- buf:
 	default: // full: drop, kcp-go retransmits
 	}
 	return nil
 }
 
-func (c *dnsClient) Recv() ([]byte, error) {
+func queueRecv(in <-chan []byte, closed <-chan struct{}) ([]byte, error) {
 	select {
-	case d := <-c.inbound:
+	case d := <-in:
 		return d, nil
-	case <-c.closed:
+	case <-closed:
 		return nil, net.ErrClosed
 	}
 }
+
+func (c *dnsClient) Send(d []byte) error { return queueSend(c.closed, c.outbound, d) }
+
+func (c *dnsClient) Recv() ([]byte, error) { return queueRecv(c.inbound, c.closed) }
 
 func (c *dnsClient) Close() error {
 	c.once.Do(func() {
@@ -492,16 +505,8 @@ func (c *dnsClient) dropInflight(id uint16) {
 // responseIDName parses a DNS message enough to return its id and question name; ok is false for a
 // malformed message or a query (not a response).
 func responseIDName(buf []byte) (id uint16, qname string, ok bool) {
-	var p dnsmessage.Parser
-	h, err := p.Start(buf)
-	if err != nil || !h.Response {
-		return 0, "", false
-	}
-	q, err := p.Question()
-	if err != nil {
-		return 0, "", false
-	}
-	return h.ID, q.Name.String(), true
+	id, qname, _, ok = parseMsgQuestion(buf, true)
+	return
 }
 
 // nonceLabel returns the leftmost label of a query name (the per-query nonce the client set).
@@ -587,28 +592,9 @@ func apexRecords(zone string) (dnsmessage.Name, dnsmessage.Resource, dnsmessage.
 	return zn, soa, ns, nil
 }
 
-func (s *dnsServer) Send(d []byte) error {
-	select {
-	case <-s.closed:
-		return net.ErrClosed
-	default:
-	}
-	buf := append([]byte(nil), d...)
-	select {
-	case s.downstream <- buf:
-	default: // full: drop, kcp-go retransmits
-	}
-	return nil
-}
+func (s *dnsServer) Send(d []byte) error { return queueSend(s.closed, s.downstream, d) }
 
-func (s *dnsServer) Recv() ([]byte, error) {
-	select {
-	case d := <-s.upstream:
-		return d, nil
-	case <-s.closed:
-		return nil, net.ErrClosed
-	}
-}
+func (s *dnsServer) Recv() ([]byte, error) { return queueRecv(s.upstream, s.closed) }
 
 func (s *dnsServer) Close() error {
 	s.once.Do(func() {

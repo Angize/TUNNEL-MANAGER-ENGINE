@@ -52,28 +52,6 @@ func (b *TCP) sendTCPFakes(conn net.Conn) {
 	}
 }
 
-// tcpPshAck is the TCP flag byte for a PSH|ACK segment — what an ordinary data segment carries,
-// so a decoy looks like flow data to a DPI.
-const tcpPshAck = 0x18
-
-// buildTCPSeg crafts one TCP segment with parameterised ports/seq/ack/flags/window and a correct
-// checksum over the IPv4 pseudo-header. It mirrors rawEncap's protoTCP branch but is not tied to
-// the raw carrier's fixed ports, so it can forge a decoy on a real connection's 4-tuple.
-func buildTCPSeg(src, dst net.IP, sport, dport uint16, seq, ack uint32, flags byte, window uint16, payload []byte) []byte {
-	h := make([]byte, 20+len(payload))
-	binary.BigEndian.PutUint16(h[0:2], sport)
-	binary.BigEndian.PutUint16(h[2:4], dport)
-	binary.BigEndian.PutUint32(h[4:8], seq)
-	binary.BigEndian.PutUint32(h[8:12], ack)
-	h[12] = 5 << 4 // data offset = 5 words (20 bytes), no options
-	h[13] = flags
-	binary.BigEndian.PutUint16(h[14:16], window)
-	copy(h[20:], payload)
-	// checksum field (h[16:18]) is still zero here, as l4Checksum requires
-	binary.BigEndian.PutUint16(h[16:18], l4Checksum(src, dst, protoTCP, h))
-	return h
-}
-
 // randSeq32 returns a random 32-bit value for a decoy segment's sequence/ack fields.
 func randSeq32() uint32 {
 	var b [4]byte

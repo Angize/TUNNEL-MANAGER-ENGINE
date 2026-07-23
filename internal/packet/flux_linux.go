@@ -837,13 +837,7 @@ func (f *Flux) SetPeerSources(ips []string) {
 	if f.isClient || len(ips) == 0 {
 		return
 	}
-	m := make(map[string]struct{}, len(ips))
-	for _, s := range ips {
-		if ip := parseIP4(hostOnly(s)); ip != nil {
-			m[string(ip.To4())] = struct{}{}
-		}
-	}
-	if len(m) > 0 {
+	if m := buildSrcAllow(ips); len(m) > 0 {
 		f.srcAllow = m
 	}
 }
@@ -851,15 +845,7 @@ func (f *Flux) SetPeerSources(ips []string) {
 // srcAllowed reports whether ip is one of the client's known pool sources (server only). Empty set
 // (non-pool tunnel, or the client) => false, so the strict single-source filter is unchanged there.
 func (f *Flux) srcAllowed(ip net.IP) bool {
-	if len(f.srcAllow) == 0 {
-		return false
-	}
-	v4 := ip.To4()
-	if v4 == nil {
-		return false
-	}
-	_, ok := f.srcAllow[string(v4)]
-	return ok
+	return srcAllowedIn(f.srcAllow, ip)
 }
 
 // SetSourcePool (client) wires a source-IP rotation pool: the crafted-header source IP the client
@@ -888,13 +874,7 @@ func (f *Flux) rotateSourceFlux(proactive bool) {
 	if f.sp == nil {
 		return
 	}
-	var addr string
-	var moved bool
-	if proactive {
-		addr, moved = f.sp.rotateOnce()
-	} else {
-		addr, moved = f.sp.fail()
-	}
+	addr, moved := f.sp.nextEndpoint(proactive)
 	if !moved {
 		return
 	}
@@ -916,13 +896,7 @@ func (f *Flux) rotatePeerFlux(proactive bool) {
 	if f.pp == nil {
 		return
 	}
-	var addr string
-	var moved bool
-	if proactive {
-		addr, moved = f.pp.rotateOnce()
-	} else {
-		addr, moved = f.pp.fail()
-	}
+	addr, moved := f.pp.nextEndpoint(proactive)
 	if !moved {
 		return
 	}
@@ -1025,13 +999,7 @@ func (f *Flux) clientLoop() {
 			// Heal transient burns on endpoints proving themselves. Clear mode has no handshake, so use
 			// the data plane (peerAnswered), so a just-jumped-to endpoint's burn is never falsely cleared.
 			if failN > 0 || (!f.cryptoOn && rc.active() && f.peerAnswered.Load()) {
-				dh, sh := rc.success()
-				if dh != "" {
-					f.st.event("heal", "peer-retest", dh) // burned destination IP recovered
-				}
-				if sh != "" {
-					f.st.event("heal", "src-retest", sh) // burned source IP recovered
-				}
+				healEvents(f.st, rc)
 			}
 			failN = 0
 			f.send(typePing, nil, f.peer.Load())

@@ -137,10 +137,7 @@ func (c *Codec) EncodeName(data []byte, nonce string) (string, error) {
 // per-query nonce (see EncodeName) and is discarded; the remaining labels are the base32 data. A
 // nonce-only name ("<nonce>.<zone>") or the bare zone carries zero upstream bytes (a poll).
 func (c *Codec) DecodeName(name string) ([]byte, error) {
-	nl := strings.ToLower(strings.TrimSpace(name))
-	if !strings.HasSuffix(nl, ".") {
-		nl += "."
-	}
+	nl := normName(name) // lower-case, trimmed, single trailing dot — same normalization as the zone form
 	// Require a real label boundary before the zone: "<labels>.<zone>" or a bare "<zone>" query.
 	// A plain HasSuffix would accept e.g. "abt.example.com" for zone "t.example.com" and mis-parse
 	// the foreign label "ab" as a nonce.

@@ -164,13 +164,7 @@ func (b *UDP) rotatePeerUDP(proactive bool) {
 	if b.pp == nil {
 		return
 	}
-	var addr string
-	var moved bool
-	if proactive {
-		addr, moved = b.pp.rotateOnce()
-	} else {
-		addr, moved = b.pp.fail()
-	}
+	addr, moved := b.pp.nextEndpoint(proactive)
 	if !moved {
 		return
 	}
@@ -236,13 +230,7 @@ func (b *UDP) rotateSourceUDP(proactive bool) {
 	if b.sp == nil {
 		return
 	}
-	var addr string
-	var moved bool
-	if proactive {
-		addr, moved = b.sp.rotateOnce()
-	} else {
-		addr, moved = b.sp.fail()
-	}
+	addr, moved := b.sp.nextEndpoint(proactive)
 	if !moved {
 		return
 	}
@@ -882,13 +870,7 @@ func (b *UDP) clientLoop() {
 			// so healing here can never falsely clear a just-jumped-to (unproven) endpoint's burn.
 			heal := failN > 0 || (!b.cryptoOn && rc.active() && b.peerAnswered.Load())
 			if heal {
-				dh, sh := rc.success() // the active endpoints are alive — clear any transient burns (and release a landed pin)
-				if dh != "" {
-					b.st.event("heal", "peer-retest", dh) // burned destination IP recovered
-				}
-				if sh != "" {
-					b.st.event("heal", "src-retest", sh) // burned source IP recovered
-				}
+				healEvents(b.st, rc) // active endpoints alive — clear transient burns (and release a landed pin), emit any heal
 			}
 			// BUG #35: clear mode has no handshake to fire st.reconnected(), so a self-heal down() (the
 			// clear-mode failover above, or a peer rotate/pin) would arm wasDown with no matching "up".

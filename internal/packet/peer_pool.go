@@ -270,6 +270,31 @@ func (p *PeerPool) rotateOnce() (addr string, moved bool) {
 	return a, moved
 }
 
+// nextEndpoint picks the endpoint a carrier should jump to now: a proactive timed rotate (rotateOnce,
+// no burn) or a failover burn+advance (fail). Both return (addr, moved) with identical meaning, so the
+// four direct carriers share this one dispatch instead of each open-coding the proactive branch.
+func (p *PeerPool) nextEndpoint(proactive bool) (addr string, moved bool) {
+	if proactive {
+		return p.rotateOnce()
+	}
+	return p.fail()
+}
+
+// healEvents emits the paired heal events after a datagram carrier's active endpoints prove alive again:
+// rc.success() clears any transient burn and returns the recovered destination/source IPs ("" when
+// nothing healed), which become "peer-retest"/"src-retest" events. Shared by udp/raw/flux, whose blocks
+// were byte-identical. st.event is nil-safe (server / off). (tcp's analogue differs — it uses succeeded()
+// singly with an "ip:" prefix — and stays separate.)
+func healEvents(st *coreStatus, rc *rotationController) {
+	dh, sh := rc.success()
+	if dh != "" {
+		st.event("heal", "peer-retest", dh)
+	}
+	if sh != "" {
+		st.event("heal", "src-retest", sh)
+	}
+}
+
 // succeeded clears the active endpoint's burn after it connects — a live success proves it healthy right
 // now, so a transient block heals. Only writes the status file if something changed.
 // succeeded clears any health record on the CURRENT endpoint (it just proved good on the data plane).
