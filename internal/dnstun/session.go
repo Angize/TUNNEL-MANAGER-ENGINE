@@ -296,6 +296,15 @@ func resolveKeepalive(interval time.Duration) (time.Duration, time.Duration) {
 	return interval, dw
 }
 
+// dialFail is the shared pre-handshake teardown for Dial/ServeSession: signal the recv fanout to stop,
+// close the transport, and return the error. (The post-handshake failure path also closes qpc and is
+// left inline.)
+func dialFail(done chan struct{}, t WireTransport, err error) (net.Conn, error) {
+	close(done)
+	_ = t.Close()
+	return nil, err
+}
+
 // DialSession (client) runs the X25519 handshake over t (retransmitting the init until the
 // responder answers or the deadline passes), then returns a reliable, AEAD-authenticated stream
 // to the server. The caller must Close the returned conn to release the transport and goroutines.
@@ -306,9 +315,7 @@ func DialSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 
 	ci, err := crypto.GenerateEphemeral()
 	if err != nil {
-		close(done)
-		_ = t.Close()
-		return nil, err
+		return dialFail(done, t, err)
 	}
 	initDG := append([]byte{kindHandshake}, crypto.InitMsg(cfg.PSK, ci)...)
 	_ = t.Send(initDG)
@@ -322,16 +329,12 @@ handshake:
 	for {
 		select {
 		case <-deadline.C:
-			close(done)
-			_ = t.Close()
-			return nil, errors.New("dns session: handshake timed out")
+			return dialFail(done, t, errors.New("dns session: handshake timed out"))
 		case <-retx.C:
 			_ = t.Send(initDG) // the transport is lossy — resend until answered
 		case d, ok := <-inCh:
 			if !ok {
-				close(done)
-				_ = t.Close()
-				return nil, errors.New("dns session: transport closed during handshake")
+				return dialFail(done, t, errors.New("dns session: transport closed during handshake"))
 			}
 			if len(d) < 1 || d[0] != kindHandshake {
 				continue
@@ -342,9 +345,7 @@ handshake:
 			}
 			s, serr := crypto.SessionSealer(cfg.Cipher, cfg.PSK, ci, eResp, ci.Pub, eResp, true)
 			if serr != nil {
-				close(done)
-				_ = t.Close()
-				return nil, serr
+				return dialFail(done, t, serr)
 			}
 			sealer = s
 			break handshake
@@ -389,9 +390,7 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 	for sealer == nil {
 		d, ok := <-inCh
 		if !ok {
-			close(done)
-			_ = t.Close()
-			return nil, errors.New("dns session: transport closed before handshake")
+			return dialFail(done, t, errors.New("dns session: transport closed before handshake"))
 		}
 		if len(d) < 1 || d[0] != kindHandshake {
 			continue
@@ -402,15 +401,11 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 		}
 		sr, gerr := crypto.GenerateEphemeral()
 		if gerr != nil {
-			close(done)
-			_ = t.Close()
-			return nil, gerr
+			return dialFail(done, t, gerr)
 		}
 		s, serr := crypto.SessionSealer(cfg.Cipher, cfg.PSK, sr, eInit, eInit, sr.Pub, false)
 		if serr != nil {
-			close(done)
-			_ = t.Close()
-			return nil, serr
+			return dialFail(done, t, serr)
 		}
 		sealer, gotInit = s, eInit
 		respDG = append([]byte{kindHandshake}, crypto.RespMsg(cfg.PSK, eInit, sr)...)
