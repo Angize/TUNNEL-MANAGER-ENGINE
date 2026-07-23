@@ -80,10 +80,13 @@ func randUint(max int) (int, error) {
 	}
 }
 
-// obfsSeal packs [type][realLen][payload][random-pad] and AEAD-seals it. The
-// returned bytes carry no constant fields (the sealer prepends a random nonce). The random pad is
-// written straight into the tail of the output buffer — no separate pad buffer + copy per packet;
-// its exact bytes are irrelevant (obfsOpen strips it by realLen), so only length + payload matter.
+// obfsSeal packs [type][realLen][payload][pad] and AEAD-seals it. The returned bytes carry no constant
+// fields (the sealer prepends a random nonce). Only the pad LENGTH matters (it's the size-shaping defense
+// and is random via randUint); its bytes do NOT — the pad rides INSIDE the AEAD envelope and obfsOpen
+// strips it by realLen without reading it. So the pad region is just left as make()'s zero fill: under a
+// non-repeating nonce the sealed ciphertext over a zero pad is keystream, i.e. still indistinguishable
+// from random on the wire, so this skips a per-packet crypto/rand fill of up to padMax bytes with no
+// change to the wire-looks-random property and no security effect (AEAD IND-CPA covers any plaintext).
 func obfsSeal(s Sealer, typ byte, payload []byte, padMax int) ([]byte, error) {
 	n, err := randUint(padMax)
 	if err != nil {
@@ -93,11 +96,6 @@ func obfsSeal(s Sealer, typ byte, payload []byte, padMax int) ([]byte, error) {
 	inner[0] = typ
 	binary.BigEndian.PutUint16(inner[1:3], uint16(len(payload)))
 	copy(inner[obfsInnerHdr:], payload)
-	if n > 0 {
-		if _, err := io.ReadFull(rand.Reader, inner[obfsInnerHdr+len(payload):]); err != nil {
-			return nil, err
-		}
-	}
 	return s.Seal(inner, nil) // type is folded into the sealed plaintext, no aad needed
 }
 
