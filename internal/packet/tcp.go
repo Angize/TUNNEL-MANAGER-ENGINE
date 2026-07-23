@@ -1476,6 +1476,28 @@ func (b *TCP) readECHCmdSingle() bool {
 	return true
 }
 
+const (
+	// reconnectBase / reconnectMax bound the client re-dial backoff. A dead/blocked destination must NOT
+	// be re-probed on a fixed 1s clock — a periodic SYN/handshake train to a filtered IP is itself a
+	// tunnel signature and positively confirms the endpoint to a censor. The delay doubles from
+	// reconnectBase toward reconnectMax (jittered) while dials keep failing, and resets to base once a
+	// connection is established.
+	reconnectBase = 1 * time.Second
+	reconnectMax  = 60 * time.Second
+)
+
+// nextReconnectDelay advances the exponential re-dial backoff: reconnectBase when cur==0, else
+// min(cur*2, reconnectMax), jittered so the retry carries no fixed period.
+func nextReconnectDelay(cur time.Duration) time.Duration {
+	next := reconnectBase
+	if cur > 0 {
+		if next = cur * 2; next > reconnectMax {
+			next = reconnectMax
+		}
+	}
+	return jitterFrac(next)
+}
+
 func (b *TCP) dialLoop() {
 	// direct-tcp peer/source pools: burnDest burns+advances the destination and, once the dest pool has
 	// cycled through every endpoint against the current source, walks the source too (same policy as the
@@ -1516,6 +1538,9 @@ func (b *TCP) dialLoop() {
 			}
 		}
 	}
+	// reconnect backoff: grows on each failed dial/handshake, resets on a successful connect, so a
+	// dead/blocked destination is re-probed with an exponential backoff instead of a fixed-1s beacon.
+	backoff := time.Duration(0)
 	for {
 		if b.closed.Load() {
 			return
@@ -1530,7 +1555,8 @@ func (b *TCP) dialLoop() {
 			} else {
 				burnDest() // direct-tcp: this endpoint won't connect -> burn + advance (dest, then source)
 			}
-			if b.sleep(1 * time.Second) {
+			backoff = nextReconnectDelay(backoff)
+			if b.sleep(backoff) {
 				return
 			}
 			continue
@@ -1538,12 +1564,14 @@ func (b *TCP) dialLoop() {
 		cf, err := b.handshakeAndPrime(conn)
 		if err != nil {
 			conn.Close()
-			if b.sleep(1 * time.Second) {
+			backoff = nextReconnectDelay(backoff)
+			if b.sleep(backoff) {
 				return
 			}
 			continue
 		}
 		log.Printf("core/tcp: connected to %s", label)
+		backoff = 0 // the endpoint answered — a later re-dial starts from reconnectBase again
 		connectedAt := time.Now()
 		// Single-edge (non-pool) self-heal: pair this recovery with a prior carrier-loss "down". nil-safe
 		// (no-op when no status file is wired) and silent on the first connect (only a pending down emits).
@@ -1712,7 +1740,8 @@ func (b *TCP) dialLoop() {
 		// re-dialed edge that then dies for real hits this backoff on its NEXT (non-deliberate) drop, so
 		// a bad edge still can't be hammered.
 		if !deliberate {
-			if b.sleep(1 * time.Second) {
+			backoff = nextReconnectDelay(backoff)
+			if b.sleep(backoff) {
 				return
 			}
 		}
