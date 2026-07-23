@@ -313,7 +313,7 @@ func DialSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 	inCh := make(chan []byte, 256)
 	go recvFanout(t, inCh, done)
 
-	ci, err := crypto.GenerateEphemeral()
+	ci, err := crypto.GenerateEphemeralNoPad()
 	if err != nil {
 		return dialFail(done, t, err)
 	}
@@ -399,7 +399,7 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 		if perr != nil {
 			continue
 		}
-		sr, gerr := crypto.GenerateEphemeral()
+		sr, gerr := crypto.GenerateEphemeralNoPad()
 		if gerr != nil {
 			return dialFail(done, t, gerr)
 		}
@@ -444,7 +444,7 @@ func ServeSession(t WireTransport, cfg SessionConfig) (net.Conn, error) {
 		}
 		// A new, PSK-authenticated init: derive + STAGE (do not adopt) a candidate session and answer
 		// it. Evict the OLDEST first (FIFO) when the set is full so this newest candidate survives.
-		sr, gerr := crypto.GenerateEphemeral()
+		sr, gerr := crypto.GenerateEphemeralNoPad()
 		if gerr != nil {
 			return
 		}

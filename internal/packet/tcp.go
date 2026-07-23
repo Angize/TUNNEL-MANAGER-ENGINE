@@ -763,8 +763,8 @@ func (b *TCP) clientHandshake(cf *connFramer) error {
 	if _, err := cf.conn.Write(crypto.InitMsg(b.psk, ci)); err != nil {
 		return err
 	}
-	resp := make([]byte, crypto.HandshakeSize)
-	if _, err := io.ReadFull(cf.r, resp); err != nil {
+	resp, err := crypto.ReadHandshake(cf.r, b.psk)
+	if err != nil {
 		return err
 	}
 	eResp, err := crypto.ParseResp(b.psk, ci.Pub, resp)
@@ -782,8 +782,8 @@ func (b *TCP) clientHandshake(cf *connFramer) error {
 // serverHandshake (server) reads an init, authenticates it, installs the session
 // sealer, and replies. A wrong PSK / probe fails ParseInit and gets no response.
 func (b *TCP) serverHandshake(cf *connFramer) error {
-	init := make([]byte, crypto.HandshakeSize)
-	if _, err := io.ReadFull(cf.r, init); err != nil {
+	init, err := crypto.ReadHandshake(cf.r, b.psk)
+	if err != nil {
 		return err
 	}
 	eInit, err := crypto.ParseInit(b.psk, init)

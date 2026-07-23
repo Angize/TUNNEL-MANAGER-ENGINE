@@ -192,7 +192,7 @@ func TestServeSessionRecoversFromVanishedClient(t *testing.T) {
 	}()
 
 	// Client 1 arms the server with a valid init, then goes silent (never completes KCP).
-	ci1, err := crypto.GenerateEphemeral()
+	ci1, err := crypto.GenerateEphemeralNoPad()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +289,7 @@ func TestServeSessionIgnoresReplayedInit(t *testing.T) {
 	}
 
 	// Inject a bare, DIFFERENT-ephemeral init (a replay) with no follow-up data frame.
-	attacker, err := crypto.GenerateEphemeral()
+	attacker, err := crypto.GenerateEphemeralNoPad()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestServeSessionUnblocksOnTransportClose(t *testing.T) {
 		srvErr <- err
 	}()
 
-	ci, err := crypto.GenerateEphemeral()
+	ci, err := crypto.GenerateEphemeralNoPad()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +355,7 @@ func TestServeSessionStagedSetResistsEviction(t *testing.T) {
 	}()
 
 	// Client 1 arms the server, then vanishes before completing KCP.
-	ci1, err := crypto.GenerateEphemeral()
+	ci1, err := crypto.GenerateEphemeralNoPad()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +372,7 @@ func TestServeSessionStagedSetResistsEviction(t *testing.T) {
 	// The attacker floods maxStaged-1 further DISTINCT captured inits (bare, no data). Together with
 	// the legit candidate the set is exactly full, so FIFO keeps the legit (oldest-but-present) entry.
 	for i := 0; i < maxStaged-1; i++ {
-		atk, gerr := crypto.GenerateEphemeral()
+		atk, gerr := crypto.GenerateEphemeralNoPad()
 		if gerr != nil {
 			t.Fatal(gerr)
 		}
@@ -425,7 +425,7 @@ func TestSessionKeepaliveReapsSilentPeer(t *testing.T) {
 				if perr != nil {
 					continue
 				}
-				sr, gerr := crypto.GenerateEphemeral()
+				sr, gerr := crypto.GenerateEphemeralNoPad()
 				if gerr != nil {
 					continue
 				}
