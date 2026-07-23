@@ -373,24 +373,7 @@ func (f *Flux) fluxPadMax(typ byte) int {
 // body builds the framed (magic/type/sealed or obfs) bytes — identical to the UDP
 // and raw carriers — before the IPv4 header is prepended.
 func (f *Flux) body(typ byte, payload []byte) ([]byte, error) {
-	s := f.sealer()
-	if f.obfs {
-		return obfsSeal(s, typ, payload, f.fluxPadMax(typ))
-	}
-	if s != nil {
-		sealed, err := s.Seal(payload, []byte{typ})
-		if err != nil {
-			return nil, err
-		}
-		out := make([]byte, 2+len(sealed))
-		out[0], out[1] = magic, typ
-		copy(out[2:], sealed)
-		return out, nil
-	}
-	out := make([]byte, 2+len(payload))
-	out[0], out[1] = magic, typ
-	copy(out[2:], payload)
-	return out, nil
+	return sealBody(f.sealer(), f.obfs, typ, payload, f.fluxPadMax(typ))
 }
 
 // carrierSeg maps the configured carrier to the (IP proto, L4 payload) that frames body under shape
@@ -560,34 +543,12 @@ func addFluxDrop(peer net.IP, carrier string) func() {
 // known — whose source is the peer, strips the carrier header, then authenticates
 // and dispatches. SOCK_DGRAM strips the link header, so each frame starts at the IPv4 header.
 func (f *Flux) netToTun() error {
-	buf := make([]byte, maxDatagram+64)
+	// grace* persist ACROSS frames (the closure captures them by reference, exactly like the old loop
+	// vars): the live per-epoch carrier protocol/port sets, refreshed only when the epoch ticks over.
 	var graceEpoch int64 = -1
 	var graceP map[int]bool
 	var graceD map[uint16]bool
-	for {
-		n, from, err := syscall.Recvfrom(f.pktFd, buf, 0)
-		if err != nil {
-			select {
-			case <-f.closeCh:
-				return nil
-			default:
-			}
-			if err == syscall.EINTR || err == syscall.EAGAIN {
-				continue // EAGAIN: the SO_RCVTIMEO tick fired (lets Close be noticed); EINTR: a signal
-			}
-			return err
-		}
-		if ll, ok := from.(*syscall.SockaddrLinklayer); ok && ll.Pkttype == packetOutgoing {
-			continue // ignore frames we transmitted ourselves
-		}
-		pkt := buf[:n]
-		if len(pkt) < 20 || pkt[0]>>4 != 4 {
-			continue // not IPv4
-		}
-		ihl := int(pkt[0]&0x0f) * 4
-		if ihl < 20 || len(pkt) < ihl {
-			continue
-		}
+	return afpacketLoop(f.pktFd, f.closeCh, func(pkt []byte, ihl int) {
 		if e := f.epochNow(); e != graceEpoch {
 			graceP = graceProtos(f.psk, e, f.shapeProf)
 			graceD = graceDports(f.psk, e, f.shapeProf, f.carrier)
@@ -596,21 +557,21 @@ func (f *Flux) netToTun() error {
 		var body []byte
 		if f.carrier == "raw" {
 			if !graceP[int(pkt[9])] {
-				continue // not a flux carrier protocol for any live epoch
+				return // not a flux carrier protocol for any live epoch
 			}
 			body = pkt[ihl:]
 		} else { // udp or stun carrier — both ride protocol 17
 			if int(pkt[9]) != protoUDP || len(pkt) < ihl+8 {
-				continue
+				return
 			}
 			if !graceD[binary.BigEndian.Uint16(pkt[ihl+2:ihl+4])] {
-				continue // not a flux carrier destination port for any live epoch
+				return // not a flux carrier destination port for any live epoch
 			}
 			body = pkt[ihl+8:] // strip the UDP header
 			if f.carrier == "stun" {
 				inner, ok := parseSTUN(body)
 				if !ok {
-					continue // not a STUN datagram
+					return // not a STUN datagram
 				}
 				body = inner
 			}
@@ -619,7 +580,7 @@ func (f *Flux) netToTun() error {
 		if peer := f.peer.Load(); peer != nil && !src.IP.Equal(peer.IP) && !f.srcAllowed(src.IP) {
 			// only the peer's frames are ours (AF_PACKET sees all hosts); a pooled server ALSO admits the
 			// client's other known source IPs so a source rotation reaches crypto and learnPeer re-binds.
-			continue
+			return
 		}
 		if f.fecDec != nil {
 			// netToTun is the sole reader, so rxSrc is stable for the whole input()
@@ -629,7 +590,7 @@ func (f *Flux) netToTun() error {
 		} else {
 			f.handleCrypto(body, src)
 		}
-	}
+	})
 }
 
 // tunToNet reads L3 packets from TUN, seals them, and sends to the peer.

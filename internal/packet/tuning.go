@@ -84,37 +84,37 @@ func ApplyTuning(t TuningInput) {
 		}
 	}
 	if t.DeadRetestSecs > 0 {
-		deadRetest = tclamp64(t.DeadRetestSecs, 5, 86400)
+		deadRetest = tclamp(t.DeadRetestSecs, 5, 86400)
 	}
 	if t.PinTTLSecs > 0 {
-		pinTTL = tclamp64(t.PinTTLSecs, 1, 3600)
+		pinTTL = tclamp(t.PinTTLSecs, 1, 3600)
 	}
 	if t.DataFailThreshold > 0 {
-		dataFailThreshold = tclampInt(t.DataFailThreshold, 1, 100)
+		dataFailThreshold = tclamp(t.DataFailThreshold, 1, 100)
 	}
 	if t.DataGoodWindowSecs > 0 {
-		dataGoodWindow = tclamp64(t.DataGoodWindowSecs, 1, 86400)
+		dataGoodWindow = tclamp(t.DataGoodWindowSecs, 1, 86400)
 	}
 	if t.IdleMult > 0 {
-		idleMult = tclamp64(t.IdleMult, 1, 100)
+		idleMult = tclamp(t.IdleMult, 1, 100)
 	}
 	if t.IdleMinSecs > 0 {
-		idleMinSecs = tclamp64(t.IdleMinSecs, 1, 86400)
+		idleMinSecs = tclamp(t.IdleMinSecs, 1, 86400)
 	}
 	if t.SessionStaleMult > 0 {
-		sessionStaleMult = tclamp64(t.SessionStaleMult, 1, 100)
+		sessionStaleMult = tclamp(t.SessionStaleMult, 1, 100)
 	}
 	if t.SessionStaleMinSecs > 0 {
-		sessionStaleMinSecs = tclamp64(t.SessionStaleMinSecs, 1, 86400)
+		sessionStaleMinSecs = tclamp(t.SessionStaleMinSecs, 1, 86400)
 	}
 	if t.PingLossThreshold > 0 {
-		pingLossThreshold = int32(tclampInt(t.PingLossThreshold, 1, 100))
+		pingLossThreshold = int32(tclamp(t.PingLossThreshold, 1, 100))
 	}
 	if t.MinLivenessSecs > 0 {
-		minLiveness = time.Duration(tclamp64(t.MinLivenessSecs, 1, 3600)) * time.Second
+		minLiveness = time.Duration(tclamp(t.MinLivenessSecs, 1, 3600)) * time.Second
 	}
 	if t.ProbeTimeoutSecs > 0 {
-		probeTimeout = time.Duration(tclamp64(t.ProbeTimeoutSecs, 1, 120)) * time.Second
+		probeTimeout = time.Duration(tclamp(t.ProbeTimeoutSecs, 1, 120)) * time.Second
 	}
 }
 
@@ -132,17 +132,9 @@ func suspectStep(i int) int64 {
 	return suspectBackoff[i]
 }
 
-func tclamp64(v, lo, hi int64) int64 {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
-}
-
-func tclampInt(v, lo, hi int) int {
+// tclamp clamps v to [lo, hi]. One generic over the integer widths the tuning knobs use (was two
+// byte-identical copies, tclamp64 for int64 fields and tclampInt for the two int ones).
+func tclamp[T int | int32 | int64](v, lo, hi T) T {
 	if v < lo {
 		return lo
 	}

@@ -434,24 +434,7 @@ func (r *Raw) srcIP() net.IP {
 // body builds the framed (magic/type/sealed or obfs) bytes for typ/payload —
 // identical to the UDP carrier's frame() — before the profile wrap is applied.
 func (r *Raw) body(typ byte, payload []byte) ([]byte, error) {
-	s := r.sealer()
-	if r.obfs {
-		return obfsSeal(s, typ, payload, padMaxFor(typ))
-	}
-	if s != nil {
-		sealed, err := s.Seal(payload, []byte{typ})
-		if err != nil {
-			return nil, err
-		}
-		out := make([]byte, 2+len(sealed))
-		out[0], out[1] = magic, typ
-		copy(out[2:], sealed)
-		return out, nil
-	}
-	out := make([]byte, 2+len(payload))
-	out[0], out[1] = magic, typ
-	copy(out[2:], payload)
-	return out, nil
+	return sealBody(r.sealer(), r.obfs, typ, payload, padMaxFor(typ))
 }
 
 // wire wraps a framed body in the profile carrier header, ready for the socket.
@@ -699,15 +682,18 @@ func (r *Raw) netToTun() error {
 // afpacketToTun receives frames aimed at the decoy destination off the wire via
 // AF_PACKET. A decoy dst is not a local address, so the kernel would drop it before
 // an AF_INET raw socket; AF_PACKET taps the packet before the IP stack's dst check.
-// Incoming IPv4 frames are filtered to our protocol and decoy dst, then handled just
-// like netToTun. SOCK_DGRAM strips the link header, so each frame starts at the IP header.
-func (r *Raw) afpacketToTun() error {
+// afpacketLoop owns the AF_PACKET receive loop shared by the raw and flux carriers: one reusable
+// buffer, the blocking Recvfrom, the close/EINTR/EAGAIN control flow, the PACKET_OUTGOING self-frame
+// skip, and the IPv4 header validation. It calls handle(pkt, ihl) for each accepted IPv4 frame; the
+// carrier-specific per-frame `continue`s become plain returns from handle. Runs until Close (nil) or a
+// real Recvfrom error.
+func afpacketLoop(fd int, closeCh <-chan struct{}, handle func(pkt []byte, ihl int)) error {
 	buf := make([]byte, maxDatagram+64) // room for the IPv4 header ahead of the frame
 	for {
-		n, from, err := syscall.Recvfrom(r.pktFd, buf, 0)
+		n, from, err := syscall.Recvfrom(fd, buf, 0)
 		if err != nil {
 			select {
-			case <-r.closeCh:
+			case <-closeCh:
 				return nil
 			default:
 			}
@@ -727,15 +713,23 @@ func (r *Raw) afpacketToTun() error {
 		if ihl < 20 || len(pkt) < ihl {
 			continue
 		}
+		handle(pkt, ihl)
+	}
+}
+
+// Incoming IPv4 frames are filtered to our protocol and decoy dst, then handled just
+// like netToTun. SOCK_DGRAM strips the link header, so each frame starts at the IP header.
+func (r *Raw) afpacketToTun() error {
+	return afpacketLoop(r.pktFd, r.closeCh, func(pkt []byte, ihl int) {
 		if int(pkt[9]) != r.proto {
-			continue // not our carrier protocol
+			return // not our carrier protocol
 		}
 		if r.decoy != nil && !net.IP(pkt[16:20]).Equal(r.decoy) {
-			continue // only frames aimed at our decoy destination
+			return // only frames aimed at our decoy destination
 		}
 		src := &net.IPAddr{IP: append(net.IP(nil), pkt[12:16]...)}
 		r.handleRaw(pkt[ihl:], src)
-	}
+	})
 }
 
 // handleRaw strips the profile header, authenticates the frame, and dispatches it —

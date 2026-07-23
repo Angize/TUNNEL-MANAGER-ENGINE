@@ -92,10 +92,7 @@ func (c *fecCodec) Encode(data [][]byte) ([][]byte, error) {
 			if coef == 0 {
 				continue
 			}
-			dj := data[j]
-			for b := 0; b < sz; b++ {
-				row[b] ^= gmul(coef, dj[b])
-			}
+			gfMulAddRow(row, data[j], coef)
 		}
 		out[i] = row
 	}
@@ -167,14 +164,19 @@ func (c *fecCodec) Reconstruct(shards [][]byte) ([][]byte, error) {
 			if coef == 0 {
 				continue
 			}
-			v := vals[cc]
-			for b := 0; b < sz; b++ {
-				out[b] ^= gmul(coef, v[b])
-			}
+			gfMulAddRow(out, vals[cc], coef)
 		}
 		data[r] = out
 	}
 	return data, nil
+}
+
+// gfMulAddRow does dst[i] ^= coef·src[i] over GF(256) for the full length of dst (len(src) == len(dst)
+// at every call). The RS "multiply-accumulate row" primitive, shared by Encode / Reconstruct / gfInvert.
+func gfMulAddRow(dst, src []byte, coef byte) {
+	for i := range dst {
+		dst[i] ^= gmul(coef, src[i])
+	}
 }
 
 // gfInvert inverts an n×n GF(256) matrix via Gauss-Jordan elimination.
@@ -211,10 +213,7 @@ func gfInvert(m [][]byte) ([][]byte, error) {
 			if r == col || a[r][col] == 0 {
 				continue
 			}
-			f := a[r][col]
-			for x := 0; x < 2*n; x++ {
-				a[r][x] ^= gmul(f, a[col][x])
-			}
+			gfMulAddRow(a[r], a[col], a[r][col])
 		}
 	}
 	inv := make([][]byte, n)

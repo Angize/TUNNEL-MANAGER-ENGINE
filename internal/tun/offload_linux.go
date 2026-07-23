@@ -129,16 +129,25 @@ func segment(pkt []byte, gsoSize int, isTCP bool) [][]byte {
 				f &^= 0x09 // clear FIN(0x01) and PSH(0x08) on all but the final segment
 			}
 			seg[ipHdrLen+13] = f
-			seg[ipHdrLen+16], seg[ipHdrLen+17] = 0, 0
-			binary.BigEndian.PutUint16(seg[ipHdrLen+16:ipHdrLen+18], l4Checksum(seg, ipHdrLen, v6, 6))
+			writeL4Csum(seg, ipHdrLen, v6, 6)
 		} else {
 			binary.BigEndian.PutUint16(seg[ipHdrLen+4:ipHdrLen+6], uint16(8+len(chunk))) // UDP length
-			seg[ipHdrLen+6], seg[ipHdrLen+7] = 0, 0
-			binary.BigEndian.PutUint16(seg[ipHdrLen+6:ipHdrLen+8], l4Checksum(seg, ipHdrLen, v6, 17))
+			writeL4Csum(seg, ipHdrLen, v6, 17)
 		}
 		out = append(out, seg)
 	}
 	return out
+}
+
+// writeL4Csum zeroes the L4 checksum field (offset +16 for TCP proto 6, +6 for UDP proto 17) then
+// writes the freshly computed l4Checksum there. Shared by segment() and finalizeCsum().
+func writeL4Csum(pkt []byte, ipHdrLen int, v6 bool, proto byte) {
+	off := ipHdrLen + 6
+	if proto == 6 {
+		off = ipHdrLen + 16
+	}
+	pkt[off], pkt[off+1] = 0, 0
+	binary.BigEndian.PutUint16(pkt[off:off+2], l4Checksum(pkt, ipHdrLen, v6, proto))
 }
 
 // finalizeCsum recomputes the L4 checksum of a single (non-GSO) packet whose
@@ -172,11 +181,9 @@ func finalizeCsum(pkt []byte) {
 		if len(pkt) < ipHdrLen+18 {
 			return
 		}
-		pkt[ipHdrLen+16], pkt[ipHdrLen+17] = 0, 0
-		binary.BigEndian.PutUint16(pkt[ipHdrLen+16:ipHdrLen+18], l4Checksum(pkt, ipHdrLen, v6, 6))
+		writeL4Csum(pkt, ipHdrLen, v6, 6)
 	case 17:
-		pkt[ipHdrLen+6], pkt[ipHdrLen+7] = 0, 0
-		binary.BigEndian.PutUint16(pkt[ipHdrLen+6:ipHdrLen+8], l4Checksum(pkt, ipHdrLen, v6, 17))
+		writeL4Csum(pkt, ipHdrLen, v6, 17)
 	}
 }
 

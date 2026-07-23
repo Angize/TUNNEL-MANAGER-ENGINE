@@ -567,24 +567,7 @@ func (b *UDP) sealer() Sealer {
 // frame builds one datagram for typ/payload using the current session sealer
 // (or clear framing when crypto is off / no session yet).
 func (b *UDP) frame(typ byte, payload []byte) ([]byte, error) {
-	s := b.sealer()
-	if b.obfs {
-		return obfsSeal(s, typ, payload, padMaxFor(typ))
-	}
-	if s != nil {
-		sealed, err := s.Seal(payload, []byte{typ}) // authenticate the type byte
-		if err != nil {
-			return nil, err
-		}
-		out := make([]byte, 2+len(sealed))
-		out[0], out[1] = magic, typ
-		copy(out[2:], sealed)
-		return out, nil
-	}
-	out := make([]byte, 2+len(payload))
-	out[0], out[1] = magic, typ
-	copy(out[2:], payload)
-	return out, nil
+	return sealBody(b.sealer(), b.obfs, typ, payload, padMaxFor(typ))
 }
 
 // tunToNet reads L3 packets from TUN, seals them, and sends to the peer. Packets
@@ -676,6 +659,30 @@ func (b *UDP) deliver(pkt []byte, addr *net.UDPAddr) {
 // openFrame is the shared receive-side frame opener for the datagram carriers (udp/raw/flux): obfs
 // path when obfs is on, else parse the magic/type header and authenticate the type byte via the
 // sealer. The three carriers' openWith methods differ only by the obfs field, so they delegate here.
+// sealBody builds one outbound frame for typ/payload: obfs, crypto (magic+type+sealed), or clear
+// (magic+type+payload). The send-side mirror of openFrame; shared by udp/raw/flux, which each pass their
+// own padMax (padMaxFor for udp/raw, fluxPadMax for flux — both pure reads, so evaluating eagerly at the
+// call site is harmless even when obfs is off and padMax goes unused).
+func sealBody(s Sealer, obfs bool, typ byte, payload []byte, padMax int) ([]byte, error) {
+	if obfs {
+		return obfsSeal(s, typ, payload, padMax)
+	}
+	if s != nil {
+		sealed, err := s.Seal(payload, []byte{typ}) // authenticate the type byte
+		if err != nil {
+			return nil, err
+		}
+		out := make([]byte, 2+len(sealed))
+		out[0], out[1] = magic, typ
+		copy(out[2:], sealed)
+		return out, nil
+	}
+	out := make([]byte, 2+len(payload))
+	out[0], out[1] = magic, typ
+	copy(out[2:], payload)
+	return out, nil
+}
+
 func openFrame(s Sealer, data []byte, obfs bool) (typ byte, session, seq uint64, payload []byte, oerr error) {
 	if obfs {
 		return obfsOpen(s, data)
