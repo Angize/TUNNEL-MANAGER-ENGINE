@@ -125,21 +125,47 @@ func padMaxFor(typ byte) int {
 	return obfsCtrlPadMax
 }
 
-// jitter returns base perturbed by up to ±33% so keepalives do not emit on a
-// fixed period a DPI box could time. It never returns less than base/2.
-func jitter(base time.Duration) time.Duration {
+// frac53 maps 8 bytes to a uniform float64 in [0,1) using the top 53 bits (the mantissa width, so
+// every value is exactly representable). b must be at least 8 bytes.
+func frac53(b []byte) float64 {
+	return float64(binary.BigEndian.Uint64(b)>>11) / float64(uint64(1)<<53)
+}
+
+// keepaliveInterval returns the next client keepalive delay. A fixed clock — or even a bare
+// symmetric ±33% jitter — is a passive TIMING fingerprint: an adversary that averages the
+// inter-arrival of a long-lived flow's small control packets recovers the mean exactly, and a whole
+// fleet pinned to the same keepalive beacons in lockstep (a cross-flow correlation signal). Two
+// defenses over jitter():
+//
+//   - a per-TUNNEL mean shift derived from the PSK. Keepalive is client-local (the peer only
+//     reflects pongs), so the two ends need not agree on the period; deriving it from the PSK gives
+//     each tunnel a different, stable mean, so there is no single fleet-wide constant to recover and
+//     different tunnels do not step together.
+//   - a wider, TRIANGULAR per-fire spread (mean of two uniforms) so one flow's own mean is harder to
+//     average out than a tight uniform band.
+//
+// The result is clamped to [0.6,1.3]×base so a live-but-idle client still pings well within the
+// server's idleMult×keepalive read deadline (idleMult>=4 ⇒ 1.3×base ≪ 4×base) and the
+// pingLossThreshold dead-detection window stays bounded (<= pingLossThreshold×1.3×base).
+func keepaliveInterval(base time.Duration, psk string) time.Duration {
 	if base <= 0 {
 		return base
 	}
-	span := int64(base) * 2 / 3 // total jitter window = 2/3 of base
-	var b [8]byte
-	if _, err := io.ReadFull(rand.Reader, b[:]); err != nil {
-		return base
+	// per-tunnel mean in [0.85,1.20]×base, deterministic from the PSK.
+	h := sha256.Sum256([]byte("tnl-core|ka-phase|" + psk))
+	mean := float64(base) * (0.85 + 0.35*frac53(h[:8]))
+	var rb [16]byte
+	if _, err := io.ReadFull(rand.Reader, rb[:]); err != nil {
+		return time.Duration(mean)
 	}
-	delta := int64(binary.BigEndian.Uint64(b[:])%uint64(span+1)) - span/2
-	d := int64(base) + delta
-	if d < int64(base)/2 {
-		d = int64(base) / 2
+	// triangular spread in ~[0.66,1.34], heavier at the center than a single uniform.
+	spread := 1.0 + 0.68*((frac53(rb[0:8])+frac53(rb[8:16]))/2.0-0.5)
+	d := mean * spread
+	if lo := float64(base) * 0.6; d < lo {
+		d = lo
+	}
+	if hi := float64(base) * 1.3; d > hi {
+		d = hi
 	}
 	return time.Duration(d)
 }

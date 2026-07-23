@@ -898,11 +898,11 @@ func (b *UDP) clientLoop() {
 				continue
 			}
 		}
-		wait := b.keepalive
+		var wait time.Duration
 		if b.sealer() == nil && b.cryptoOn {
 			wait = time.Second // retransmit the handshake faster than keepalive
 		} else {
-			wait = jitter(wait)
+			wait = keepaliveInterval(b.keepalive, b.psk)
 		}
 		select {
 		case <-b.closeCh:

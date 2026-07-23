@@ -1146,7 +1146,7 @@ func (r *Raw) clientLoop() {
 				continue
 			}
 		}
-		wait := jitter(r.keepalive)
+		wait := keepaliveInterval(r.keepalive, r.psk)
 		if r.cryptoOn && r.sealer() == nil {
 			wait = time.Second // retransmit the handshake faster than keepalive
 		}

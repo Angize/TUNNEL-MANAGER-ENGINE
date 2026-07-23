@@ -974,7 +974,7 @@ func (f *Flux) clientLoop() {
 				continue
 			}
 		}
-		wait := jitter(f.keepalive)
+		wait := keepaliveInterval(f.keepalive, f.psk)
 		if f.cryptoOn && f.sealer() == nil {
 			wait = time.Second // retransmit the handshake faster than keepalive
 		}

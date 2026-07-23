@@ -311,6 +311,13 @@ type TCP struct {
 	stTag  string        // carrier label prefix ("tcp"/"cover"/"ws"/"xhttp") for setActive on a direct-pool rotation; set alongside st
 	lastRx atomic.Int64  // client: unix-nano of the last authenticated INBOUND frame — feeds the status-file heartbeat (v2.48.3). Seeded once in Run() and advanced ONLY by readLoop; never stamp it for a frame we sent, or a carrier that reconnects forever behind a CDN reads "alive" while nothing flows (v2.48.5)
 
+	// lastData is the unix-nano of the last real DATA frame moved in EITHER direction (never ping/pong).
+	// It drives opportunistic keepalive: when data moved within the last keepalive period the standalone
+	// ping is redundant (the data already proved the peer live and, via tunLoop's write-liveness deadline
+	// refresh, kept the connection off the idle-reaper), so an ACTIVE tunnel emits no periodic beacon.
+	// Stamped by tunLoop (outbound) and handleFrame's typeData case (inbound).
+	lastData atomic.Int64
+
 	// pp is the DESTINATION rotation pool for the direct TCP carriers (plain tcp / tcp+cover): the
 	// client cycles the peer IPs and burns a blocked one so a single filtered server IP doesn't kill
 	// the tunnel. It is the direct-transport analogue of the ws edge pool (which owns rotation on the
@@ -2252,6 +2259,7 @@ func (b *TCP) handleFrame(cf *connFramer, typ byte, payload []byte) {
 	case typePong:
 		// keepalive ack
 	case typeData:
+		b.lastData.Store(time.Now().UnixNano()) // real inbound data -> the keepalive ping is redundant this interval
 		// Downstream follows upstream DATA (server only): the connection the client most
 		// recently sent a real data frame on becomes the TUN->client target, so a warm standby
 		// (which only sends keepalive pings) never steals downstream, and a promotion flips the
@@ -2340,7 +2348,14 @@ func (b *TCP) tunLoop() {
 				continue
 			}
 			b.onConnErr(cf, err)
+			continue
 		}
+		// Write succeeded: real DATA moved. Stamp it so the client suppresses the now-redundant keepalive
+		// ping, and treat the write as LIVENESS by pushing this conn's read deadline forward. A one-way
+		// flow (server->client download, or client->server upload) reads nothing back, so without this the
+		// silent side's readLoop would idle-reap a healthy, actively-used connection once we stop pinging.
+		b.lastData.Store(time.Now().UnixNano())
+		cf.conn.SetReadDeadline(time.Now().Add(b.idle))
 	}
 }
 
@@ -2372,8 +2387,12 @@ func (b *TCP) keepaliveLoop() {
 		select {
 		case <-b.closeCh:
 			return
-		case <-time.After(jitter(b.keepalive)):
-			if cf := b.cur.Load(); cf != nil {
+		case <-time.After(keepaliveInterval(b.keepalive, b.psk)):
+			// Opportunistic: skip the ACTIVE connection's keepalive when real data moved within the last
+			// period. The data already proved the peer live and (via tunLoop's write-liveness deadline
+			// refresh) kept the connection off the idle-reaper, so a busy tunnel emits no standalone
+			// beacon. The warm standby carries no data, so it is always pinged below.
+			if cf := b.cur.Load(); cf != nil && !b.recentData() {
 				if ok, err := b.pingOne(cf); !ok {
 					if b.warmStandby {
 						// Let the warm-standby manager react to the reader's exit (promote a
@@ -2414,6 +2433,20 @@ func (b *TCP) pingOne(cf *connFramer) (ok bool, err error) {
 		return false, errPingTimeout
 	}
 	return true, nil
+}
+
+// recentData reports whether a real DATA frame moved (in OR out) within the last keepalive period.
+// When it did, the standalone keepalive ping is redundant — the data already proved the peer live and
+// tunLoop's write-liveness refresh kept the connection off the idle-reaper — so the client suppresses
+// the ping and an active tunnel emits no periodic beacon. The base keepalive (not the jittered
+// interval) is the window; a never-yet-used connection (lastData==0) keeps the normal keepalive so it
+// is not idle-reaped before any data flows.
+func (b *TCP) recentData() bool {
+	last := b.lastData.Load()
+	if last == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, last)) < b.keepalive
 }
 
 // sleep waits d or returns true if Close fired during the wait.
