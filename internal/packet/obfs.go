@@ -169,3 +169,16 @@ func keepaliveInterval(base time.Duration, psk string) time.Duration {
 	}
 	return time.Duration(d)
 }
+
+// jitterFrac perturbs d by a multiplicative ±30% so a retry/backoff delay has no fixed period a DPI
+// could lock onto. Returns d unchanged on a rand error or a non-positive d.
+func jitterFrac(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	var rb [8]byte
+	if _, err := io.ReadFull(rand.Reader, rb[:]); err != nil {
+		return d
+	}
+	return time.Duration(float64(d) * (0.7 + 0.6*frac53(rb[:]))) // × uniform[0.7, 1.3)
+}
