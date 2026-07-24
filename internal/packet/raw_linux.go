@@ -68,6 +68,16 @@ type Raw struct {
 
 	localIP  atomic.Pointer[net.IPAddr] // our source IP toward the peer (for TCP/UDP checksums)
 	peer     atomic.Pointer[net.IPAddr] // current known peer (server learns it)
+	// replySrc (server, non-decoy) is the local IP the client dialed = the source to answer FROM, so a
+	// destination-pool client that rotates across our IPs gets each reply from the SAME IP it dialed
+	// (else the kernel picks our default IP, the client's source filter drops it, and that pool IP burns).
+	// Set per received frame in netToTun BEFORE the frame is handled, so even the handshake RESP (sent
+	// synchronously inside handleRaw) already answers from the dialed IP. Tracks destination rotation.
+	// It is committed post-source-filter but pre-AEAD: the synchronous replies (RESP/pong) read the same
+	// frame's dst on the same goroutine so they are always correct; only the ASYNC download source could
+	// be momentarily steered by a source-spoofing attacker (availability-only, self-corrects on the next
+	// genuine frame) — accepted over threading the dst through every synchronous reply path.
+	replySrc atomic.Pointer[net.IP]
 	srcAllow map[string]struct{}        // server pool: the client's known source IPs (4-byte keys) it may rotate across; set once before Run, then read-only
 	session  atomic.Pointer[sealerBox]
 	rp       replayGuard
@@ -310,6 +320,7 @@ func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoO
 		return nil, err
 	}
 	applyConnSockBuf(conn) // this IPConn is the normal (non-decoy) raw RX/TX socket
+	enablePktinfoDst(conn) // server: learn which of our IPs each frame targeted, to answer from it (dest-pool rotation)
 	r := newRaw(conn, dev, ka, obfs, cryptoOn, psk, cipher, profile, false)
 	r.proto = proto
 	if realPeer != "" { // client forges its source, so we can't learn it — reply to this real IP
@@ -427,6 +438,9 @@ func (r *Raw) sealer() Sealer {
 }
 
 func (r *Raw) srcIP() net.IP {
+	if rs := r.replySrc.Load(); rs != nil { // server: answer from the IP the client dialed (also the L4-checksum src)
+		return *rs
+	}
 	if l := r.localIP.Load(); l != nil {
 		return l.IP
 	}
@@ -489,6 +503,13 @@ func (r *Raw) writeOut(pkt []byte, to *net.IPAddr) {
 		}
 		r.sendMu.RUnlock()
 		return
+	}
+	if rs := r.replySrc.Load(); rs != nil { // server: answer FROM the IP the client dialed (IP_PKTINFO source)
+		if _, _, err := r.conn.WriteMsgIP(pkt, pktinfoOOB(*rs), to); err == nil {
+			return
+		}
+		// Unreachable under normal routing (the pinned source is always one of our own local IPs);
+		// on the off chance the pin is rejected, degrade to a default-source send, not a silent drop.
 	}
 	_, _ = r.conn.WriteToIP(pkt, to)
 }
@@ -668,8 +689,9 @@ func (r *Raw) tunToNet() error {
 // except a decoy server (which reads off the wire via afpacketToTun instead).
 func (r *Raw) netToTun() error {
 	buf := make([]byte, maxDatagram)
+	oob := make([]byte, 128) // room for the IP_PKTINFO control message (server dst capture)
 	for {
-		n, addr, err := r.conn.ReadFromIP(buf)
+		n, oobn, _, addr, err := r.conn.ReadMsgIP(buf, oob) // ReadMsgIP == ReadFromIP for buf, plus the oob
 		if err != nil {
 			return err
 		}
@@ -677,6 +699,11 @@ func (r *Raw) netToTun() error {
 			if peer := r.peer.Load(); peer != nil && !addr.IP.Equal(peer.IP) && !r.srcAllowed(addr.IP) {
 				continue // only the peer's packets are ours (raw sockets see all); a pooled server also
 				// admits the client's other known source IPs so a source rotation reaches crypto and re-binds
+			}
+		}
+		if !r.isClient && oobn > 0 { // server: answer THIS frame (and its handshake RESP) from the IP the client dialed
+			if d := pktinfoDst(oob[:oobn]); d != nil {
+				r.replySrc.Store(&d)
 			}
 		}
 		r.handleRaw(buf[:n], addr)
