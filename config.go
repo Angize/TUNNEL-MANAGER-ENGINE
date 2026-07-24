@@ -135,6 +135,13 @@ type Config struct {
 	MTU     int    `json:"mtu"`      // TUN MTU, e.g. 1400
 
 	Keepalive int `json:"keepalive"` // client ping interval in seconds (default 15)
+	// SockBuf is the send/receive socket-buffer size (bytes) pinned on the datagram carriers (udp/raw/
+	// flux) via SO_SNDBUFFORCE/SO_RCVBUFFORCE — which bypass net.core.{r,w}mem_max (the core holds
+	// CAP_NET_ADMIN), so a large buffer applies without a sysctl. It matters on high-latency links where
+	// the bandwidth-delay product exceeds the default (~200 KiB) buffer and a burst overflows it (loss)
+	// before the reader drains it. TCP/WS autotune and are left alone. 0 = default (4 MiB); a negative
+	// value leaves the kernel default (feature off). Clamped to <=64 MiB.
+	SockBuf int `json:"sock_buf"`
 	// DeadAfterSecs (client) is the per-tunnel self-heal deadline: the carrier is declared dead — and the
 	// client re-establishes / fails over — if no authenticated inbound frame arrives within this many
 	// seconds. It sets the read-deadline ceiling (b.idle for tcp/ws/xhttp; the stale window for udp/raw/
@@ -347,6 +354,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Keepalive <= 0 { // <=0: a negative keepalive makes jitter() fire immediately -> ping busy-loop
 		c.Keepalive = 15
+	}
+	if c.SockBuf == 0 { // 0 = pick the default; a negative value means "leave the kernel default" (off)
+		c.SockBuf = 4 << 20 // 4 MiB
+	}
+	if c.SockBuf > 64<<20 { // cap the pin so a typo can't reserve absurd kernel memory
+		c.SockBuf = 64 << 20
 	}
 	if c.Crypto.Cipher == "" {
 		c.Crypto.Cipher = "aes-256-gcm"

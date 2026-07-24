@@ -65,6 +65,9 @@ func main() {
 			ProbeTimeoutSecs: t.ProbeTimeoutSecs,
 		})
 	}
+	// Pin the datagram-carrier socket buffers (udp/raw/flux) BEFORE any socket is opened. cfg.SockBuf is
+	// resolved by applyDefaults (4 MiB default; negative = leave the kernel default).
+	packet.SetSockBuf(cfg.SockBuf)
 
 	// Open the TUN device BEFORE building the sealer. The sealer's constructor may
 	// draw from crypto/rand; on hosts without getrandom(2) that opens /dev/urandom

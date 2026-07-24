@@ -212,6 +212,7 @@ func (b *UDP) SetSourcePool(sp *PeerPool) {
 		}
 		if ip := net.ParseIP(host); ip != nil {
 			if nc, err := net.ListenUDP("udp", &net.UDPAddr{IP: ip}); err == nil {
+				applyConnSockBuf(nc)
 				old := b.conn.Load()
 				b.conn.Store(nc)
 				if old != nil {
@@ -262,6 +263,7 @@ func (b *UDP) rebindSourceTo(addr string) (string, bool) {
 		log.Printf("core/udp: source rebind to %s failed: %v", host, err)
 		return "", false
 	}
+	applyConnSockBuf(nc)
 	old := b.conn.Load()
 	// Order matters (netToTun loads gen THEN conn): store the new conn BEFORE bumping the gen. Then any
 	// reader that still loaded the OLD conn must have sampled its gen BEFORE this bump (Go atomics are
@@ -399,6 +401,7 @@ func Dial(peerAddr string, dev *tun.Device, keepalive time.Duration, obfs, crypt
 	if err != nil {
 		return nil, err
 	}
+	applyConnSockBuf(conn)
 	b := &UDP{dev: dev, keepalive: keepalive, obfs: obfs, cryptoOn: cryptoOn, psk: psk, cipher: cipher, isClient: true, closeCh: make(chan struct{})}
 	b.conn.Store(conn)
 	b.peer.Store(ra)
@@ -417,6 +420,7 @@ func Listen(listenAddrs []string, dev *tun.Device, keepalive time.Duration, obfs
 			var conn *net.UDPConn
 			conn, err = net.ListenUDP("udp", la)
 			if err == nil {
+				applyConnSockBuf(conn)
 				b.srvConns = append(b.srvConns, conn)
 				continue
 			}

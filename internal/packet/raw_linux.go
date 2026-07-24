@@ -254,6 +254,7 @@ func DialRaw(peerIP string, dev *tun.Device, ka time.Duration, obfs, cryptoOn bo
 	if err != nil {
 		return nil, err
 	}
+	applyConnSockBuf(conn) // this IPConn is the normal (non-spoof) raw RX/TX socket
 	r := newRaw(conn, dev, ka, obfs, cryptoOn, psk, cipher, profile, true)
 	r.proto = proto
 	r.peer.Store(&net.IPAddr{IP: ip})
@@ -308,6 +309,7 @@ func ListenRaw(listenIP string, dev *tun.Device, ka time.Duration, obfs, cryptoO
 	if err != nil {
 		return nil, err
 	}
+	applyConnSockBuf(conn) // this IPConn is the normal (non-decoy) raw RX/TX socket
 	r := newRaw(conn, dev, ka, obfs, cryptoOn, psk, cipher, profile, false)
 	r.proto = proto
 	if realPeer != "" { // client forges its source, so we can't learn it — reply to this real IP
@@ -591,6 +593,7 @@ func openHdrincl(proto int) (int, error) {
 		syscall.Close(fd)
 		return -1, err
 	}
+	applyFdSndBuf(fd, wantSockBuf()) // SEND buffer only — this raw sender's RX queue is never drained
 	return fd, nil
 }
 
@@ -610,6 +613,7 @@ func openAfpacket() (int, error) {
 		syscall.Close(fd)
 		return -1, err
 	}
+	applyFdRcvBuf(fd, wantSockBuf()) // RECEIVE buffer only — this AF_PACKET socket is the raw-decoy/flux RX path
 	return fd, nil
 }
 
