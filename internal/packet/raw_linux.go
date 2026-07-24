@@ -593,7 +593,7 @@ func openHdrincl(proto int) (int, error) {
 		syscall.Close(fd)
 		return -1, err
 	}
-	applyFdBuf(fd, wantSockBuf()) // pin the send buffer (raw/flux) — best-effort, no-op when unconfigured
+	applyFdSndBuf(fd, wantSockBuf()) // SEND buffer only — this raw sender's RX queue is never drained
 	return fd, nil
 }
 
@@ -613,7 +613,7 @@ func openAfpacket() (int, error) {
 		syscall.Close(fd)
 		return -1, err
 	}
-	applyFdBuf(fd, wantSockBuf()) // pin the receive buffer — this AF_PACKET socket is the raw-decoy/flux RX path
+	applyFdRcvBuf(fd, wantSockBuf()) // RECEIVE buffer only — this AF_PACKET socket is the raw-decoy/flux RX path
 	return fd, nil
 }
 
