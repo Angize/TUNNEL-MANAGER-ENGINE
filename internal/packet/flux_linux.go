@@ -59,6 +59,14 @@ type Flux struct {
 
 	localIP  atomic.Pointer[net.IPAddr] // our source IP toward the peer
 	peer     atomic.Pointer[net.IPAddr] // current known peer (server learns it)
+	// replySrc (server) is the local IP the client dialed = the source to answer FROM, so a destination-
+	// pool client rotating across our IPs gets each reply from the SAME IP it dialed (flux crafts every
+	// header via buildIP4, so srcIP() feeds the source directly). Set per received frame in netToTun
+	// (AF_PACKET exposes the dst at pkt[16:20]) BEFORE handleCrypto, so even the handshake RESP answers
+	// from the dialed IP. Tracks destination rotation. Committed pre-AEAD (post source-filter): the
+	// synchronous replies are always correct; only the async download source could be briefly steered by
+	// a source-spoofing attacker (availability-only, self-correcting) — see the raw carrier's note.
+	replySrc atomic.Pointer[net.IP]
 	srcAllow map[string]struct{}        // server pool: the client's known source IPs (4-byte keys) it may rotate across; set once before Run, then read-only
 	session  atomic.Pointer[sealerBox]
 	curShape atomic.Pointer[fluxShape] // this epoch's shape (refreshed each second by rotateWatcher)
@@ -350,6 +358,9 @@ func (f *Flux) sealer() Sealer {
 }
 
 func (f *Flux) srcIP() net.IP {
+	if rs := f.replySrc.Load(); rs != nil { // server: craft the reply FROM the IP the client dialed
+		return *rs
+	}
 	if l := f.localIP.Load(); l != nil {
 		return l.IP
 	}
@@ -581,6 +592,14 @@ func (f *Flux) netToTun() error {
 			// only the peer's frames are ours (AF_PACKET sees all hosts); a pooled server ALSO admits the
 			// client's other known source IPs so a source rotation reaches crypto and learnPeer re-binds.
 			return
+		}
+		if !f.isClient { // server: answer THIS frame (and its handshake RESP) from the IP the client dialed (pkt[16:20]=dst)
+			// Unlike raw (which learns the dst from kernel-verified IP_PKTINFO), flux trusts pkt[16:20] — but
+			// this store is already gated by the PSK-derived grace proto/port match above AND the peer/source
+			// filter, so a party without the PSK can't reach it to steer the egress source; and it is only the
+			// ASYNC download source (availability-only, self-correcting) per the field's note.
+			d := append(net.IP(nil), pkt[16:20]...)
+			f.replySrc.Store(&d)
 		}
 		if f.fecDec != nil {
 			// netToTun is the sole reader, so rxSrc is stable for the whole input()
